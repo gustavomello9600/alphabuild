@@ -1,0 +1,26 @@
+name: alphabuilder
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # Python
+  - python=3.10
+  
+  # Core Científico (FEM e Computação Numérica)
+  - fenics-dolfinx
+  - mpich
+  - pyvista
+  - matplotlib
+  - scipy
+  - numpy
+  - pandas
+  
+  # Pip packages (IA e Web)
+  - pip
+  - pip:
+    - tensorflow
+    - keras
+    - fastapi
+    - uvicorn[standard]
+    - plotly
+    - streamlit-drawable-canvas
