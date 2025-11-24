@@ -11,9 +11,12 @@ from pathlib import Path
 from typing import Tuple, List, Optional
 from dataclasses import dataclass
 import sys
+from pathlib import Path
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 # Import physics core
-sys.path.append(str(Path(__file__).parent.parent.parent))
 from alphabuilder.src.core.physics_model import (
     initialize_cantilever_context,
     PhysicalProperties,
@@ -31,11 +34,33 @@ from alphabuilder.src.logic.storage import (
 
 @dataclass
 class EpisodeConfig:
-    """Configuration for episode execution."""
-    resolution: Tuple[int, int] = (32, 16)  # (nx, ny)
-    max_refinement_steps: int = 100
-    stagnation_threshold: float = 1e-4
-    stagnation_patience: int = 20
+    """Configuration for episode execution with adaptive strategies."""
+    resolution: Tuple[int, int] = (16, 32)  # (ny, nx) - height x width
+    
+    # Refinement parameters - optimized for better data quality
+    max_refinement_steps: int = 50  # Reduced from 100 for more diverse short episodes
+    
+    # Adaptive stagnation detection
+    use_relative_threshold: bool = True  # Use percentage-based threshold
+    stagnation_threshold_relative: float = 0.001  # 0.1% relative improvement
+    stagnation_threshold_absolute: float = 1e-11  # Fallback absolute threshold
+    stagnation_patience: int = 10  # Reduced from 20
+    
+    # Phase 1 growth strategy
+    growth_strategy: str = "astar"  # Options: "straight", "astar", "smart_heuristic", "random_pattern"
+    
+    # Phase 2 exploration strategy  
+    exploration_strategy: str = "mixed"  # Options: "random", "mixed", "greedy"
+    exploration_weights: dict = None  # Will be set in __post_init__
+    
+    def __post_init__(self):
+        if self.exploration_weights is None:
+            self.exploration_weights = {
+                "random": 0.4,
+                "remove_weak": 0.3,
+                "add_support": 0.2,
+                "symmetry": 0.1
+            }
     
 
 def find_boundary_cells(topology: np.ndarray) -> List[Tuple[int, int]]:
@@ -112,30 +137,60 @@ def is_connected_bfs(topology: np.ndarray, start_col: int = 0, end_col: int = -1
     return False
 
 
-def phase1_growth(topology: np.ndarray, config: EpisodeConfig) -> np.ndarray:
+def phase1_growth(topology: np.ndarray, config: EpisodeConfig, seed: int = 0) -> np.ndarray:
     """
-    Phase 1: Grow topology from left to right using greedy connection.
+    Phase 1: Grow topology using advanced strategies.
     
     Args:
-        topology: Initial topology (should be empty or have left edge filled).
+        topology: Initial topology (should be empty).
+                  Shape is (nx, ny) where nx is width, ny is height.
         config: Episode configuration.
+        seed: Random seed for pattern selection.
         
     Returns:
         Connected topology.
     """
-    ny, nx = config.resolution
+    from alphabuilder.src.logic.pathfinding import (
+        create_astar_topology,
+        create_smart_heuristic_topology,
+        create_random_pattern
+    )
+    
+    ny, nx = config.resolution  # config stores (ny, nx)
     result = topology.copy()
     
-    # Initialize left edge (support)
-    result[:, 0] = 1
+    # Always fill left edge (support)
+    result[0, :] = 1
     
-    # Greedy growth: connect to right edge
-    current_col = 0
-    target_row = ny // 2  # Middle of right edge
+    strategy = config.growth_strategy
     
-    # Simple straight line connection for now
-    for col in range(nx):
-        result[target_row, col] = 1
+    if strategy == "astar":
+        # A* pathfinding with multiple paths for redundancy
+        starts = [
+            (0, ny // 4),      # Lower quarter
+            (0, ny // 2),       # Middle
+            (0, 3 * ny // 4)   # Upper quarter
+        ]
+        goals = [
+            (nx - 1, ny // 2),  # All converge to middle of right edge
+            (nx - 1, ny // 2),
+            (nx - 1, ny // 2)
+        ]
+        result = create_astar_topology(result, starts, goals)
+    
+    elif strategy == "smart_heuristic":
+        # Diagonal arch/truss pattern
+        result = create_smart_heuristic_topology(result, ny, nx)
+    
+    elif strategy == "random_pattern":
+        # Random pattern based on seed
+        result = create_random_pattern(result, ny, nx, seed)
+    
+    else:  # "straight" or fallback
+        # Original straight line (baseline)
+        mid_y = ny // 2
+        for x in range(nx):
+            result[x, mid_y] = 1
         
     return result
 
@@ -175,7 +230,11 @@ def phase2_refinement(
         fitness = result.fitness
         fitness_history.append(fitness)
         
-        # Save to database
+        # Calculate additional structural metrics
+        from alphabuilder.src.logic.pathfinding import calculate_structural_metrics
+        struct_metrics = calculate_structural_metrics(current_topology)
+        
+        # Save to database with enhanced metadata
         state_blob = serialize_state(current_topology)
         record = TrainingRecord(
             episode_id=episode_id,
@@ -186,13 +245,26 @@ def phase2_refinement(
             valid_fem=result.valid,
             metadata={
                 "max_displacement": result.max_displacement,
-                "compliance": result.compliance
+                "compliance": result.compliance,
+                "volume_fraction": struct_metrics["volume_fraction"],
+                "structural_efficiency": fitness / (np.sum(current_topology) + 1.0),
+                "pattern_entropy": struct_metrics["pattern_entropy"],
+                "connectivity_score": struct_metrics["connectivity_score"]
             }
         )
         save_record(db_path, record)
         
-        # Check for stagnation
-        if fitness > best_fitness + config.stagnation_threshold:
+        # Check for stagnation with adaptive threshold
+        if config.use_relative_threshold:
+            # Relative improvement threshold
+            if best_fitness > 0:
+                threshold = config.stagnation_threshold_relative * abs(best_fitness)
+            else:
+                threshold = config.stagnation_threshold_absolute
+        else:
+            threshold = config.stagnation_threshold_absolute
+        
+        if fitness > best_fitness + threshold:
             best_fitness = fitness
             stagnation_counter = 0
         else:
@@ -202,44 +274,82 @@ def phase2_refinement(
             print(f"  Stagnation detected at step {step}, terminating episode.")
             break
             
-        # Random action: ADD or REMOVE
-        action = rng.choice(['add', 'remove'])
+        # Prepare action candidates using semi-guided exploration
+        ny_tp, nx_tp = current_topology.shape  # Topology is (ny, nx)
         
-        if action == 'add':
-            # Find empty cells adjacent to material
-            candidates = []
-            ny, nx = current_topology.shape
-            for i in range(ny):
-                for j in range(nx):
-                    if current_topology[i, j] == 0:
-                        # Check if adjacent to material
-                        for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                            ni, nj = i + di, j + dj
-                            if 0 <= ni < ny and 0 <= nj < nx:
-                                if current_topology[ni, nj] == 1:
-                                    candidates.append((i, j))
-                                    break
+        # Collect all possible actions
+        add_candidates = []
+        remove_candidates = []
+        
+        # ADD candidates: empty cells adjacent to material
+        for r in range(ny_tp): # r for row
+            for c in range(nx_tp): # c for col
+                if current_topology[r, c] == 0:
+                    # Check if adjacent to material
+                    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                        nr, nc = r + dr, c + dc
+                        if 0 <= nr < ny_tp and 0 <= nc < nx_tp:
+                            if current_topology[nr, nc] == 1:
+                                add_candidates.append(("ADD", (r, c)))
+                                break
+        
+        # REMOVE candidates: material cells that don't disconnect
+        for r in range(ny_tp): # r for row
+            for c in range(nx_tp): # c for col
+                if current_topology[r, c] == 1 and c not in [0, nx_tp-1]:  # Not on left/right edges
+                    # Test removal
+                    test_topology = current_topology.copy()
+                    test_topology[r, c] = 0
+                    if is_connected_bfs(test_topology):
+                        remove_candidates.append(("REMOVE", (r, c)))
+        
+        all_actions = add_candidates + remove_candidates
+        
+        if len(all_actions) == 0:
+            continue  # No valid actions
+        
+        # Select action using exploration strategy
+        if config.exploration_strategy == "random":
+            # Pure random
+            action_type, coord = all_actions[rng.integers(0, len(all_actions))]
+        
+        elif config.exploration_strategy == "mixed":
+            # Mixed strategy with weighted probabilities
+            strategy_names = list(config.exploration_weights.keys())
+            strategy_probs = list(config.exploration_weights.values())
+            chosen_strategy = rng.choice(strategy_names, p=strategy_probs)
             
-            if candidates:
-                i, j = candidates[rng.integers(0, len(candidates))]
-                current_topology[i, j] = 1
-                
-        else:  # remove
-            # Find material cells that can be removed without disconnecting
-            candidates = []
-            ny, nx = current_topology.shape
-            for i in range(ny):
-                for j in range(nx):
-                    if current_topology[i, j] == 1 and j not in [0, nx-1]:  # Not on edges
-                        # Test removal
-                        test_topology = current_topology.copy()
-                        test_topology[i, j] = 0
-                        if is_connected_bfs(test_topology):
-                            candidates.append((i, j))
+            # Determine load and support points (simplified - middle of edges)
+            load_points = [(ny_tp - 1, nx_tp // 2)]  # Right edge, middle
+            support_points = [(0, nx_tp // 4), (0, nx_tp // 2), (0, 3 * nx_tp // 4)]  # Left edge
             
-            if candidates:
-                i, j = candidates[rng.integers(0, len(candidates))]
-                current_topology[i, j] = 0
+            # Apply strategy (simplified inline version)
+            if chosen_strategy == "random":
+                action_type, coord = all_actions[rng.integers(0, len(all_actions))]
+            else:
+                # For other strategies, use simple heuristics
+                if chosen_strategy == "remove_weak" and len(remove_candidates) > 0:
+                    # Select from remove candidates (prefer those far from path)
+                    action_type, coord = remove_candidates[rng.integers(0, len(remove_candidates))]
+                elif chosen_strategy == "add_support" and len(add_candidates) > 0:
+                    # Select from add candidates (prefer those near load)
+                    action_type, coord = add_candidates[rng.integers(0, len(add_candidates))]
+                elif chosen_strategy == "symmetry":
+                    # Select action that maintains symmetry
+                    action_type, coord = all_actions[rng.integers(0, len(all_actions))]
+                else:
+                    # Fallback
+                    action_type, coord = all_actions[rng.integers(0, len(all_actions))]
+        
+        else:  # greedy or other
+            action_type, coord = all_actions[rng.integers(0, len(all_actions))]
+        
+        # Apply action
+        r, c = coord
+        if action_type == "ADD":
+            current_topology[r, c] = 1
+        else:  # REMOVE
+            current_topology[r, c] = 0
                 
     return current_topology, fitness_history
 
@@ -275,8 +385,8 @@ def run_episode(
     # Phase 1: Growth
     print("  Phase 1: Growth")
     ny, nx = config.resolution
-    initial_topology = np.zeros((ny, nx), dtype=np.int32)
-    connected_topology = phase1_growth(initial_topology, config)
+    initial_topology = np.zeros((nx, ny), dtype=np.int32)  # FEM expects (nx, ny)
+    connected_topology = phase1_growth(initial_topology, config, seed=seed if seed is not None else 0)
     
     # Phase 2: Refinement
     print("  Phase 2: Refinement")
@@ -290,6 +400,6 @@ def run_episode(
         rng
     )
     
-    print(f"  Episode complete. Best fitness: {max(fitness_history):.6f}")
+    print(f"  Episode complete. Best fitness: {max(fitness_history):.6e}")
     
     return episode_id
