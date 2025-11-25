@@ -126,13 +126,20 @@ class UniversalPatchEncoder(layers.Layer):
         is_3d = tf.equal(rank, 5)
         
         # Normalize input to 5D to satisfy XLA static shape requirements
-        # If 4D (B, H, W, C) -> (B, 1, H, W, C)
-        # If 5D (B, D, H, W, C) -> keep
-        x_5d = tf.cond(
-            is_3d,
-            lambda: images,
-            lambda: tf.expand_dims(images, 1)
-        )
+        # We use tf.reshape with a dynamically constructed shape vector
+        # This avoids tf.cond returning tensors of different ranks
+        
+        shape = tf.shape(images)
+        
+        def _shape_5d():
+            return shape
+            
+        def _shape_4d_to_5d():
+            # Insert dim 1 at axis 1: (B, H, W, C) -> (B, 1, H, W, C)
+            return tf.concat([shape[:1], [1], shape[1:]], axis=0)
+            
+        target_shape = tf.cond(is_3d, _shape_5d, _shape_4d_to_5d)
+        x_5d = tf.reshape(images, target_shape)
         
         def process_2d():
             # Squeeze back to 4D for 2D processing
