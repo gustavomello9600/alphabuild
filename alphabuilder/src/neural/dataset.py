@@ -13,7 +13,8 @@ def data_generator(db_path):
     """
     Generator function that yields (state, max_displacement) pairs from the database.
     """
-    conn = sqlite3.connect(db_path)
+    # Allow cross-thread access for tf.data pipeline
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     cursor = conn.cursor()
     
     # Select all valid records from Refinement phase
