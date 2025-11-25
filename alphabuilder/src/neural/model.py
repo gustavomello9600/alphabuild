@@ -123,45 +123,20 @@ class UniversalPatchEncoder(layers.Layer):
         # Input is always 5D: (Batch, Depth, Height, Width, Channels)
         input_shape = tf.shape(images)
         batch_size = input_shape[0]
-        depth = input_shape[1]
         
-        # Check if input is "flat" (2D treated as 3D with depth=1)
-        is_flat = tf.equal(depth, 1)
+        # Use Conv3D with planar kernel (1, P, P) - works for both 2D and 3D
+        # For 2D (Depth=1): Acts like Conv2D
+        # For 3D (Depth>1): Extracts 2D slices along depth (can be upgraded later)
+        k_planar = tf.expand_dims(self.kernel_2d, axis=0)  # (1, P, P, C, Out)
         
-        # Prepare safe input for 3D branch to satisfy XLA shape inference
-        # When input is 2D (Depth=1), Conv3D with Depth=4 would fail static analysis.
-        # So we feed a dummy tensor of Depth=4 to the 3D branch in that case.
-        def _get_safe_3d():
-            # Tile to depth 4: (B, 1, H, W, C) -> (B, 4, H, W, C)
-            return tf.tile(images, [1, 4, 1, 1, 1])
-            
-        safe_3d_input = tf.cond(is_flat, _get_safe_3d, lambda: images)
-        
-        def apply_2d_sim():
-            # Use 2D kernel reshaped as (1, P, P, C, Out)
-            # Strides: (1, 1, P, P, 1) -> No stride in depth
-            k2d = tf.expand_dims(self.kernel_2d, axis=0)
-            return tf.nn.conv3d(
-                images, 
-                k2d, 
-                strides=[1, 1, self.patch_size, self.patch_size, 1], 
-                padding="VALID"
-            )
-            
-        def apply_3d():
-            # Use 3D kernel (P, P, P, C, Out)
-            # Use safe_3d_input which is guaranteed to have Depth >= 4
-            return tf.nn.conv3d(
-                safe_3d_input, 
-                self.kernel_3d, 
-                strides=[1, self.patch_size, self.patch_size, self.patch_size, 1], 
-                padding="VALID"
-            )
-            
-        x = tf.cond(is_flat, apply_2d_sim, apply_3d)
+        x = tf.nn.conv3d(
+            images, 
+            k_planar, 
+            strides=[1, 1, self.patch_size, self.patch_size, 1],  # No stride in depth
+            padding="VALID"
+        )
         x = tf.nn.bias_add(x, self.bias)
         
-        # Recalculate shapes after conv
         d_prime = tf.shape(x)[1]
         h_prime = tf.shape(x)[2]
         w_prime = tf.shape(x)[3]
@@ -170,7 +145,6 @@ class UniversalPatchEncoder(layers.Layer):
         x = tf.reshape(x, [batch_size, d_prime * h_prime * w_prime, self.projection_dim])
         
         # Add 3D positional embeddings
-        # For 2D (d_prime=1), this works if the embedding function handles it correctly
         pos_emb = self._get_sinusoidal_embeddings_3d(d_prime, h_prime, w_prime)
         
         encoded = x + pos_emb
