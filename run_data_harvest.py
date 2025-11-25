@@ -2,12 +2,14 @@
 """
 Data Harvest Script for AlphaBuilder Training Data Generation.
 
-Runs 50 episodes using random exploration in Phase 2 and saves
+Runs episodes using random exploration in Phase 2 and saves
 all results to data/training_data.db.
+Supports command-line arguments for Colab usage.
 """
 
 import sys
 import time
+import argparse
 from pathlib import Path
 from datetime import datetime
 
@@ -38,27 +40,44 @@ def print_section(text: str):
     print('─' * 80)
 
 
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="AlphaBuilder Data Harvest")
+    parser.add_argument("--episodes", type=int, default=50, help="Number of episodes to run")
+    parser.add_argument("--resolution", type=str, default="64x32", help="Mesh resolution (WxH), e.g., 64x32")
+    parser.add_argument("--db-path", type=str, default="data/training_data.db", help="Path to SQLite database")
+    parser.add_argument("--steps", type=int, default=100, help="Max refinement steps per episode")
+    return parser.parse_args()
+
+
 def main():
-    """Run 50 training episodes and save to database."""
+    """Run training episodes and save to database."""
+    args = parse_args()
     
     start_time = time.time()
     
     print_header("AlphaBuilder Data Harvest", "═")
     print(f"Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # Configuration - optimized for data quality
-    num_episodes = 100  # Increased from 50 for better dataset diversity
-    db_path = Path("data/training_data.db")
+    # Configuration
+    num_episodes = args.episodes
+    db_path = Path(args.db_path)
+    
+    # Parse resolution
+    try:
+        w, h = map(int, args.resolution.split('x'))
+        resolution = (w, h)
+    except ValueError:
+        print(f"Error: Invalid resolution format '{args.resolution}'. Use WxH (e.g., 64x32).")
+        sys.exit(1)
     
     print_section("Configuration")
     print(f"  Number of episodes: {num_episodes}")
     print(f"  Database path: {db_path.absolute()}")
-    print(f"  Resolution: 32x16 (512 cells)")
-    print(f"  Max refinement steps: 50 (optimized for diversity)")
-    print(f"  Stagnation threshold: Relative 0.1% or Absolute 1e-11")
-    print(f"  Stagnation patience: 10 steps")
-    print(f"  Growth strategy: A* pathfinding")
-    print(f"  Exploration strategy: Mixed (40% random, 30% remove_weak, 20% add_support, 10% symmetry)")
+    print(f"  Resolution: {resolution[0]}x{resolution[1]} ({resolution[0]*resolution[1]} cells)")
+    print(f"  Max refinement steps: {args.steps}")
+    print(f"  Stagnation threshold: 1e-4")
+    print(f"  Stagnation patience: 20 steps")
     
     # Initialize database
     print_section("Database Initialization")
@@ -70,7 +89,6 @@ def main():
     print(f"  ✓ Database initialized in {db_time:.3f}s")
     print(f"  ✓ Existing episodes in database: {existing_episodes}")
     
-    
     # Physical properties
     props = PhysicalProperties()
     
@@ -78,67 +96,39 @@ def main():
     print_section("FEM Context Initialization")
     print("  Initializing FEniCSx context...")
     print("  This may take a few seconds on first run...")
-    resolution = (16, 32)  # (ny, nx) - height x width
     fem_start = time.time()
     ctx = initialize_cantilever_context(resolution, props)
     fem_time = time.time() - fem_start
     print(f"  ✓ FEM context initialized in {fem_time:.3f}s")
-    print(f"  ✓ Mesh size: {resolution[1]}x{resolution[0]} = {resolution[0]*resolution[1]} cells")
+    print(f"  ✓ Mesh size: {resolution[0]}x{resolution[1]} = {resolution[0]*resolution[1]} cells")
+    
     print(f"  ✓ Physical properties loaded")
     print(f"    - Young's modulus (solid): {props.E_solid}")
     print(f"    - Young's modulus (void): {props.E_void}")
     print(f"    - Poisson's ratio: {props.nu}")
     
-    # Episode configuration - using new optimized defaults
+    # Episode configuration
     config = EpisodeConfig(
-        resolution=resolution
-        # All other parameters use optimized defaults:
-        # - max_refinement_steps: 50
-        # - use_relative_threshold: True
-        # - stagnation_threshold_relative: 0.001 (0.1%)
-        # - stagnation_threshold_absolute: 1e-11
-        # - stagnation_patience: 10
-        # - growth_strategy: "astar"
-        # - exploration_strategy: "mixed"
+        resolution=resolution,
+        max_refinement_steps=args.steps,
+        stagnation_threshold=1e-4,
+        stagnation_patience=20
     )
-    
-    # Load Neural Model
-    print_section("Neural Model Loading")
-    model = None
-    try:
-        import tensorflow as tf
-        from alphabuilder.src.neural.trainer import load_model
-        
-        # Check for model in checkpoints directory
-        model_path = Path("alphabuilder/checkpoints/latest_model.keras")
-        if model_path.exists():
-            print(f"  Loading model from {model_path}...")
-            model = load_model(str(model_path))
-            print("  ✓ Model loaded successfully")
-            
-            # Update config to use neural guidance
-            config.use_neural_guidance = True
-            config.exploration_strategy = "neural_greedy"
-            print("  ✓ Neural guidance enabled (Strategy: neural_greedy)")
-        else:
-            print(f"  Model not found at {model_path}")
-            print("  ⚠ Neural guidance disabled (using mixed strategy)")
-            
-    except ImportError:
-        print("  ⚠ TensorFlow not found. Neural guidance disabled.")
-    except Exception as e:
-        print(f"  ⚠ Error loading model: {e}")
     
     # Run episodes
     print_header(f"Running {num_episodes} Episodes")
     
     episode_times = []
     
+    # Use existing count to offset seed, ensuring variety if run multiple times
+    seed_offset = existing_episodes
+    
     for i in range(num_episodes):
         episode_start = time.time()
+        current_seed = seed_offset + i
         
         print(f"\n{'═' * 80}")
-        print(f"Episode {i+1}/{num_episodes} (Seed: {i})")
+        print(f"Episode {i+1}/{num_episodes} (Seed: {current_seed})")
         print('═' * 80)
         
         episode_id = run_episode(
@@ -146,8 +136,7 @@ def main():
             props=props,
             db_path=db_path,
             config=config,
-            seed=i,  # Use episode number as seed for reproducibility
-            model=model
+            seed=current_seed
         )
         
         episode_time = time.time() - episode_start
@@ -183,13 +172,15 @@ def main():
     print(f"  Total episodes in database: {final_count}")
     print(f"  New episodes generated: {new_episodes}")
     print(f"  Database location: {db_path.absolute()}")
-    print(f"  Database size: {db_path.stat().st_size / 1024 / 1024:.2f} MB")
+    if db_path.exists():
+        print(f"  Database size: {db_path.stat().st_size / 1024 / 1024:.2f} MB")
     
     print(f"\n⏱️  Timing:")
     print(f"  Total execution time: {total_time/60:.2f} minutes ({total_time:.1f}s)")
-    print(f"  Average time per episode: {sum(episode_times)/len(episode_times):.2f}s")
-    print(f"  Fastest episode: {min(episode_times):.2f}s")
-    print(f"  Slowest episode: {max(episode_times):.2f}s")
+    if episode_times:
+        print(f"  Average time per episode: {sum(episode_times)/len(episode_times):.2f}s")
+        print(f"  Fastest episode: {min(episode_times):.2f}s")
+        print(f"  Slowest episode: {max(episode_times):.2f}s")
     print(f"  FEM initialization: {fem_time:.3f}s")
     print(f"  Database initialization: {db_time:.3f}s")
     
