@@ -125,34 +125,22 @@ class UniversalPatchEncoder(layers.Layer):
         rank = tf.rank(images)
         is_3d = tf.equal(rank, 5)
         
-        # Prepare safe inputs to satisfy static shape inference in both branches
-        # We use dummy tensors of correct rank and sufficient size for the inactive branch
-        # This prevents graph construction errors (e.g. negative dimensions in Conv)
-        
-        channels = self.kernel_2d.shape[2] # Known from build()
-        
-        def _to_5d():
-            # Dummy 5D tensor for 3D branch (when input is 4D)
-            return tf.zeros([1, 16, 16, 16, channels])
-            
-        def _id_5d():
-            return images
-            
-        safe_5d = tf.cond(is_3d, _id_5d, _to_5d)
-        
-        def _to_4d():
-            # Dummy 4D tensor for 2D branch (when input is 5D)
-            return tf.zeros([1, 16, 16, channels])
-            
-        def _id_4d():
-            return images
-            
-        safe_4d = tf.cond(is_3d, _to_4d, _id_4d)
+        # Normalize input to 5D to satisfy XLA static shape requirements
+        # If 4D (B, H, W, C) -> (B, 1, H, W, C)
+        # If 5D (B, D, H, W, C) -> keep
+        x_5d = tf.cond(
+            is_3d,
+            lambda: images,
+            lambda: tf.expand_dims(images, 1)
+        )
         
         def process_2d():
-            # Use safe_4d which is guaranteed to be rank 4
+            # Squeeze back to 4D for 2D processing
+            # x_5d is (B, 1, H, W, C) -> (B, H, W, C)
+            x_4d = tf.squeeze(x_5d, axis=1)
+            
             x = tf.nn.conv2d(
-                safe_4d, 
+                x_4d, 
                 self.kernel_2d, 
                 strides=[1, self.patch_size, self.patch_size, 1], 
                 padding="VALID"
@@ -167,9 +155,9 @@ class UniversalPatchEncoder(layers.Layer):
             return x + pos_emb
             
         def process_3d():
-            # Use safe_5d which is guaranteed to be rank 5
+            # Use x_5d directly
             x = tf.nn.conv3d(
-                safe_5d, 
+                x_5d, 
                 self.kernel_3d, 
                 strides=[1, self.patch_size, self.patch_size, self.patch_size, 1], 
                 padding="VALID"
