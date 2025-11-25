@@ -1,5 +1,6 @@
 import tensorflow as tf
 from tensorflow.keras import layers, models
+import numpy as np
 
 class Patches(layers.Layer):
     def __init__(self, patch_size):
@@ -19,80 +20,90 @@ class Patches(layers.Layer):
         patches = tf.reshape(patches, [batch_size, -1, patch_dims])
         return patches
 
+def get_sinusoidal_embeddings(num_positions, projection_dim):
+    """
+    Generates fixed sinusoidal positional embeddings.
+    """
+    positions = np.arange(num_positions)[:, np.newaxis]
+    div_term = np.exp(np.arange(0, projection_dim, 2) * -(np.log(10000.0) / projection_dim))
+    
+    embeddings = np.zeros((num_positions, projection_dim))
+    embeddings[:, 0::2] = np.sin(positions * div_term)
+    embeddings[:, 1::2] = np.cos(positions * div_term)
+    
+    return tf.constant(embeddings, dtype=tf.float32)
+
 class PatchEncoder(layers.Layer):
     def __init__(self, num_patches, projection_dim):
         super(PatchEncoder, self).__init__()
         self.num_patches = num_patches
         self.projection = layers.Dense(units=projection_dim)
-        self.position_embedding = layers.Embedding(
-            input_dim=num_patches, output_dim=projection_dim
-        )
+        # Fixed Sinusoidal Embeddings (Crucial Context #2)
+        self.position_embedding = get_sinusoidal_embeddings(num_patches + 1, projection_dim) # +1 for CLS token
 
     def call(self, patch):
-        positions = tf.range(start=0, limit=self.num_patches, delta=1)
-        encoded = self.projection(patch) + self.position_embedding(positions)
+        # patch shape: (batch, num_patches, patch_dim)
+        encoded = self.projection(patch)
+        
+        # Add CLS token (Crucial Context #3)
+        batch_size = tf.shape(patch)[0]
+        cls_token = tf.zeros((batch_size, 1, encoded.shape[-1])) # Learnable CLS token could be better, but zero is standard start
+        encoded = tf.concat([cls_token, encoded], axis=1)
+        
+        # Add positional embeddings
+        encoded = encoded + self.position_embedding
         return encoded
 
 def create_vit_regressor(
-    input_shape=(32, 64, 3), # (H, W, C) - Note: W=64, H=32 usually
+    input_shape=(32, 64, 3), # (H, W, C)
     patch_size=4,
-    num_patches=None, # Calculated automatically if None
+    num_patches=None, 
     projection_dim=64,
     num_heads=4,
     transformer_layers=4,
     mlp_head_units=[2048, 1024],
 ):
     """
-    Creates a Vision Transformer model for regression (Fitness prediction).
+    Creates a Vision Transformer model for Max Displacement prediction.
+    Complies with 'contexto_crucial.md'.
     """
     inputs = layers.Input(shape=input_shape)
     
-    # Calculate num_patches if not provided
     if num_patches is None:
         num_patches = (input_shape[0] // patch_size) * (input_shape[1] // patch_size)
 
     # Create patches
     patches = Patches(patch_size)(inputs)
     
-    # Encode patches
+    # Encode patches (includes CLS token and Sinusoidal Embeddings)
     encoded_patches = PatchEncoder(num_patches, projection_dim)(patches)
 
     # Transformer Blocks
     for _ in range(transformer_layers):
-        # Layer normalization 1.
         x1 = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
-        # Create a multi-head attention layer.
         attention_output = layers.MultiHeadAttention(
             num_heads=num_heads, key_dim=projection_dim, dropout=0.1
         )(x1, x1)
-        # Skip connection 1.
         x2 = layers.Add()([attention_output, encoded_patches])
-        # Layer normalization 2.
         x3 = layers.LayerNormalization(epsilon=1e-6)(x2)
-        # MLP.
         x3 = layers.Dense(units=projection_dim * 2, activation=tf.nn.gelu)(x3)
         x3 = layers.Dense(units=projection_dim, activation=tf.nn.gelu)(x3)
-        # Skip connection 2.
         encoded_patches = layers.Add()([x3, x2])
 
-    # Create a [batch_size, projection_dim] tensor.
+    # Aggregation: Use CLS Token (Index 0) (Crucial Context #3)
     representation = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
-    representation = layers.Flatten()(representation)
-    representation = layers.Dropout(0.5)(representation)
+    cls_token_output = representation[:, 0, :] 
+    
+    features = layers.Dropout(0.5)(cls_token_output)
 
     # MLP Head
-    features = representation
     for units in mlp_head_units:
         features = layers.Dense(units, activation=tf.nn.gelu)(features)
         features = layers.Dropout(0.5)(features)
 
-    # Output Layer (Scalar Regression)
-    # Sigmoid activation because fitness is in [0, 1] range (Kane Eq 1)
-    # But usually it's small, so linear or sigmoid? 
-    # Kane fitness is 1 / (Mass + Penalty). Max is 1/Mass_min.
-    # If mass is normalized, fitness is roughly in [0, ~10].
-    # Let's use linear (None) or Relu to ensure positive.
-    outputs = layers.Dense(1, activation="relu")(features)
+    # Output Layer: Max Displacement (Crucial Context #1)
+    # Using softplus to ensure positive output, as displacement is magnitude
+    outputs = layers.Dense(1, activation="softplus", name="max_displacement_output")(features)
 
     model = models.Model(inputs=inputs, outputs=outputs)
     return model

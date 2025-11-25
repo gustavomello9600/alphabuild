@@ -51,9 +51,10 @@ class EpisodeConfig:
     
     # Adaptive stagnation detection
     use_relative_threshold: bool = True  # Use percentage-based threshold
+    stagnation_threshold: float = 1e-4  # General threshold (used as relative or absolute base)
     stagnation_threshold_relative: float = 0.001  # 0.1% relative improvement
     stagnation_threshold_absolute: float = 1e-11  # Fallback absolute threshold
-    stagnation_patience: int = 10  # Reduced from 20
+    stagnation_patience: int = 20  # Increased default to match harvest script
     
     # Phase 1 growth strategy
     growth_strategy: str = "astar"  # Options: "straight", "astar", "smart_heuristic", "random_pattern"
@@ -349,7 +350,7 @@ def phase2_refinement(
                  
                  try:
                      # Predict displacements
-                     # predict_fitness returns (Batch, 1)
+                     # predict_fitness returns (Batch, 1) representing Max Displacement
                      pred_disps = predict_fitness(model, candidate_grids, thicknesses)
                      
                      # Calculate predicted fitness
@@ -366,7 +367,13 @@ def phase2_refinement(
                          # Calculate fitness (simplified Kane Eq 1)
                          # We use the same parameters as solver
                          penalty = max(0.0, d - props.disp_limit)
-                         denominator = mass + props.penalty_epsilon * 0.0 + props.penalty_alpha * penalty
+                         
+                         # Note: Solver uses mean(topology) for omega_mat, not sum.
+                         # Let's align with solver.py: omega_mat = np.mean(topology_matrix)
+                         omega_mat = np.mean(candidate_grids[idx])
+                         omega_dis = 0.0 # Not used in current solver
+                         
+                         denominator = omega_mat + props.penalty_epsilon * omega_dis + props.penalty_alpha * penalty
                          
                          if denominator < 1e-9:
                              f = 0.0

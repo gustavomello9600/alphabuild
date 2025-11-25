@@ -2,6 +2,7 @@ import tensorflow as tf
 import sqlite3
 import numpy as np
 import pickle
+import json
 from pathlib import Path
 
 def deserialize_state(state_blob):
@@ -10,14 +11,15 @@ def deserialize_state(state_blob):
 
 def data_generator(db_path):
     """
-    Generator function that yields (state, fitness) pairs from the database.
+    Generator function that yields (state, max_displacement) pairs from the database.
     """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
     # Select all valid records from Refinement phase
+    # We need metadata to extract max_displacement
     cursor.execute("""
-        SELECT state_blob, fitness_score 
+        SELECT state_blob, metadata 
         FROM training_data 
         WHERE phase = 'REFINEMENT' AND valid_fem = 1
         ORDER BY RANDOM()
@@ -28,23 +30,17 @@ def data_generator(db_path):
         if row is None:
             break
             
-        state_blob, fitness = row
+        state_blob, metadata_json = row
         state = deserialize_state(state_blob)
+        metadata = json.loads(metadata_json)
         
-        # Ensure state is float32 and normalized if needed
-        # State is binary (0, 1), so float32 is fine.
-        # Shape is (H, W). ViT expects (H, W, C).
-        # We need to add channel dimension if missing.
+        # Target: Max Displacement (Crucial Context #1)
+        max_disp = float(metadata.get("max_displacement", 0.0))
+        
+        # Ensure state is float32
         if len(state.shape) == 2:
             state = np.expand_dims(state, axis=-1)
             
-        # Add extra channels for BCs and Loads if we had them
-        # For now, just topology channel.
-        # Ideally we should construct the full 3-channel tensor here:
-        # Ch0: Topology
-        # Ch1: Supports (Fixed x=0)
-        # Ch2: Loads (Point at L, H/2)
-        
         H, W = state.shape[:2]
         full_state = np.zeros((H, W, 3), dtype=np.float32)
         
@@ -55,12 +51,11 @@ def data_generator(db_path):
         full_state[:, 0, 1] = 1.0
         
         # Ch2: Loads (Right edge middle)
-        # Assuming 64x32 or 32x16
         load_y = H // 2
         load_x = W - 1
         full_state[load_y, load_x, 2] = 1.0
         
-        yield full_state, float(fitness)
+        yield full_state, max_disp
         
     conn.close()
 
