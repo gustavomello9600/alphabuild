@@ -51,8 +51,8 @@ def test_mixed_resolution_batching(tmp_path):
     x, y = batch
     
     # 4. Verify
-    # Shape should be (2, 32, 64, 3) because 32x64 is the max
-    assert x.shape == (2, 32, 64, 3)
+    # Shape should be (2, 1, 32, 64, 3) because 32x64 is the max and Depth=1
+    assert x.shape == (2, 1, 32, 64, 3)
     assert y.shape == (2,)
     
     # Check padding

@@ -45,7 +45,8 @@ def main():
     # Create Model
     # Use flexible input shape to allow variable resolutions/padding
     # The model will adapt to whatever shape padded_batch produces
-    model = create_vit_regressor(input_shape=(None, None, 3))
+    # Always 5D: (Batch, Depth, Height, Width, Channels)
+    model = create_vit_regressor(input_shape=(None, None, None, 3))
     optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
     model.compile(optimizer=optimizer, loss='mse', metrics=['mae'])
     

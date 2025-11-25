@@ -79,7 +79,11 @@ def data_generator(db_path):
         load_x = W - 1
         full_state[load_y, load_x, 2] = 1.0
         
-        yield full_state, max_disp
+        # Expand to 3D (Depth=1) for Universal ViT
+        # Shape: (1, H, W, 3)
+        full_state_5d = np.expand_dims(full_state, axis=0)
+        
+        yield full_state_5d, max_disp
         
     conn.close()
 
@@ -90,7 +94,7 @@ def create_dataset(db_path, batch_size=32, buffer_size=1000):
     return tf.data.Dataset.from_generator(
         lambda: data_generator(db_path),
         output_signature=(
-            tf.TensorSpec(shape=(None, None, 3), dtype=tf.float32),
+            tf.TensorSpec(shape=(None, None, None, 3), dtype=tf.float32),
             tf.TensorSpec(shape=(), dtype=tf.float32)
         )
     ).shuffle(buffer_size).padded_batch(batch_size).prefetch(tf.data.AUTOTUNE)

@@ -120,66 +120,60 @@ class UniversalPatchEncoder(layers.Layer):
         return tf.reshape(embeddings, [1, depth * height * width, d_model])
 
     def call(self, images):
+        # Input is always 5D: (Batch, Depth, Height, Width, Channels)
         input_shape = tf.shape(images)
         batch_size = input_shape[0]
-        rank = tf.rank(images)
-        is_3d = tf.equal(rank, 5)
+        depth = input_shape[1]
         
-        # Normalize input to 5D to satisfy XLA static shape requirements
-        # We use tf.reshape with a dynamically constructed shape vector
-        # This avoids tf.cond returning tensors of different ranks
+        # Check if input is "flat" (2D treated as 3D with depth=1)
+        is_flat = tf.equal(depth, 1)
         
-        shape = tf.shape(images)
-        
-        def _shape_5d():
-            return shape
+        # Prepare safe input for 3D branch to satisfy XLA shape inference
+        # When input is 2D (Depth=1), Conv3D with Depth=4 would fail static analysis.
+        # So we feed a dummy tensor of Depth=4 to the 3D branch in that case.
+        def _get_safe_3d():
+            # Tile to depth 4: (B, 1, H, W, C) -> (B, 4, H, W, C)
+            return tf.tile(images, [1, 4, 1, 1, 1])
             
-        def _shape_4d_to_5d():
-            # Insert dim 1 at axis 1: (B, H, W, C) -> (B, 1, H, W, C)
-            return tf.concat([shape[:1], [1], shape[1:]], axis=0)
-            
-        target_shape = tf.cond(is_3d, _shape_5d, _shape_4d_to_5d)
-        x_5d = tf.reshape(images, target_shape)
+        safe_3d_input = tf.cond(is_flat, _get_safe_3d, lambda: images)
         
-        def process_2d():
-            # Squeeze back to 4D for 2D processing
-            # x_5d is (B, 1, H, W, C) -> (B, H, W, C)
-            x_4d = tf.squeeze(x_5d, axis=1)
-            
-            x = tf.nn.conv2d(
-                x_4d, 
-                self.kernel_2d, 
-                strides=[1, self.patch_size, self.patch_size, 1], 
+        def apply_2d_sim():
+            # Use 2D kernel reshaped as (1, P, P, C, Out)
+            # Strides: (1, 1, P, P, 1) -> No stride in depth
+            k2d = tf.expand_dims(self.kernel_2d, axis=0)
+            return tf.nn.conv3d(
+                images, 
+                k2d, 
+                strides=[1, 1, self.patch_size, self.patch_size, 1], 
                 padding="VALID"
             )
-            x = tf.nn.bias_add(x, self.bias)
             
-            h_prime = tf.shape(x)[1]
-            w_prime = tf.shape(x)[2]
-            
-            x = tf.reshape(x, [batch_size, h_prime * w_prime, self.projection_dim])
-            pos_emb = self._get_sinusoidal_embeddings_2d(h_prime, w_prime)
-            return x + pos_emb
-            
-        def process_3d():
-            # Use x_5d directly
-            x = tf.nn.conv3d(
-                x_5d, 
+        def apply_3d():
+            # Use 3D kernel (P, P, P, C, Out)
+            # Use safe_3d_input which is guaranteed to have Depth >= 4
+            return tf.nn.conv3d(
+                safe_3d_input, 
                 self.kernel_3d, 
                 strides=[1, self.patch_size, self.patch_size, self.patch_size, 1], 
                 padding="VALID"
             )
-            x = tf.nn.bias_add(x, self.bias)
             
-            d_prime = tf.shape(x)[1]
-            h_prime = tf.shape(x)[2]
-            w_prime = tf.shape(x)[3]
-            
-            x = tf.reshape(x, [batch_size, d_prime * h_prime * w_prime, self.projection_dim])
-            pos_emb = self._get_sinusoidal_embeddings_3d(d_prime, h_prime, w_prime)
-            return x + pos_emb
-
-        encoded = tf.cond(is_3d, process_3d, process_2d)
+        x = tf.cond(is_flat, apply_2d_sim, apply_3d)
+        x = tf.nn.bias_add(x, self.bias)
+        
+        # Recalculate shapes after conv
+        d_prime = tf.shape(x)[1]
+        h_prime = tf.shape(x)[2]
+        w_prime = tf.shape(x)[3]
+        
+        # Flatten patches
+        x = tf.reshape(x, [batch_size, d_prime * h_prime * w_prime, self.projection_dim])
+        
+        # Add 3D positional embeddings
+        # For 2D (d_prime=1), this works if the embedding function handles it correctly
+        pos_emb = self._get_sinusoidal_embeddings_3d(d_prime, h_prime, w_prime)
+        
+        encoded = x + pos_emb
         
         cls_broadcast = tf.tile(self.cls_token, [batch_size, 1, 1])
         return tf.concat([cls_broadcast, encoded], axis=1)
