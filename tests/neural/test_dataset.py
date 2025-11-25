@@ -2,10 +2,12 @@ import pytest
 import tensorflow as tf
 import numpy as np
 import json
+import sqlite3
+import pickle
 from alphabuilder.src.logic.storage import (
     save_record, TrainingRecord, Phase, serialize_state
 )
-from alphabuilder.src.neural.dataset import create_dataset, data_generator
+from alphabuilder.src.neural.dataset import create_dataset, data_generator, get_dataset_shape
 
 def test_data_generator(temp_db):
     """Test data generator yields correct data."""
@@ -46,6 +48,29 @@ def test_data_generator(temp_db):
     
     assert x.shape == (32, 64, 3)
     assert y == 1.5
+
+def test_get_dataset_shape(temp_db):
+    """Test auto-detection of dataset shape."""
+    # Insert a record with known shape (16, 32)
+    conn = sqlite3.connect(temp_db)
+    cursor = conn.cursor()
+    
+    state = np.zeros((16, 32), dtype=np.float32)
+    state_blob = pickle.dumps(state)
+    
+    cursor.execute("""
+        INSERT INTO training_data (episode_id, step, phase, state_blob, fitness_score, valid_fem, metadata)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, ("test_ep", 1, "REFINEMENT", state_blob, 1.0, 1, "{}"))
+    conn.commit()
+    conn.close()
+    
+    # Test detection
+    shape = get_dataset_shape(temp_db)
+    assert shape == (16, 32, 3)
+    
+    # Test empty DB
+    assert get_dataset_shape("non_existent.db") is None
 
 def test_create_dataset(temp_db):
     """Test tf.data.Dataset creation."""

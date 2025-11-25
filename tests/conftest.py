@@ -12,10 +12,52 @@ from unittest.mock import MagicMock
 mock_dolfinx = os.environ.get("MOCK_DOLFINX", "0") == "1"
 
 if mock_dolfinx:
-    sys.modules["dolfinx"] = MagicMock()
-    sys.modules["dolfinx.mesh"] = MagicMock()
-    sys.modules["dolfinx.fem"] = MagicMock()
-    sys.modules["dolfinx.fem.petsc"] = MagicMock()
+    mock_dolfinx = MagicMock()
+    sys.modules["dolfinx"] = mock_dolfinx
+    mock_dolfinx.default_scalar_type = np.float64
+    
+    mock_mesh = MagicMock()
+    mock_mesh.CellType.quadrilateral = "quadrilateral"
+    sys.modules["dolfinx.mesh"] = mock_mesh
+    mock_dolfinx.mesh = mock_mesh
+    
+    # Configure FunctionSpace mock
+    mock_fs = MagicMock()
+    dummy_coords = np.zeros((512, 3))
+    mock_fs.tabulate_dof_coordinates.return_value = dummy_coords
+    mock_fs.dofmap.index_map.size_local = 512
+    
+    mock_fem = MagicMock()
+    mock_fem.functionspace.return_value = mock_fs
+    sys.modules["dolfinx.fem"] = mock_fem
+    mock_dolfinx.fem = mock_fem
+    
+    mock_fem_petsc = MagicMock()
+    
+    # Configure LinearProblem
+    mock_problem = MagicMock()
+    # Mock solution vector u
+    mock_u = MagicMock()
+    # Array must be large enough for reshape if needed, or just flat
+    # Physics model might reshape it?
+    # "Calcule D_max = max ||u||_L2" usually implies reshaping to (N, 2) or similar?
+    # Or just norm of the vector?
+    # If it's a flat vector of size 2*N, norm is scalar.
+    # But if code does .reshape(-1, 2), we need correct size.
+    # Let's assume 512 nodes * 2 dofs = 1024
+    mock_u.x.array = np.zeros(1024) 
+    mock_problem.u = mock_u
+    
+    # Mock RHS vector b
+    mock_b = MagicMock()
+    mock_b.dot.return_value = 1.0
+    mock_b.norm.return_value = 1.0
+    mock_problem.b = mock_b
+    
+    mock_fem_petsc.LinearProblem.return_value = mock_problem
+    sys.modules["dolfinx.fem.petsc"] = mock_fem_petsc
+    mock_fem.petsc = mock_fem_petsc
+    
     sys.modules["mpi4py"] = MagicMock()
     sys.modules["petsc4py"] = MagicMock()
     sys.modules["ufl"] = MagicMock()

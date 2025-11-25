@@ -8,7 +8,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from alphabuilder.src.neural.model import create_vit_regressor
-from alphabuilder.src.neural.dataset import create_dataset
+from alphabuilder.src.neural.dataset import create_dataset, get_dataset_shape
 from alphabuilder.src.neural.logger import TrainingLogger
 
 def parse_args():
@@ -18,15 +18,27 @@ def parse_args():
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--resolution", type=str, default="64x32")
+    # Resolution argument is now optional/fallback
+    parser.add_argument("--resolution", type=str, default=None, help="Force resolution HxW (e.g. 32x64). If None, auto-detects.")
     return parser.parse_args()
 
 def main():
     args = parse_args()
     
-    # Parse resolution
-    w, h = map(int, args.resolution.split('x'))
-    input_shape = (h, w, 3) # (32, 64, 3)
+    # Auto-detect shape
+    detected_shape = get_dataset_shape(args.db_path)
+    
+    if args.resolution:
+        h, w = map(int, args.resolution.split('x'))
+        input_shape = (h, w, 3)
+        print(f"Forcing resolution: {input_shape}")
+    elif detected_shape:
+        input_shape = detected_shape
+        print(f"Auto-detected input shape from DB: {input_shape}")
+    else:
+        # Fallback default
+        print("Warning: Could not detect shape from DB (empty?). Using default 32x64.")
+        input_shape = (32, 64, 3)
     
     # Create Model
     model = create_vit_regressor(input_shape=input_shape)

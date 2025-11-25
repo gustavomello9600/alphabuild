@@ -2,23 +2,6 @@ import tensorflow as tf
 from tensorflow.keras import layers, models
 import numpy as np
 
-class Patches(layers.Layer):
-    def __init__(self, patch_size):
-        super(Patches, self).__init__()
-        self.patch_size = patch_size
-
-    def call(self, images):
-        batch_size = tf.shape(images)[0]
-        patches = tf.image.extract_patches(
-            images=images,
-            sizes=[1, self.patch_size, self.patch_size, 1],
-            strides=[1, self.patch_size, self.patch_size, 1],
-            rates=[1, 1, 1, 1],
-            padding="VALID",
-        )
-        patch_dims = patches.shape[-1]
-        patches = tf.reshape(patches, [batch_size, -1, patch_dims])
-        return patches
 
 def get_sinusoidal_embeddings(num_positions, projection_dim):
     """
@@ -33,61 +16,214 @@ def get_sinusoidal_embeddings(num_positions, projection_dim):
     
     return tf.constant(embeddings, dtype=tf.float32)
 
-class PatchEncoder(layers.Layer):
-    def __init__(self, num_patches, projection_dim):
-        super(PatchEncoder, self).__init__()
-        self.num_patches = num_patches
-        self.projection = layers.Dense(units=projection_dim)
-        # Fixed Sinusoidal Embeddings (Crucial Context #2)
-        self.position_embedding = get_sinusoidal_embeddings(num_patches + 1, projection_dim) # +1 for CLS token
+@tf.keras.utils.register_keras_serializable()
+class UniversalPatchEncoder(layers.Layer):
+    def __init__(self, patch_size=4, projection_dim=64, **kwargs):
+        super().__init__(**kwargs)
+        self.patch_size = patch_size
+        self.projection_dim = projection_dim
 
-    def call(self, patch):
-        # patch shape: (batch, num_patches, patch_dim)
-        encoded = self.projection(patch)
+    def build(self, input_shape):
+        # Input shape can be (B, H, W, C) or (B, D, H, W, C)
+        # Channel dim is always last
+        channels = input_shape[-1]
+        if channels is None:
+             raise ValueError("Channel dimension must be defined.")
+
+        # 2D Kernel: (h, w, cin, cout)
+        self.kernel_2d = self.add_weight(
+            name="kernel_2d",
+            shape=(self.patch_size, self.patch_size, channels, self.projection_dim),
+            initializer="glorot_uniform",
+            trainable=True
+        )
         
-        # Add CLS token (Crucial Context #3)
-        batch_size = tf.shape(patch)[0]
-        cls_token = tf.zeros((batch_size, 1, encoded.shape[-1])) # Learnable CLS token could be better, but zero is standard start
-        encoded = tf.concat([cls_token, encoded], axis=1)
+        # 3D Kernel: (d, h, w, cin, cout)
+        self.kernel_3d = self.add_weight(
+            name="kernel_3d",
+            shape=(self.patch_size, self.patch_size, self.patch_size, channels, self.projection_dim),
+            initializer="glorot_uniform",
+            trainable=True
+        )
         
-        # Add positional embeddings
-        encoded = encoded + self.position_embedding
-        return encoded
+        self.bias = self.add_weight(
+            name="bias",
+            shape=(self.projection_dim,),
+            initializer="zeros",
+            trainable=True
+        )
+        
+        # CLS Token
+        self.cls_token = self.add_weight(
+            name="cls_token",
+            shape=(1, 1, self.projection_dim),
+            initializer="zeros",
+            trainable=True
+        )
+        
+        super().build(input_shape)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "patch_size": self.patch_size,
+            "projection_dim": self.projection_dim,
+        })
+        return config
+
+    def _get_sinusoidal_embeddings_2d(self, height, width):
+        """Generate 2D sinusoidal embeddings."""
+        d_model = self.projection_dim
+        y_pos = tf.range(height, dtype=tf.float32)
+        x_pos = tf.range(width, dtype=tf.float32)
+        d_half = d_model // 2
+        
+        def get_1d_embedding(pos, d):
+            i = tf.range(d, dtype=tf.float32)
+            angle_rates = 1 / tf.pow(10000.0, (2 * (i // 2)) / tf.cast(d, tf.float32))
+            angle_rads = pos[:, tf.newaxis] * angle_rates[tf.newaxis, :]
+            sines = tf.math.sin(angle_rads[:, 0::2])
+            cosines = tf.math.cos(angle_rads[:, 1::2])
+            return tf.concat([sines, cosines], axis=-1)
+
+        y_emb = get_1d_embedding(y_pos, d_half)
+        x_emb = get_1d_embedding(x_pos, d_half)
+        
+        y_emb_grid = tf.tile(y_emb[:, tf.newaxis, :], [1, width, 1])
+        x_emb_grid = tf.tile(x_emb[tf.newaxis, :, :], [height, 1, 1])
+        
+        embeddings = tf.concat([y_emb_grid, x_emb_grid], axis=-1)
+        return tf.reshape(embeddings, [1, height * width, d_model])
+
+    def _get_sinusoidal_embeddings_3d(self, depth, height, width):
+        """Generate 3D sinusoidal embeddings."""
+        d_model = self.projection_dim
+        d_third = d_model // 3
+        
+        def get_1d_embedding(pos, d):
+            i = tf.range(d, dtype=tf.float32)
+            angle_rates = 1 / tf.pow(10000.0, (2 * (i // 2)) / tf.cast(d, tf.float32))
+            angle_rads = pos[:, tf.newaxis] * angle_rates[tf.newaxis, :]
+            sines = tf.math.sin(angle_rads[:, 0::2])
+            cosines = tf.math.cos(angle_rads[:, 1::2])
+            return tf.concat([sines, cosines], axis=-1)
+
+        z_emb = get_1d_embedding(tf.range(depth, dtype=tf.float32), d_third)
+        y_emb = get_1d_embedding(tf.range(height, dtype=tf.float32), d_third)
+        x_emb = get_1d_embedding(tf.range(width, dtype=tf.float32), d_model - 2*d_third)
+        
+        z_grid = tf.tile(z_emb[:, tf.newaxis, tf.newaxis, :], [1, height, width, 1])
+        y_grid = tf.tile(y_emb[tf.newaxis, :, tf.newaxis, :], [depth, 1, width, 1])
+        x_grid = tf.tile(x_emb[tf.newaxis, tf.newaxis, :, :], [depth, height, 1, 1])
+        
+        embeddings = tf.concat([z_grid, y_grid, x_grid], axis=-1)
+        return tf.reshape(embeddings, [1, depth * height * width, d_model])
+
+    def call(self, images):
+        input_shape = tf.shape(images)
+        batch_size = input_shape[0]
+        rank = tf.rank(images)
+        is_3d = tf.equal(rank, 5)
+        
+        # Prepare safe inputs to satisfy static shape inference in both branches
+        # We use dummy tensors of correct rank and sufficient size for the inactive branch
+        # This prevents graph construction errors (e.g. negative dimensions in Conv)
+        
+        channels = self.kernel_2d.shape[2] # Known from build()
+        
+        def _to_5d():
+            # Dummy 5D tensor for 3D branch (when input is 4D)
+            return tf.zeros([1, 16, 16, 16, channels])
+            
+        def _id_5d():
+            return images
+            
+        safe_5d = tf.cond(is_3d, _id_5d, _to_5d)
+        
+        def _to_4d():
+            # Dummy 4D tensor for 2D branch (when input is 5D)
+            return tf.zeros([1, 16, 16, channels])
+            
+        def _id_4d():
+            return images
+            
+        safe_4d = tf.cond(is_3d, _to_4d, _id_4d)
+        
+        def process_2d():
+            # Use safe_4d which is guaranteed to be rank 4
+            x = tf.nn.conv2d(
+                safe_4d, 
+                self.kernel_2d, 
+                strides=[1, self.patch_size, self.patch_size, 1], 
+                padding="VALID"
+            )
+            x = tf.nn.bias_add(x, self.bias)
+            
+            h_prime = tf.shape(x)[1]
+            w_prime = tf.shape(x)[2]
+            
+            x = tf.reshape(x, [batch_size, h_prime * w_prime, self.projection_dim])
+            pos_emb = self._get_sinusoidal_embeddings_2d(h_prime, w_prime)
+            return x + pos_emb
+            
+        def process_3d():
+            # Use safe_5d which is guaranteed to be rank 5
+            x = tf.nn.conv3d(
+                safe_5d, 
+                self.kernel_3d, 
+                strides=[1, self.patch_size, self.patch_size, self.patch_size, 1], 
+                padding="VALID"
+            )
+            x = tf.nn.bias_add(x, self.bias)
+            
+            d_prime = tf.shape(x)[1]
+            h_prime = tf.shape(x)[2]
+            w_prime = tf.shape(x)[3]
+            
+            x = tf.reshape(x, [batch_size, d_prime * h_prime * w_prime, self.projection_dim])
+            pos_emb = self._get_sinusoidal_embeddings_3d(d_prime, h_prime, w_prime)
+            return x + pos_emb
+
+        encoded = tf.cond(is_3d, process_3d, process_2d)
+        
+        cls_broadcast = tf.tile(self.cls_token, [batch_size, 1, 1])
+        return tf.concat([cls_broadcast, encoded], axis=1)
+
 
 def create_vit_regressor(
-    input_shape=(32, 64, 3), # (H, W, C)
+    input_shape=(None, None, 3), # Flexible shape
     patch_size=4,
-    num_patches=None, 
     projection_dim=64,
     num_heads=4,
     transformer_layers=4,
     mlp_head_units=[2048, 1024],
 ):
     """
-    Creates a Vision Transformer model for Max Displacement prediction.
-    Complies with 'contexto_crucial.md'.
+    Creates a Universal ViT model (2D/3D, Variable Resolution).
     """
     inputs = layers.Input(shape=input_shape)
     
-    if num_patches is None:
-        num_patches = (input_shape[0] // patch_size) * (input_shape[1] // patch_size)
-
-    # Create patches
-    patches = Patches(patch_size)(inputs)
-    
-    # Encode patches (includes CLS token and Sinusoidal Embeddings)
-    encoded_patches = PatchEncoder(num_patches, projection_dim)(patches)
+    # Encode patches (Universal: handles 2D/3D and variable sizes)
+    encoded_patches = UniversalPatchEncoder(patch_size, projection_dim)(inputs)
 
     # Transformer Blocks
     for _ in range(transformer_layers):
+        # Layer Normalization 1
         x1 = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
+        # Multi-Head Attention
         attention_output = layers.MultiHeadAttention(
             num_heads=num_heads, key_dim=projection_dim, dropout=0.1
         )(x1, x1)
+        # Skip Connection 1
         x2 = layers.Add()([attention_output, encoded_patches])
+        
+        # Layer Normalization 2
         x3 = layers.LayerNormalization(epsilon=1e-6)(x2)
-        x3 = layers.Dense(units=projection_dim * 2, activation=tf.nn.gelu)(x3)
-        x3 = layers.Dense(units=projection_dim, activation=tf.nn.gelu)(x3)
+        # MLP
+        x3 = layers.Dense(projection_dim * 2, activation=tf.nn.gelu)(x3)
+        x3 = layers.Dense(projection_dim)(x3)
+        x3 = layers.Dropout(0.1)(x3)
+        # Skip Connection 2
         encoded_patches = layers.Add()([x3, x2])
 
     # Aggregation: Use CLS Token (Index 0) (Crucial Context #3)

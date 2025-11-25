@@ -9,6 +9,29 @@ def deserialize_state(state_blob):
     """Deserialize numpy array from bytes."""
     return pickle.loads(state_blob)
 
+def get_dataset_shape(db_path):
+    """
+    Peek at the database to determine the input shape (H, W, 3).
+    Returns (H, W, 3) or None if DB is empty/invalid.
+    """
+    if not Path(db_path).exists():
+        return None
+        
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT state_blob FROM training_data LIMIT 1")
+    row = cursor.fetchone()
+    conn.close()
+    
+    if row is None:
+        return None
+        
+    state = deserialize_state(row[0])
+    # State is (H, W) or (H, W, 1)
+    H, W = state.shape[:2]
+    return (H, W, 3)
+
 def data_generator(db_path):
     """
     Generator function that yields (state, max_displacement) pairs from the database.
