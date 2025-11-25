@@ -102,6 +102,33 @@ def main():
         # - exploration_strategy: "mixed"
     )
     
+    # Load Neural Model
+    print_section("Neural Model Loading")
+    model = None
+    try:
+        import tensorflow as tf
+        from alphabuilder.src.neural.trainer import load_model
+        
+        # Check for model in checkpoints directory
+        model_path = Path("alphabuilder/checkpoints/latest_model.keras")
+        if model_path.exists():
+            print(f"  Loading model from {model_path}...")
+            model = load_model(str(model_path))
+            print("  ✓ Model loaded successfully")
+            
+            # Update config to use neural guidance
+            config.use_neural_guidance = True
+            config.exploration_strategy = "neural_greedy"
+            print("  ✓ Neural guidance enabled (Strategy: neural_greedy)")
+        else:
+            print(f"  Model not found at {model_path}")
+            print("  ⚠ Neural guidance disabled (using mixed strategy)")
+            
+    except ImportError:
+        print("  ⚠ TensorFlow not found. Neural guidance disabled.")
+    except Exception as e:
+        print(f"  ⚠ Error loading model: {e}")
+    
     # Run episodes
     print_header(f"Running {num_episodes} Episodes")
     
@@ -119,7 +146,8 @@ def main():
             props=props,
             db_path=db_path,
             config=config,
-            seed=i  # Use episode number as seed for reproducibility
+            seed=i,  # Use episode number as seed for reproducibility
+            model=model
         )
         
         episode_time = time.time() - episode_start

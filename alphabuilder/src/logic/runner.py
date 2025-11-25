@@ -31,6 +31,15 @@ from alphabuilder.src.logic.storage import (
     generate_episode_id
 )
 
+# Import neural module (try/except to allow running without tensorflow if needed)
+try:
+    import tensorflow as tf
+    from alphabuilder.src.neural.trainer import predict_fitness
+    HAS_NEURAL = True
+except ImportError:
+    print("Warning: TensorFlow or Neural Module not found. Neural guidance disabled.")
+    HAS_NEURAL = False
+
 
 @dataclass
 class EpisodeConfig:
@@ -50,8 +59,12 @@ class EpisodeConfig:
     growth_strategy: str = "astar"  # Options: "straight", "astar", "smart_heuristic", "random_pattern"
     
     # Phase 2 exploration strategy  
-    exploration_strategy: str = "mixed"  # Options: "random", "mixed", "greedy"
+    exploration_strategy: str = "mixed"  # Options: "random", "mixed", "greedy", "neural_greedy"
     exploration_weights: dict = None  # Will be set in __post_init__
+    
+    # Neural Guidance
+    use_neural_guidance: bool = False
+    neural_greedy_epsilon: float = 0.1  # Probability of random action even with neural guidance
     
     def __post_init__(self):
         if self.exploration_weights is None:
@@ -202,7 +215,8 @@ def phase2_refinement(
     config: EpisodeConfig,
     db_path: Path,
     episode_id: str,
-    rng: np.random.Generator
+    rng: np.random.Generator,
+    model: Optional[object] = None
 ) -> Tuple[np.ndarray, List[float]]:
     """
     Phase 2: Refine topology using random exploration with FEM validation.
@@ -309,40 +323,102 @@ def phase2_refinement(
             continue  # No valid actions
         
         # Select action using exploration strategy
-        if config.exploration_strategy == "random":
-            # Pure random
-            action_type, coord = all_actions[rng.integers(0, len(all_actions))]
+        # Select action using exploration strategy
+        action_type, coord = None, None
         
-        elif config.exploration_strategy == "mixed":
-            # Mixed strategy with weighted probabilities
-            strategy_names = list(config.exploration_weights.keys())
-            strategy_probs = list(config.exploration_weights.values())
-            chosen_strategy = rng.choice(strategy_names, p=strategy_probs)
-            
-            # Determine load and support points (simplified - middle of edges)
-            load_points = [(ny_tp - 1, nx_tp // 2)]  # Right edge, middle
-            support_points = [(0, nx_tp // 4), (0, nx_tp // 2), (0, 3 * nx_tp // 4)]  # Left edge
-            
-            # Apply strategy (simplified inline version)
-            if chosen_strategy == "random":
-                action_type, coord = all_actions[rng.integers(0, len(all_actions))]
+        # Neural Greedy Strategy
+        if config.use_neural_guidance and model is not None and HAS_NEURAL:
+            # Epsilon-greedy
+            if rng.random() < config.neural_greedy_epsilon:
+                 # Random exploration
+                 action_type, coord = all_actions[rng.integers(0, len(all_actions))]
             else:
-                # For other strategies, use simple heuristics
-                if chosen_strategy == "remove_weak" and len(remove_candidates) > 0:
-                    # Select from remove candidates (prefer those far from path)
-                    action_type, coord = remove_candidates[rng.integers(0, len(remove_candidates))]
-                elif chosen_strategy == "add_support" and len(add_candidates) > 0:
-                    # Select from add candidates (prefer those near load)
-                    action_type, coord = add_candidates[rng.integers(0, len(add_candidates))]
-                elif chosen_strategy == "symmetry":
-                    # Select action that maintains symmetry
+                 # Predict fitness for all candidates
+                 candidate_grids = []
+                 for at, (r, c) in all_actions:
+                     temp_topo = current_topology.copy()
+                     if at == "ADD":
+                         temp_topo[r, c] = 1
+                     else:
+                         temp_topo[r, c] = 0
+                     candidate_grids.append(temp_topo)
+                 
+                 # Batch prediction
+                 # Thickness is always 1 for 2D
+                 thicknesses = [1] * len(candidate_grids)
+                 
+                 try:
+                     # Predict displacements
+                     # predict_fitness returns (Batch, 1)
+                     pred_disps = predict_fitness(model, candidate_grids, thicknesses)
+                     
+                     # Calculate predicted fitness
+                     best_idx = 0
+                     best_pred_fitness = -1.0
+                     
+                     for idx, disp in enumerate(pred_disps):
+                         # disp is [1] tensor or array
+                         d = float(disp)
+                         
+                         # Calculate mass
+                         mass = float(np.sum(candidate_grids[idx]))
+                         
+                         # Calculate fitness (simplified Kane Eq 1)
+                         # We use the same parameters as solver
+                         penalty = max(0.0, d - props.disp_limit)
+                         denominator = mass + props.penalty_epsilon * 0.0 + props.penalty_alpha * penalty
+                         
+                         if denominator < 1e-9:
+                             f = 0.0
+                         else:
+                             f = 1.0 / denominator
+                             
+                         if f > best_pred_fitness:
+                             best_pred_fitness = f
+                             best_idx = idx
+                             
+                     action_type, coord = all_actions[best_idx]
+                     
+                 except Exception as e:
+                     print(f"Neural prediction failed: {e}")
+                     # Fallback to random
+                     action_type, coord = all_actions[rng.integers(0, len(all_actions))]
+
+        if action_type is None:
+            if config.exploration_strategy == "random":
+                # Pure random
+                action_type, coord = all_actions[rng.integers(0, len(all_actions))]
+            
+            elif config.exploration_strategy == "mixed":
+                # Mixed strategy with weighted probabilities
+                strategy_names = list(config.exploration_weights.keys())
+                strategy_probs = list(config.exploration_weights.values())
+                chosen_strategy = rng.choice(strategy_names, p=strategy_probs)
+                
+                # Determine load and support points (simplified - middle of edges)
+                load_points = [(ny_tp - 1, nx_tp // 2)]  # Right edge, middle
+                support_points = [(0, nx_tp // 4), (0, nx_tp // 2), (0, 3 * nx_tp // 4)]  # Left edge
+                
+                # Apply strategy (simplified inline version)
+                if chosen_strategy == "random":
                     action_type, coord = all_actions[rng.integers(0, len(all_actions))]
                 else:
-                    # Fallback
-                    action_type, coord = all_actions[rng.integers(0, len(all_actions))]
-        
-        else:  # greedy or other
-            action_type, coord = all_actions[rng.integers(0, len(all_actions))]
+                    # For other strategies, use simple heuristics
+                    if chosen_strategy == "remove_weak" and len(remove_candidates) > 0:
+                        # Select from remove candidates (prefer those far from path)
+                        action_type, coord = remove_candidates[rng.integers(0, len(remove_candidates))]
+                    elif chosen_strategy == "add_support" and len(add_candidates) > 0:
+                        # Select from add candidates (prefer those near load)
+                        action_type, coord = add_candidates[rng.integers(0, len(add_candidates))]
+                    elif chosen_strategy == "symmetry":
+                        # Select action that maintains symmetry
+                        action_type, coord = all_actions[rng.integers(0, len(all_actions))]
+                    else:
+                        # Fallback
+                        action_type, coord = all_actions[rng.integers(0, len(all_actions))]
+            
+            else:  # greedy or other
+                action_type, coord = all_actions[rng.integers(0, len(all_actions))]
         
         # Apply action
         r, c = coord
@@ -359,7 +435,8 @@ def run_episode(
     props: PhysicalProperties,
     db_path: Path,
     config: Optional[EpisodeConfig] = None,
-    seed: Optional[int] = None
+    seed: Optional[int] = None,
+    model: Optional[object] = None
 ) -> str:
     """
     Run a complete episode (Growth + Refinement) and save to database.
@@ -397,7 +474,8 @@ def run_episode(
         config,
         db_path,
         episode_id,
-        rng
+        rng,
+        model=model
     )
     
     print(f"  Episode complete. Best fitness: {max(fitness_history):.6e}")
