@@ -29,9 +29,11 @@ def main():
     detected_shape = get_dataset_shape(args.db_path)
     
     if args.resolution:
-        h, w = map(int, args.resolution.split('x'))
+        # User passes WxH (e.g. 64x32)
+        # Model expects HxW (e.g. 32, 64)
+        w, h = map(int, args.resolution.split('x'))
         input_shape = (h, w, 3)
-        print(f"Forcing resolution: {input_shape}")
+        print(f"Forcing resolution: {input_shape} (H={h}, W={w})")
     elif detected_shape:
         input_shape = detected_shape
         print(f"Auto-detected input shape from DB: {input_shape}")
