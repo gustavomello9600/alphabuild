@@ -93,4 +93,4 @@ def create_dataset(db_path, batch_size=32, buffer_size=1000):
             tf.TensorSpec(shape=(None, None, 3), dtype=tf.float32),
             tf.TensorSpec(shape=(), dtype=tf.float32)
         )
-    ).shuffle(buffer_size).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    ).shuffle(buffer_size).padded_batch(batch_size).prefetch(tf.data.AUTOTUNE)
