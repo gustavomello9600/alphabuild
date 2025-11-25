@@ -127,8 +127,9 @@ def main():
         episode_start = time.time()
         current_seed = seed_offset + i
         
+        global_episode_num = existing_episodes + i + 1
         print(f"\n{'═' * 80}")
-        print(f"Episode {i+1}/{num_episodes} (Seed: {current_seed})")
+        print(f"Episode {i+1}/{num_episodes} (Global #{global_episode_num}, Seed: {current_seed})")
         print('═' * 80)
         
         episode_id = run_episode(
