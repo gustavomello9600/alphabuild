@@ -261,23 +261,15 @@ def run_simp_optimization_3d(
         b.zeroEntries()
         dolfinx.fem.petsc.assemble_vector(b, ctx.problem.L)
         
-        # Apply Point Load (Hardcoded for now - should be generalized)
-        # TODO: Extract load application to a helper or use what's in solver.py
-        # For now, we replicate the load at (L, H/2, D/2) approx?
-        # In solver.py it was (2.0, 0.5). In 3D?
-        # Let's assume (2.0, 0.5, 0.5) for now if 3D.
-        
-        V = ctx.V
-        # Define locator for tip load
-        # We need to know domain size. Assuming 2x1x1 based on typical cantilever.
-        # Better: Use max coordinates.
+        # Apply Point Load at Tip (Mid-Height, Mid-Depth, Right-End)
+        # Coordinates: x=max, y=mid, z=mid
         max_coords = ctx.domain.geometry.x.max(axis=0)
         tip_x = max_coords[0]
         mid_y = max_coords[1] / 2.0
         mid_z = max_coords[2] / 2.0
         
         def point_load_locator(p):
-            # Tip load
+            # Locate tip region (small tolerance)
             return np.logical_and(
                 np.isclose(p[0], tip_x, atol=0.1),
                 np.logical_and(
@@ -286,90 +278,50 @@ def run_simp_optimization_3d(
                 )
             )
             
+        V = ctx.V
         load_dofs = fem.locate_dofs_geometrical(V, point_load_locator)
-        if len(load_dofs) > 0:
-            # Apply load in -Y direction
-            # V is vector space. We need to target Y component (index 1).
-            # This is complex with blocked DOFs.
-            # Simplified: Just apply to all found DOFs in Y direction?
-            # With dolfinx, we usually iterate blocks.
-            
-            # Let's use the same logic as solver.py if possible.
-            # But solver.py logic was for 2D/3D?
-            # Let's try a simpler approach for SIMP:
-            # Just apply a distributed load on the tip face if point load fails.
-            
-            # Actually, let's assume solver.py logic works if we copy it.
-            # But we don't have easy access to it here without import.
-            # Let's try to just assemble and solve, assuming L form handles it?
-            # In physics_model.py, L is defined as dot(f, v)*dx + dot(T, v)*ds.
-            # If f or T are defined, it works.
-            # But usually we want a point load which is not in L form directly (Dirac).
-            
-            # Let's apply manual point load to vector 'b'
-            with b.localForm() as b_local:
-                # We need to map dofs.
-                # This is risky without exact logic.
-                pass
-                
-        # CRITICAL: If we don't apply load, u will be zero.
-        # We MUST apply load.
-        # Let's trust that 'ctx.problem.L' might contain a Neumann BC if defined?
-        # If not, we need to manually modify b.
         
-        # Let's assume for this fix that we can use a simple load application.
-        # Or better: Call a helper from solver.py?
-        # solver.py has `solve_topology_3d`. We can't call that because it does the whole loop.
+        # Apply load F_y = -1.0
+        # In FEniCSx, for Vector FunctionSpace, DOFs are blocked if created with (mesh, ("Lagrange", 1, (3,)))
+        # But if created with VectorElement, they might be interlaced.
+        # PhysicsModel uses: element = basix.ufl.element("Lagrange", ..., shape=(3,))
+        # This creates a blocked map usually (bs=3).
         
-        # Re-implementing load application:
-        # Find dofs at tip
-        load_dofs = fem.locate_dofs_geometrical(V, point_load_locator)
-        # We want to set -1.0 on Y component.
-        # V is 3D vector space. Dofs are blocked by node?
-        # index = node_index * block_size + component
-        # block_size = 3.
-        
-        # This depends on how V was created.
-        # If V = fem.functionspace(mesh, ("Lagrange", 1, (3,))) -> Blocked.
         bs = V.dofmap.index_map_bs
         
         with b.localForm() as b_local:
-            for dof in load_dofs:
-                # Check if this dof corresponds to Y component
-                # In blocked map, dof refers to the block (node).
-                # We need to set value at dof*bs + 1
-                # Wait, locate_dofs returns local indices of nodes?
-                # No, it returns indices in the dofmap.
+            # We want to apply load to Y component (index 1)
+            # If bs=3, then for each node dof 'k', the components are k*3, k*3+1, k*3+2
+            # BUT locate_dofs returns the indices in the local array directly?
+            # No, locate_dofs returns indices in the dofmap.
+            
+            # Let's handle the block size carefully.
+            # If we used fem.functionspace(mesh, element), and element has shape (3,),
+            # then V.dofmap.index_map.size_local * bs is the total local size.
+            
+            # For a given 'node_dof' returned by locate_dofs (if unrolled? or blocked?)
+            # locate_dofs_geometrical on a Vector FunctionSpace returns the indices of ALL components for the matching nodes?
+            # Or just the block indices?
+            # It usually returns all DOFs associated with the entity.
+            
+            # Let's assume we want to distribute the load -1.0 among found nodes.
+            f_total = -1.0
+            n_nodes = len(load_dofs) // bs if bs > 0 else 1
+            if n_nodes > 0:
+                f_node = f_total / n_nodes
                 
-                # If using VectorElement (Lagrange with shape), dofs are unrolled?
-                # No, usually blocked.
+                # We need to target Y component.
+                # If bs=3, the DOFs are [x, y, z, x, y, z...] or [x,x,x, y,y,y...]?
+                # FEniCSx default is usually blocked: [x0, y0, z0, x1, y1, z1...]
                 
-                # Let's assume we apply to Y component.
-                # If bs > 1:
-                #   idx = dof * bs + 1
-                #   b_local.setValues([idx], [-1.0], addv=PETSc.InsertMode.ADD_VALUES)
-                
-                # This is getting too low-level and error-prone for a quick fix.
-                # Alternative: Define a Traction boundary condition in L?
-                pass
-        
-        # Fallback: Apply load to the last node?
-        # Let's just apply to the very last DOF for now to ensure non-zero.
-        # (This is a hack, but better than crash).
-        # ideally we use the same load as the main simulation.
-        
-        # Let's look at how solver.py does it.
-        # It uses `fem.locate_dofs_geometrical` and `b_local.setValues`.
-        
-        # Let's assume we can skip detailed load logic for now and just rely on L form if it has body force?
-        # No, cantilever needs tip load.
-        
-        # Let's try to apply a generic load at the end of the domain.
-        # We will use a simplified approach:
-        # Apply -1.0 to the Y-component of the node closest to (L, H/2, D/2).
-        
-        dolfinx.fem.petsc.apply_lifting(b, [ctx.problem.a], bcs=[ctx.problem.bcs])
+                # Let's iterate and check modulo
+                for dof in load_dofs:
+                    if dof % bs == 1: # Y component
+                        b_local.setValues([dof], [f_node], addv=PETSc.InsertMode.ADD_VALUES)
+            
         b.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)
+        
+        # Re-apply BCs (Dirichlet overrides load if conflict, but here they are far apart)
         dolfinx.fem.petsc.set_bc(b, ctx.problem.bcs)
         
         # Solve
