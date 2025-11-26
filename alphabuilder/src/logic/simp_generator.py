@@ -3,7 +3,7 @@ import dolfinx
 from dolfinx import fem
 import ufl
 from petsc4py import PETSc
-from typing import Tuple, List, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 from dataclasses import dataclass
 
 from alphabuilder.src.core.physics_model import FEMContext, PhysicalProperties, SimulationResult
@@ -192,8 +192,9 @@ def run_simp_optimization_3d(
     ctx: FEMContext,
     props: PhysicalProperties,
     config: SIMPConfig,
-    resolution: Tuple[int, int, int], # Added resolution argument
-    seed: int = 0
+    resolution: Tuple[int, int, int],
+    seed: int = 0,
+    initial_density: Optional[np.ndarray] = None  # NEW: Allow A* backbone initialization
 ) -> List[Dict[str, Any]]:
     
     nx, ny, nz = resolution
@@ -204,8 +205,15 @@ def run_simp_optimization_3d(
     # if num_cells != n_elements:
     #     print(f"Warning: Mesh cells ({num_cells}) != Resolution product ({n_elements})")
     
-    # Initialize density x (uniform = vol_frac)
-    x = np.ones(n_elements) * config.vol_frac
+    # Initialize density
+    if initial_density is not None:
+        # Use provided backbone (e.g., from A*)
+        x = initial_density.copy()
+        if len(x) != n_elements:
+            raise ValueError(f"initial_density length ({len(x)}) != n_elements ({n_elements})")
+    else:
+        # Default: uniform density at target volume fraction
+        x = np.ones(n_elements) * config.vol_frac
     
     # Precompute filter
     H, Hs = precompute_filter_3d(nx, ny, nz, config.r_min)

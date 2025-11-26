@@ -47,7 +47,8 @@ def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="AlphaBuilder Data Harvest")
     parser.add_argument("--episodes", type=int, default=50, help="Number of episodes to run")
-    parser.add_argument("--resolution", type=str, default="64x32x32", help="Mesh resolution (LxHxW), e.g., 64x32x32")
+    parser.add_argument('--resolution', type=str, default='64x32x8',
+                        help='Grid resolution as LxHxD (e.g., 64x32x8 for cantilever beam with 2:1:0.25 ratio)')
     parser.add_argument("--db-path", type=str, default="data/training_data.db", help="Path to SQLite database")
     parser.add_argument("--steps", type=int, default=100, help="Max refinement steps per episode")
     parser.add_argument("--strategy", type=str, default="balanced", choices=["random", "simp", "balanced"], help="Data generation strategy")
@@ -170,9 +171,18 @@ def main():
                 current_strategy = "random"
         
         if current_strategy == "simp":
-            # Run SIMP Optimization
-            from alphabuilder.src.logic.simp_generator import run_simp_optimization, SIMPConfig
+            # Run A* + SIMP Optimization
+            # Phase 1: Build connectivity backbone with A*
+            # Phase 2: Optimize with SIMP
+            from alphabuilder.src.logic.simp_generator import run_simp_optimization_3d, SIMPConfig
             from alphabuilder.src.logic.storage import TrainingRecord, Phase, serialize_state, save_record, generate_episode_id
+            from alphabuilder.src.logic.runner_astar import run_episode_astar
+            
+            # Build A* backbone first
+            backbone_state = run_episode_astar(ctx, props, resolution=resolution)
+            
+            # Extract backbone density for SIMP initialization
+            initial_density = backbone_state.density.flatten()
             
             # Randomize target volume fraction
             vol_frac = np.random.uniform(0.3, 0.7)
@@ -182,9 +192,12 @@ def main():
                 max_iter=50
             )
             
-            # Run SIMP
-            from alphabuilder.src.logic.simp_generator import run_simp_optimization_3d
-            history = run_simp_optimization_3d(ctx, props, simp_config, resolution=resolution)
+            # Run SIMP starting from A* backbone
+            history = run_simp_optimization_3d(
+                ctx, props, simp_config, 
+                resolution=resolution,
+                initial_density=initial_density
+            )
             
             episode_id = generate_episode_id()
             
@@ -208,20 +221,20 @@ def main():
                     metadata={
                         "max_displacement": frame['max_displacement'],
                         "compliance": frame['compliance'],
-                        "volume_fraction": omega_mat / (resolution[0]*resolution[1]),
-                        "strategy": "simp"
+                        "volume_fraction": omega_mat / (resolution[0]*resolution[1]*resolution[2]),
+                        "strategy": "astar+simp"
                     }
                 )
                 save_record(db_path, record)
                 
-            # print(f"  ✓ SIMP Episode completed. Steps: {len(history)}, Final Disp: {history[-1]['max_displacement']:.4f}")
+            # print(f"  ✓ A*+SIMP Episode completed. Steps: {len(history)}, Final Disp: {history[-1]['max_displacement']:.4f}")
             
             # Log SIMP metrics
             logger.log({
                 "episode": global_episode_num,
                 "duration": time.time() - episode_start,
                 "steps": len(history),
-                "strategy": "simp",
+                "strategy": "astar+simp",
                 "compliance": history[-1]['compliance'],
                 "max_disp": history[-1]['max_displacement'],
                 "volume_fraction": vol_frac
