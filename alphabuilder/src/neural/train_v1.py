@@ -10,6 +10,8 @@ sys.path.insert(0, str(project_root))
 
 from alphabuilder.src.neural.dataset import CantileverDataset
 from alphabuilder.src.neural.model_arch import build_model
+from alphabuilder.src.utils.logger import TrainingLogger
+import time
 
 def train_epoch(model, dataloader, optimizer, criterion, device="cpu"):
     """Run one epoch of training."""
@@ -66,9 +68,27 @@ def main():
     
     print(f"Starting training for {args.epochs} epochs...")
     
+    # Initialize Logger
+    db_path = Path(args.db_path)
+    log_dir = db_path.parent / "logs"
+    logger = TrainingLogger(
+        log_dir=str(log_dir),
+        filename="training_log.csv",
+        headers=["epoch", "avg_loss", "duration"]
+    )
+    
     for epoch in range(args.epochs):
+        start_time = time.time()
         avg_loss = train_epoch(model, dataloader, optimizer, criterion, device)
+        duration = time.time() - start_time
+        
         print(f"Epoch {epoch+1} Complete. Avg Loss: {avg_loss:.4f}")
+        
+        logger.log({
+            "epoch": epoch + 1,
+            "avg_loss": avg_loss,
+            "duration": duration
+        })
             
 
         

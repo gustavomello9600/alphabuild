@@ -24,6 +24,7 @@ from alphabuilder.src.core.physics_model import (
 )
 from alphabuilder.src.logic.runner import run_episode_v1_1 as run_episode, EpisodeConfig
 from alphabuilder.src.logic.storage import initialize_database, get_episode_count
+from alphabuilder.src.utils.logger import TrainingLogger
 
 
 def print_header(text: str, char: str = "="):
@@ -97,6 +98,14 @@ def main():
     existing_episodes = get_episode_count(db_path)
     print(f"  ✓ Database initialized in {db_time:.3f}s")
     print(f"  ✓ Existing episodes in database: {existing_episodes}")
+    
+    # Initialize Logger
+    log_dir = db_path.parent / "logs"
+    logger = TrainingLogger(
+        log_dir=str(log_dir),
+        filename="data_harvest_log.csv",
+        headers=["episode", "duration", "steps", "strategy", "compliance", "max_disp", "volume_fraction"]
+    )
     
     # Physical properties
     props = PhysicalProperties()
@@ -201,6 +210,17 @@ def main():
                 
             print(f"  ✓ SIMP Episode completed. Steps: {len(history)}, Final Disp: {history[-1]['max_displacement']:.4f}")
             
+            # Log SIMP metrics
+            logger.log({
+                "episode": global_episode_num,
+                "duration": time.time() - episode_start,
+                "steps": len(history),
+                "strategy": "simp",
+                "compliance": history[-1]['compliance'],
+                "max_disp": history[-1]['max_displacement'],
+                "volume_fraction": vol_frac
+            })
+            
         else:
             # Standard Random/Game Episode
             # Configure exploration based on strategy
@@ -208,9 +228,6 @@ def main():
             
             if current_strategy == "guided":
                 # Guided: Heuristic Growth + Mixed Exploration
-                # We modify the config for this episode
-                # Note: config is a dataclass, so we should create a new instance or modify carefully
-                # Since we are in a loop, let's create a new one
                 episode_config = EpisodeConfig(
                     resolution=resolution,
                     max_refinement_steps=args.steps,
@@ -240,6 +257,20 @@ def main():
                 config=episode_config,
                 seed=current_seed
             )
+            
+            # Log Standard Episode metrics
+            # Since run_episode doesn't return metrics, we log what we know.
+            # Ideally run_episode should return a result object.
+            # For now, we log basic info.
+            logger.log({
+                "episode": global_episode_num,
+                "duration": time.time() - episode_start,
+                "steps": args.steps, # Approximate
+                "strategy": current_strategy,
+                "compliance": 0.0, # Placeholder
+                "max_disp": 0.0,   # Placeholder
+                "volume_fraction": 0.0 # Placeholder
+            })
         
         episode_time = time.time() - episode_start
         episode_times.append(episode_time)
