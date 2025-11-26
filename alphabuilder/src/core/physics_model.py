@@ -104,7 +104,16 @@ def initialize_cantilever_context(resolution=(64, 32, 32), props: PhysicalProper
     L = ufl.dot(fem.Constant(domain, np.zeros(3, dtype=PETSc.ScalarType)), v) * ufl.dx
     
     # 5. Linear Problem Setup
-    problem = dolfinx.fem.petsc.LinearProblem(a, L, bcs=[bc], petsc_options={"ksp_type": "preonly", "pc_type": "lu"}, petsc_options_prefix="cantilever")
+    # Use Iterative Solver (CG + GAMG) for 3D Elasticity to save memory
+    # LU is too expensive for 64x32x32 (200k DOFs) on Colab
+    solver_options = {
+        "ksp_type": "cg",
+        "pc_type": "gamg",
+        "ksp_rtol": 1e-6,
+        "ksp_atol": 1e-10,
+        "ksp_max_it": 1000
+    }
+    problem = dolfinx.fem.petsc.LinearProblem(a, L, bcs=[bc], petsc_options=solver_options, petsc_options_prefix="cantilever")
     
     # 6. DOF Map (Voxel -> Cell Index)
     # In FEniCSx with structured box mesh, cell indices usually follow a pattern.
