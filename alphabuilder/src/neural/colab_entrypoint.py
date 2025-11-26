@@ -27,7 +27,7 @@ def install_dependencies():
         # except ImportError:
         #     !wget "https://fem-on-colab.github.io/releases/fenicsx-install-real.sh" -O "/tmp/fenicsx-install.sh" && bash "/tmp/fenicsx-install.sh"
         # Since this is a python script, we use subprocess.
-        subprocess.run('wget "https://fem-on-colab.github.io/releases/fenicsx-install-real.sh" -O "/tmp/fenicsx-install.sh" && bash "/tmp/fenicsx-install.sh"', shell=True, check=True)
+        subprocess.run('wget "https://fem-on-colab.github.io/releases/fenicsx-install-release-real.sh" -O "/tmp/fenicsx-install.sh" && bash "/tmp/fenicsx-install.sh"', shell=True, check=True)
         import dolfinx
         print(f"FEniCSx installed: {dolfinx.__version__}")
 
