@@ -177,8 +177,9 @@ def main():
                 max_iter=50
             )
             
-            print(f"  Running SIMP (Vol: {vol_frac:.2f})...")
-            history = run_simp_optimization(ctx, props, simp_config)
+            # Run SIMP
+            from alphabuilder.src.logic.simp_generator import run_simp_optimization_3d
+            history = run_simp_optimization_3d(ctx, props, simp_config, resolution=resolution)
             
             episode_id = generate_episode_id()
             
