@@ -13,6 +13,7 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 import numpy as np
+import gc
 
 # Add project root to path
 project_root = Path(__file__).parent
@@ -298,6 +299,9 @@ def main():
         # filled = int(bar_length * progress)
         # bar = '█' * filled + '░' * (bar_length - filled)
         # print(f"  Progress: [{bar}] {progress*100:.1f}%")
+        
+        # Force GC to prevent OOM
+        gc.collect()
     
     # Final statistics
     total_time = time.time() - start_time

@@ -352,8 +352,11 @@ def run_simp_optimization_3d(
              expr = fem.Expression(comp_dens, W.element.interpolation_points)
              objectsetattr(ctx, 'energy_expr', expr)
              objectsetattr(ctx, 'W_space', W)
+             # Create reusable function for energy values
+             energy_vals = fem.Function(W)
+             objectsetattr(ctx, 'energy_vals', energy_vals)
              
-        energy_vals = fem.Function(ctx.W_space)
+        energy_vals = ctx.energy_vals
         energy_vals.interpolate(ctx.energy_expr)
         
         # Raw energies (aligned with x if ordering matches)
