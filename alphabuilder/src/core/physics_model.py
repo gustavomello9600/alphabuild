@@ -35,7 +35,7 @@ class SimulationResult:
     valid: bool
     displacement_array: np.ndarray
 
-def initialize_cantilever_context(resolution=(64, 32, 32)) -> FEMContext:
+def initialize_cantilever_context(resolution=(64, 32, 32), props: PhysicalProperties = None) -> FEMContext:
     """
     Initialize a 3D FEM context for a Cantilever Beam.
     Resolution: (L, H, W) -> (x, y, z)
@@ -82,11 +82,14 @@ def initialize_cantilever_context(resolution=(64, 32, 32)) -> FEMContext:
     
     # SIMP Interpolation: E(rho) = E_min + (E_0 - E_min) * rho^p
     # For binary (0/1), this simplifies to E_0 * rho (plus small epsilon to avoid singularity)
-    E_0 = 1.0
+    if props is None:
+        props = PhysicalProperties()
+        
+    E_0 = props.E
     E_min = 1e-6
     rho = material_field
     E = E_min + (E_0 - E_min) * rho # Linear for binary is fine, or rho**3 for SIMP
-    nu = 0.3
+    nu = props.nu
     
     mu = E / (2 * (1 + nu))
     lmbda = E * nu / ((1 + nu) * (1 - 2 * nu))

@@ -12,6 +12,24 @@ def install_dependencies():
         "tqdm"
     ]
     subprocess.check_call([sys.executable, "-m", "pip", "install"] + packages)
+    
+    print("Installing FEniCSx via fem-on-colab...")
+    try:
+        import fem_on_colab
+        print("fem-on-colab already installed.")
+    except ImportError:
+        # We are likely in a script, not a notebook, so we can't use %pip directly easily without IPython.
+        # But usually on Colab we run this script !python ...
+        # The official way is:
+        # try:
+        #     import google.colab
+        #     import fem_on_colab
+        # except ImportError:
+        #     !wget "https://fem-on-colab.github.io/releases/fenicsx-install-real.sh" -O "/tmp/fenicsx-install.sh" && bash "/tmp/fenicsx-install.sh"
+        # Since this is a python script, we use subprocess.
+        subprocess.run('wget "https://fem-on-colab.github.io/releases/fenicsx-install-real.sh" -O "/tmp/fenicsx-install.sh" && bash "/tmp/fenicsx-install.sh"', shell=True, check=True)
+        import dolfinx
+        print(f"FEniCSx installed: {dolfinx.__version__}")
 
 def main():
     print("=== AlphaBuilder Colab Entrypoint ===")

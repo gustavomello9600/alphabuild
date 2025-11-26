@@ -78,11 +78,10 @@ class CantileverDataset(IterableDataset):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Select Refinement Phase data
+        # Select all data
         cursor.execute("""
             SELECT state_blob, metadata 
             FROM training_data 
-            WHERE phase = 'REFINEMENT' AND valid_fem = 1
             ORDER BY RANDOM()
         """)
         

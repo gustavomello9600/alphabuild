@@ -12,6 +12,7 @@ import time
 import argparse
 from pathlib import Path
 from datetime import datetime
+import numpy as np
 
 # Add project root to path
 project_root = Path(__file__).parent
@@ -21,7 +22,7 @@ from alphabuilder.src.core.physics_model import (
     initialize_cantilever_context,
     PhysicalProperties
 )
-from alphabuilder.src.logic.runner import run_episode, EpisodeConfig
+from alphabuilder.src.logic.runner import run_episode_v1_1 as run_episode, EpisodeConfig
 from alphabuilder.src.logic.storage import initialize_database, get_episode_count
 
 
@@ -44,9 +45,10 @@ def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="AlphaBuilder Data Harvest")
     parser.add_argument("--episodes", type=int, default=50, help="Number of episodes to run")
-    parser.add_argument("--resolution", type=str, default="64x32", help="Mesh resolution (WxH), e.g., 64x32")
+    parser.add_argument("--resolution", type=str, default="64x32x32", help="Mesh resolution (LxHxW), e.g., 64x32x32")
     parser.add_argument("--db-path", type=str, default="data/training_data.db", help="Path to SQLite database")
     parser.add_argument("--steps", type=int, default=100, help="Max refinement steps per episode")
+    parser.add_argument("--strategy", type=str, default="balanced", choices=["random", "simp", "balanced"], help="Data generation strategy")
     return parser.parse_args()
 
 
@@ -65,10 +67,17 @@ def main():
     
     # Parse resolution
     try:
-        w, h = map(int, args.resolution.split('x'))
-        resolution = (w, h)
+        parts = list(map(int, args.resolution.split('x')))
+        if len(parts) == 3:
+            resolution = tuple(parts)
+        elif len(parts) == 2:
+            # Default depth = width/2 or fixed? Let's assume depth=width/2 for 2D input
+            w, h = parts
+            resolution = (w, h, w//2)
+        else:
+            raise ValueError
     except ValueError:
-        print(f"Error: Invalid resolution format '{args.resolution}'. Use WxH (e.g., 64x32).")
+        print(f"Error: Invalid resolution format '{args.resolution}'. Use LxHxW (e.g., 64x32x32).")
         sys.exit(1)
     
     print_section("Configuration")
@@ -103,8 +112,8 @@ def main():
     print(f"  ✓ Mesh size: {resolution[0]}x{resolution[1]} = {resolution[0]*resolution[1]} cells")
     
     print(f"  ✓ Physical properties loaded")
-    print(f"    - Young's modulus (solid): {props.E_solid}")
-    print(f"    - Young's modulus (void): {props.E_void}")
+    print(f"    - Young's modulus (solid): {props.E}")
+    print(f"    - Young's modulus (void): 1e-6")
     print(f"    - Poisson's ratio: {props.nu}")
     
     # Episode configuration
@@ -132,13 +141,105 @@ def main():
         print(f"Episode {i+1}/{num_episodes} (Global #{global_episode_num}, Seed: {current_seed})")
         print('═' * 80)
         
-        episode_id = run_episode(
-            ctx=ctx,
-            props=props,
-            db_path=db_path,
-            config=config,
-            seed=current_seed
-        )
+        # Data Balancing Strategy (30% SIMP, 40% Guided, 30% Random)
+        # We use the --strategy arg as a base, but if it's "balanced", we mix.
+        # If user specifies "simp" or "random", we force that.
+        
+        current_strategy = args.strategy
+        if args.strategy == "balanced":
+            rand_val = np.random.random()
+            if rand_val < 0.3:
+                current_strategy = "simp"
+            elif rand_val < 0.7:
+                current_strategy = "guided"
+            else:
+                current_strategy = "random"
+        
+        if current_strategy == "simp":
+            # Run SIMP Optimization
+            from alphabuilder.src.logic.simp_generator import run_simp_optimization, SIMPConfig
+            from alphabuilder.src.logic.storage import TrainingRecord, Phase, serialize_state, save_record, generate_episode_id
+            
+            # Randomize target volume fraction
+            vol_frac = np.random.uniform(0.3, 0.7)
+            
+            simp_config = SIMPConfig(
+                vol_frac=vol_frac,
+                max_iter=50
+            )
+            
+            print(f"  Running SIMP (Vol: {vol_frac:.2f})...")
+            history = run_simp_optimization(ctx, props, simp_config)
+            
+            episode_id = generate_episode_id()
+            
+            # Save history to DB
+            for frame in history:
+                state_blob = serialize_state(frame['binary_map'])
+                
+                # Calculate fitness using game formula
+                omega_mat = np.sum(frame['binary_map'])
+                penalty = max(0.0, frame['max_displacement'] - props.disp_limit)
+                denominator = omega_mat + props.penalty_alpha * penalty
+                fitness = 1.0 / denominator if denominator > 1e-9 else 0.0
+                
+                record = TrainingRecord(
+                    episode_id=episode_id,
+                    step=frame['step'],
+                    phase=Phase.REFINEMENT, # Treat as refinement steps
+                    state_blob=state_blob,
+                    fitness_score=fitness,
+                    valid_fem=True,
+                    metadata={
+                        "max_displacement": frame['max_displacement'],
+                        "compliance": frame['compliance'],
+                        "volume_fraction": omega_mat / (resolution[0]*resolution[1]),
+                        "strategy": "simp"
+                    }
+                )
+                save_record(db_path, record)
+                
+            print(f"  ✓ SIMP Episode completed. Steps: {len(history)}, Final Disp: {history[-1]['max_displacement']:.4f}")
+            
+        else:
+            # Standard Random/Game Episode
+            # Configure exploration based on strategy
+            episode_config = config # Copy default
+            
+            if current_strategy == "guided":
+                # Guided: Heuristic Growth + Mixed Exploration
+                # We modify the config for this episode
+                # Note: config is a dataclass, so we should create a new instance or modify carefully
+                # Since we are in a loop, let's create a new one
+                episode_config = EpisodeConfig(
+                    resolution=resolution,
+                    max_refinement_steps=args.steps,
+                    stagnation_threshold=1e-6,
+                    stagnation_patience=20,
+                    growth_strategy="smart_heuristic",
+                    exploration_strategy="mixed"
+                )
+                print("  Running Guided Episode (Smart Heuristic + Mixed Exploration)...")
+                
+            else: # random
+                # Random: Random Pattern + Random Exploration
+                episode_config = EpisodeConfig(
+                    resolution=resolution,
+                    max_refinement_steps=args.steps,
+                    stagnation_threshold=1e-6,
+                    stagnation_patience=20,
+                    growth_strategy="random_pattern",
+                    exploration_strategy="random"
+                )
+                print("  Running Random Episode (Random Pattern + Random Exploration)...")
+
+            episode_id = run_episode(
+                ctx=ctx,
+                props=props,
+                db_path=db_path,
+                config=episode_config,
+                seed=current_seed
+            )
         
         episode_time = time.time() - episode_start
         episode_times.append(episode_time)

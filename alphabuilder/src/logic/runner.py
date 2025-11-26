@@ -5,22 +5,42 @@ from alphabuilder.src.core.physics_model import initialize_cantilever_context, P
 from alphabuilder.src.core.solver import solve_topology_3d
 from alphabuilder.src.logic.game_rules import GameState
 from alphabuilder.src.logic.mcts import MCTSAgent
+from dataclasses import dataclass
+
+@dataclass
+class EpisodeConfig:
+    resolution: tuple = (64, 32, 32)
+    max_refinement_steps: int = 100
+    stagnation_threshold: float = 1e-4
+    stagnation_patience: int = 20
+    growth_strategy: str = "random"
+    exploration_strategy: str = "random"
 
 def run_episode_v1_1(
     db_path: Path,
     max_steps: int = 20,
     model = None,
-    resolution: tuple = (64, 32, 32)
+    resolution: tuple = (64, 32, 32),
+    config: Optional[EpisodeConfig] = None,
+    ctx = None,
+    props = None,
+    seed: int = None
 ):
     """
     Run a v1.1 Episode:
     1. Init 3D Context
     2. Loop (MCTS -> Action -> Physics -> Reward)
     """
-    print(f"Initializing 3D Physics Context with resolution {resolution}...")
-    # Resolution (D, H, W)
-    ctx = initialize_cantilever_context(resolution=resolution)
-    props = PhysicalProperties()
+    if config:
+        resolution = config.resolution
+        max_steps = config.max_refinement_steps
+        
+    if ctx is None:
+        print(f"Initializing 3D Physics Context with resolution {resolution}...")
+        ctx = initialize_cantilever_context(resolution=resolution)
+        
+    if props is None:
+        props = PhysicalProperties()
     
     # Init State (Empty 5D Tensor)
     # (5, D, H, W)
@@ -71,35 +91,29 @@ def run_episode_v1_1(
     print("Episode Complete.")
     
     # Save to DB
-    import sqlite3
-    import json
-    import pickle
+    from alphabuilder.src.logic.storage import save_record, TrainingRecord, Phase, serialize_state, generate_episode_id
     
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS training_data (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            state_blob BLOB,
-            metadata_json TEXT
-        )
-    ''')
+    episode_id = generate_episode_id()
+    state_blob = serialize_state(state.tensor)
     
-    # Save final state as an example (or all steps)
-    # For Milestone 1, let's save the final state
-    state_blob = pickle.dumps(state.tensor)
-    metadata = {
-        "compliance": sim_result.compliance,
-        "max_disp": sim_result.max_displacement,
-        "steps": step
-    }
+    # Map phase string to Enum
+    phase_enum = Phase.GROWTH if state.phase == 'GROWTH' else Phase.REFINEMENT
     
-    cursor.execute(
-        "INSERT INTO training_data (state_blob, metadata_json) VALUES (?, ?)",
-        (state_blob, json.dumps(metadata))
+    record = TrainingRecord(
+        episode_id=episode_id,
+        step=step,
+        phase=phase_enum,
+        state_blob=state_blob,
+        fitness_score=sim_result.fitness, # Use fitness from result
+        valid_fem=sim_result.valid,
+        metadata={
+            "compliance": sim_result.compliance,
+            "max_disp": sim_result.max_displacement,
+            "steps": step
+        }
     )
-    conn.commit()
-    conn.close()
+    
+    save_record(db_path, record)
     print(f"Saved episode to {db_path}")
 
 if __name__ == "__main__":
