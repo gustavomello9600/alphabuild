@@ -165,3 +165,44 @@ def extract_support_points(tensor: np.ndarray) -> List[Coord]:
     # Supports are in channel 1 (Mask)
     coords = np.argwhere(tensor[1] > 0)
     return [(int(d), int(h), int(w)) for d, h, w in coords]
+
+
+import scipy.ndimage as nd
+
+def thicken_backbone(
+    backbone_coords: List[Coord],
+    grid_shape: Tuple[int, int, int],
+    thickness: int = 1  # Base iterations
+) -> List[Coord]:
+    """
+    Thicken a 1-voxel backbone using morphological dilation.
+    
+    This creates structurally robust paths instead of thin lines,
+    solving the singular matrix issue in FEM/SIMP.
+    
+    Args:
+        backbone_coords: List of coordinates in the backbone
+        grid_shape: Grid dimensions (D, H, W)
+        thickness: Base number of dilation iterations (default: 1)
+        
+    Returns:
+        List of coordinates including original + thickened neighbors
+    """
+    D, H, W = grid_shape
+    
+    # Create binary grid from coords
+    grid = np.zeros(grid_shape, dtype=bool)
+    for d, h, w in backbone_coords:
+        grid[d, h, w] = True
+        
+    # Randomize iterations for data augmentation (1 to 2)
+    # As per expert directive
+    iterations = np.random.randint(1, 3)
+    
+    # Apply 3D binary dilation
+    # structure=None uses default 3x3x3 connectivity
+    thickened_grid = nd.binary_dilation(grid, iterations=iterations)
+    
+    # Extract coordinates
+    coords = np.argwhere(thickened_grid)
+    return [(int(d), int(h), int(w)) for d, h, w in coords]

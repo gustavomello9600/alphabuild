@@ -31,6 +31,7 @@ class TrainingRecord:
     fitness_score: float
     valid_fem: bool
     metadata: Optional[Dict[str, Any]] = None
+    policy_blob: Optional[bytes] = None  # NEW: Target action mask
 
 
 def initialize_database(db_path: Path) -> None:
@@ -60,6 +61,7 @@ def initialize_database(db_path: Path) -> None:
             fitness_score REAL NOT NULL,
             valid_fem INTEGER NOT NULL,
             metadata TEXT,
+            policy_blob BLOB,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(episode_id, step)
         )
@@ -92,27 +94,29 @@ def save_record(db_path: Path, record: TrainingRecord) -> None:
     cursor = conn.cursor()
     
     # Serialize metadata if present
-    metadata_json = None
-    if record.metadata:
-        import json
-        metadata_json = json.dumps(record.metadata)
+    import json
+    metadata_json = json.dumps(record.metadata) if record.metadata else None
     
-    cursor.execute("""
-        INSERT OR REPLACE INTO training_data 
-        (episode_id, step, phase, state_blob, fitness_score, valid_fem, metadata)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (
-        record.episode_id,
-        record.step,
-        record.phase.value,
-        record.state_blob,
-        record.fitness_score,
-        1 if record.valid_fem else 0,
-        metadata_json
-    ))
-    
-    conn.commit()
-    conn.close()
+    try:
+        cursor.execute("""
+            INSERT OR REPLACE INTO training_data 
+            (episode_id, step, phase, state_blob, fitness_score, valid_fem, metadata, policy_blob)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            record.episode_id,
+            record.step,
+            record.phase.value,
+            record.state_blob,
+            record.fitness_score,
+            1 if record.valid_fem else 0,
+            metadata_json,
+            record.policy_blob
+        ))
+        conn.commit()
+    except sqlite3.Error as e:
+        print(f"Error saving record: {e}")
+    finally:
+        conn.close()
 
 
 def serialize_state(state_tensor: np.ndarray) -> bytes:

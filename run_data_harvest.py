@@ -183,9 +183,18 @@ def main():
             
             # Extract backbone density for SIMP initialization
             initial_density = backbone_state.density.flatten()
+            initial_vol_frac = np.mean(initial_density)
             
-            # Randomize target volume fraction
-            vol_frac = np.random.uniform(0.3, 0.7)
+            # EXPERT DIRECTIVE: SIMP should remove excess material from dilation
+            # Set target volume to be LOWER than initial (e.g., 50-90% of initial)
+            # This forces the "refinement" behavior we want to learn
+            reduction_factor = np.random.uniform(0.5, 0.9)
+            vol_frac = initial_vol_frac * reduction_factor
+            
+            # Ensure it's not too small (min 10%)
+            vol_frac = max(0.1, vol_frac)
+            
+            print(f"  SIMP Target: Reduce volume from {initial_vol_frac:.2%} to {vol_frac:.2%}")
             
             simp_config = SIMPConfig(
                 vol_frac=vol_frac,
@@ -199,44 +208,62 @@ def main():
                 initial_density=initial_density
             )
             
+            # EXPERT DIRECTIVE: Extract discrete actions from SIMP history
+            from alphabuilder.src.logic.data_mining import extract_discrete_actions
+            
+            # Extract samples (State, Policy, Value)
+            training_samples = extract_discrete_actions(history, jump_size=5)
+            
             episode_id = generate_episode_id()
             
-            # Save history to DB
-            for frame in history:
-                state_blob = serialize_state(frame['binary_map'])
+            # Save samples to DB
+            for sample in training_samples:
+                # Serialize State (Input)
+                state_blob = serialize_state(sample['input_state'])
                 
-                # Calculate fitness using game formula
-                omega_mat = np.sum(frame['binary_map'])
-                penalty = max(0.0, frame['max_displacement'] - props.disp_limit)
-                denominator = omega_mat + props.penalty_alpha * penalty
-                fitness = 1.0 / denominator if denominator > 1e-9 else 0.0
+                # Serialize Policy (Target)
+                policy_blob = serialize_state(sample['target_policy'])
+                
+                # Calculate fitness (Value)
+                # Use the target value from the sample (final compliance)
+                # Or compute local fitness? Expert says "target_value" is final compliance.
+                # We'll store the final compliance as the score, normalized if needed.
+                # For consistency with previous schema, let's use the game fitness formula
+                # based on the sample's metadata if available, or just the target value.
+                
+                # Reconstruct fitness from metadata for consistency
+                # But the sample has 'target_value' which is final_compliance.
+                # Let's use that, but inverted for "fitness" (higher is better).
+                compliance = sample['target_value']
+                fitness = 1.0 / compliance if compliance > 1e-9 else 0.0
                 
                 record = TrainingRecord(
                     episode_id=episode_id,
-                    step=frame['step'],
-                    phase=Phase.REFINEMENT, # Treat as refinement steps
+                    step=sample['step'],
+                    phase=Phase.REFINEMENT,
                     state_blob=state_blob,
                     fitness_score=fitness,
                     valid_fem=True,
                     metadata={
-                        "max_displacement": frame['max_displacement'],
-                        "compliance": frame['compliance'],
-                        "volume_fraction": omega_mat / (resolution[0]*resolution[1]*resolution[2]),
-                        "strategy": "astar+simp"
-                    }
+                        "compliance": sample['metadata']['compliance'],
+                        "max_displacement": sample['metadata']['max_displacement'],
+                        "strategy": "astar+simp+mining"
+                    },
+                    policy_blob=policy_blob # NEW
                 )
                 save_record(db_path, record)
                 
-            # print(f"  ✓ A*+SIMP Episode completed. Steps: {len(history)}, Final Disp: {history[-1]['max_displacement']:.4f}")
+            # print(f"  ✓ A*+SIMP Episode completed. Steps: {len(history)}, Extracted Samples: {len(training_samples)}")
             
-            # Log SIMP metrics
+            # Log metrics
             logger.log({
                 "episode": global_episode_num,
                 "duration": time.time() - episode_start,
                 "steps": len(history),
-                "strategy": "astar+simp",
+                "samples": len(training_samples),
+                "strategy": "astar+simp+mining",
                 "compliance": history[-1]['compliance'],
-                "max_disp": history[-1]['max_displacement'],
+                "max_displacement": history[-1]['max_displacement'],
                 "volume_fraction": vol_frac
             })
             
