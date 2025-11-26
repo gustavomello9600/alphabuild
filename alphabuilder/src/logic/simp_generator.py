@@ -218,6 +218,9 @@ def run_simp_optimization_3d(
     b = ctx.problem.b
     u = ctx.u_sol
     
+    from tqdm import tqdm
+    pbar = tqdm(total=config.max_iter, desc="SIMP Optimization", unit="iter", leave=False)
+    
     while change > config.change_tol and loop < config.max_iter:
         loop += 1
         
@@ -438,8 +441,12 @@ def run_simp_optimization_3d(
         })
         
         if loop % 10 == 0 or loop == 1:
-            print(f"  SIMP Iter {loop}: Change={change:.4f}, Compliance={compliance:.4f}, MaxDisp={max_disp:.4f}")
+            # print(f"  SIMP Iter {loop}: Change={change:.4f}, Compliance={compliance:.4f}, MaxDisp={max_disp:.4f}")
+            pbar.set_postfix({"Change": f"{change:.4f}", "C": f"{compliance:.2f}", "Disp": f"{max_disp:.2f}"})
             
+        pbar.update(1)
+            
+    pbar.close()
     return history
 
 # Helper to allow setting attributes on frozen dataclass (for caching)

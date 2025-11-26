@@ -83,9 +83,13 @@ def main():
     # Offset seed by existing count to ensure variety
     seed_offset = existing_count
     
-    for i in range(episodes_to_run):
+    from tqdm import tqdm
+    pbar = tqdm(range(episodes_to_run), desc="Self-Play Progress", unit="ep")
+    
+    for i in pbar:
         current_episode_num = existing_count + i + 1
-        print(f"\n--- Episode {current_episode_num}/{args.episodes} ---")
+        # print(f"\n--- Episode {current_episode_num}/{args.episodes} ---")
+        pbar.set_description(f"Ep {current_episode_num}/{args.episodes}")
         
         ep_start = time.time()
         
@@ -106,16 +110,16 @@ def main():
         # Train on the data just generated (or all data in DB)
         # For efficiency, we train on the whole DB (Experience Replay) for 1 epoch
         # This ensures we don't forget past experiences
-        print("  Running Online Training (1 Epoch)...")
+        # print("  Running Online Training (1 Epoch)...")
         dataset = CantileverDataset(str(db_path))
         dataloader = DataLoader(dataset, batch_size=4) # Small batch for online updates
         
         avg_loss = train_epoch(model, dataloader, optimizer, criterion, device)
-        print(f"  Training Loss: {avg_loss:.4f}")
+        # print(f"  Training Loss: {avg_loss:.4f}")
         
         # 3. Save Updated Checkpoint
         torch.save(model.state_dict(), args.checkpoint)
-        print(f"  Updated model saved to {args.checkpoint}")
+        # print(f"  Updated model saved to {args.checkpoint}")
         
         # 4. Log Metrics
         # We need to fetch metrics from the last run. 

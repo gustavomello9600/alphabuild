@@ -141,14 +141,18 @@ def main():
     # Use existing count to offset seed, ensuring variety if run multiple times
     seed_offset = existing_episodes
     
-    for i in range(num_episodes):
+    from tqdm import tqdm
+    episode_pbar = tqdm(range(num_episodes), desc="Total Progress", unit="ep")
+    
+    for i in episode_pbar:
         episode_start = time.time()
         current_seed = seed_offset + i
         
         global_episode_num = existing_episodes + i + 1
-        print(f"\n{'═' * 80}")
-        print(f"Episode {i+1}/{num_episodes} (Global #{global_episode_num}, Seed: {current_seed})")
-        print('═' * 80)
+        # print(f"\n{'═' * 80}")
+        # print(f"Episode {i+1}/{num_episodes} (Global #{global_episode_num}, Seed: {current_seed})")
+        # print('═' * 80)
+        episode_pbar.set_description(f"Ep {i+1}/{num_episodes} (Global #{global_episode_num})")
         
         # Data Balancing Strategy (30% SIMP, 40% Guided, 30% Random)
         # We use the --strategy arg as a base, but if it's "balanced", we mix.
@@ -209,7 +213,7 @@ def main():
                 )
                 save_record(db_path, record)
                 
-            print(f"  ✓ SIMP Episode completed. Steps: {len(history)}, Final Disp: {history[-1]['max_displacement']:.4f}")
+            # print(f"  ✓ SIMP Episode completed. Steps: {len(history)}, Final Disp: {history[-1]['max_displacement']:.4f}")
             
             # Log SIMP metrics
             logger.log({
@@ -237,7 +241,8 @@ def main():
                     growth_strategy="smart_heuristic",
                     exploration_strategy="mixed"
                 )
-                print("  Running Guided Episode (Smart Heuristic + Mixed Exploration)...")
+                # print("  Running Guided Episode (Smart Heuristic + Mixed Exploration)...")
+                pass
                 
             else: # random
                 # Random: Random Pattern + Random Exploration
@@ -249,7 +254,7 @@ def main():
                     growth_strategy="random_pattern",
                     exploration_strategy="random"
                 )
-                print("  Running Random Episode (Random Pattern + Random Exploration)...")
+                # print("  Running Random Episode (Random Pattern + Random Exploration)...")
 
             episode_id = run_episode(
                 ctx=ctx,
@@ -282,17 +287,17 @@ def main():
         eta_seconds = avg_time * remaining
         eta_minutes = eta_seconds / 60
         
-        print(f"\n  ✓ Episode {i+1} completed in {episode_time:.2f}s")
-        print(f"  ✓ Episode ID: {episode_id}")
-        print(f"  📊 Average time per episode: {avg_time:.2f}s")
-        print(f"  ⏱️  Estimated time remaining: {eta_minutes:.1f} minutes ({eta_seconds:.0f}s)")
+        # print(f"\n  ✓ Episode {i+1} completed in {episode_time:.2f}s")
+        # print(f"  ✓ Episode ID: {episode_id}")
+        # print(f"  📊 Average time per episode: {avg_time:.2f}s")
+        # print(f"  ⏱️  Estimated time remaining: {eta_minutes:.1f} minutes ({eta_seconds:.0f}s)")
         
         # Progress bar
         progress = (i + 1) / num_episodes
-        bar_length = 50
-        filled = int(bar_length * progress)
-        bar = '█' * filled + '░' * (bar_length - filled)
-        print(f"  Progress: [{bar}] {progress*100:.1f}%")
+        # bar_length = 50
+        # filled = int(bar_length * progress)
+        # bar = '█' * filled + '░' * (bar_length - filled)
+        # print(f"  Progress: [{bar}] {progress*100:.1f}%")
     
     # Final statistics
     total_time = time.time() - start_time

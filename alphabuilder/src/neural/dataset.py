@@ -16,6 +16,17 @@ class CantileverDataset(IterableDataset):
         self.db_path = db_path
         self.max_steps = max_steps
         
+    def __len__(self):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM training_data")
+            count = cursor.fetchone()[0]
+            conn.close()
+            return min(count, self.max_steps)
+        except:
+            return 0
+        
     def _deserialize_state(self, state_blob: bytes) -> np.ndarray:
         return pickle.loads(state_blob)
 

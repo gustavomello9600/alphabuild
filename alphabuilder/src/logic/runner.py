@@ -58,9 +58,15 @@ def run_episode_v1_1(
     
     agent = MCTSAgent(model=model, num_simulations=10) # Low sim for speed
     
+    agent = MCTSAgent(model=model, num_simulations=10) # Low sim for speed
+    
     print("Starting Game Loop...")
-    for step in range(max_steps):
-        print(f"Step {step}: Phase={state.phase}, Density={np.mean(state.density):.4f}")
+    from tqdm import tqdm
+    pbar = tqdm(range(max_steps), desc="Episode Progress", unit="step", leave=False)
+    
+    for step in pbar:
+        # print(f"Step {step}: Phase={state.phase}, Density={np.mean(state.density):.4f}")
+        pbar.set_postfix({"Phase": state.phase, "Dens": f"{np.mean(state.density):.2f}"})
         
         # 1. MCTS Select Action
         action_type, coord = agent.search(state)
@@ -77,7 +83,8 @@ def run_episode_v1_1(
         # 3. Physics Solve (Oracle)
         # Only solve if material changed
         sim_result = solve_topology_3d(new_tensor, ctx, props)
-        print(f"  Physics: Compliance={sim_result.compliance:.4f}, MaxDisp={sim_result.max_displacement:.4f}")
+        # print(f"  Physics: Compliance={sim_result.compliance:.4f}, MaxDisp={sim_result.max_displacement:.4f}")
+        pbar.set_postfix({"Phase": state.phase, "C": f"{sim_result.compliance:.2f}", "Disp": f"{sim_result.max_displacement:.2f}"})
         
         # 4. Update State
         # Check Phase Transition logic (Simplified)

@@ -19,7 +19,10 @@ def train_epoch(model, dataloader, optimizer, criterion, device="cpu"):
     total_loss = 0.0
     steps = 0
     
-    for batch_idx, (data, target) in enumerate(dataloader):
+    from tqdm import tqdm
+    pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc="Training", unit="batch", leave=False)
+    
+    for batch_idx, (data, target) in pbar:
         data, target = data.to(device), target.to(device)
         
         optimizer.zero_grad()
@@ -35,6 +38,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device="cpu"):
         total_loss += loss.item()
         steps += 1
         # print(f"Step {steps}: Loss={loss.item():.4f}", end='\r')
+        pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
         
     avg_loss = total_loss / steps if steps > 0 else 0.0
     return avg_loss
