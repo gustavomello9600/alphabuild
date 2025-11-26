@@ -84,7 +84,7 @@ def main():
     print_section("Configuration")
     print(f"  Number of episodes: {num_episodes}")
     print(f"  Database path: {db_path.absolute()}")
-    print(f"  Resolution: {resolution[0]}x{resolution[1]} ({resolution[0]*resolution[1]} cells)")
+    print(f"  Resolution: {resolution[0]}x{resolution[1]}x{resolution[2]} ({resolution[0]*resolution[1]*resolution[2]} cells)")
     print(f"  Max refinement steps: {args.steps}")
     print(f"  Stagnation threshold: 1e-4")
     print(f"  Stagnation patience: 20 steps")
@@ -118,7 +118,7 @@ def main():
     ctx = initialize_cantilever_context(resolution, props)
     fem_time = time.time() - fem_start
     print(f"  ✓ FEM context initialized in {fem_time:.3f}s")
-    print(f"  ✓ Mesh size: {resolution[0]}x{resolution[1]} = {resolution[0]*resolution[1]} cells")
+    print(f"  ✓ Mesh size: {resolution[0]}x{resolution[1]}x{resolution[2]} = {resolution[0]*resolution[1]*resolution[2]} cells")
     
     print(f"  ✓ Physical properties loaded")
     print(f"    - Young's modulus (solid): {props.E}")
