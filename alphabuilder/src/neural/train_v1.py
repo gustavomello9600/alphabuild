@@ -11,6 +11,32 @@ sys.path.insert(0, str(project_root))
 from alphabuilder.src.neural.dataset import CantileverDataset
 from alphabuilder.src.neural.model_arch import build_model
 
+def train_epoch(model, dataloader, optimizer, criterion, device="cpu"):
+    """Run one epoch of training."""
+    model.train()
+    total_loss = 0.0
+    steps = 0
+    
+    for batch_idx, (data, target) in enumerate(dataloader):
+        data, target = data.to(device), target.to(device)
+        
+        optimizer.zero_grad()
+        output = model(data)
+        
+        # Value Head
+        value_pred = output.value_pred
+        
+        loss = criterion(value_pred, target)
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
+        steps += 1
+        # print(f"Step {steps}: Loss={loss.item():.4f}", end='\r')
+        
+    avg_loss = total_loss / steps if steps > 0 else 0.0
+    return avg_loss
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--db-path", type=str, default="data/smoke_test.db")
@@ -19,12 +45,14 @@ def main():
     parser.add_argument("--checkpoint-path", type=str, default="checkpoints/swin_unetr_warmup.pt")
     args = parser.parse_args()
     
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     print(f"Loading dataset from {args.db_path}...")
     dataset = CantileverDataset(args.db_path)
     dataloader = DataLoader(dataset, batch_size=args.batch_size)
     
     print("Building model...")
-    model = build_model()
+    model = build_model().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     criterion = torch.nn.MSELoss()
     
@@ -32,37 +60,17 @@ def main():
     ckpt_path = Path(args.checkpoint_path)
     if ckpt_path.exists():
         print(f"Resuming from checkpoint: {ckpt_path}")
-        model.load_state_dict(torch.load(ckpt_path))
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
     else:
         print(f"No checkpoint found at {ckpt_path}. Starting from scratch.")
     
     print(f"Starting training for {args.epochs} epochs...")
-    model.train()
     
     for epoch in range(args.epochs):
-        total_loss = 0.0
-        steps = 0
-        for batch_idx, (data, target) in enumerate(dataloader):
-            # data: (B, 5, D, H, W)
-            # target: (B, 1)
+        avg_loss = train_epoch(model, dataloader, optimizer, criterion, device)
+        print(f"Epoch {epoch+1} Complete. Avg Loss: {avg_loss:.4f}")
             
-            optimizer.zero_grad()
-            output = model(data)
-            
-            # For Milestone 1, we only care about Value Head (Compliance prediction)
-            # Policy head is auxiliary for now
-            value_pred = output.value_pred # (B, 1)
-            
-            loss = criterion(value_pred, target)
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-            steps += 1
-            print(f"Step {steps}: Loss={loss.item():.4f}", end='\r')
-            
-        avg_loss = total_loss / steps if steps > 0 else 0.0
-        print(f"\nEpoch {epoch+1} Complete. Avg Loss: {avg_loss:.4f}")
+
         
     print("Training Complete.")
     
