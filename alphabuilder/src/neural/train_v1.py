@@ -28,6 +28,14 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     criterion = torch.nn.MSELoss()
     
+    # Resume from checkpoint if exists
+    ckpt_path = Path(args.checkpoint_path)
+    if ckpt_path.exists():
+        print(f"Resuming from checkpoint: {ckpt_path}")
+        model.load_state_dict(torch.load(ckpt_path))
+    else:
+        print(f"No checkpoint found at {ckpt_path}. Starting from scratch.")
+    
     print(f"Starting training for {args.epochs} epochs...")
     model.train()
     

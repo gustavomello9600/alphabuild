@@ -11,7 +11,7 @@ sys.path.insert(0, str(project_root))
 
 from alphabuilder.src.logic.runner import run_episode_v1_1, EpisodeConfig
 from alphabuilder.src.neural.model_arch import build_model
-from alphabuilder.src.logic.storage import initialize_database
+from alphabuilder.src.logic.storage import initialize_database, get_episode_count
 
 def main():
     parser = argparse.ArgumentParser(description="AlphaBuilder Self-Play")
@@ -50,19 +50,33 @@ def main():
     )
     
     # 4. Run Loop
-    print(f"Starting {args.episodes} Self-Play Episodes...")
-    initialize_database(Path(args.db_path))
+    db_path = Path(args.db_path)
+    initialize_database(db_path)
+    
+    existing_count = get_episode_count(db_path)
+    episodes_to_run = max(0, args.episodes - existing_count)
+    
+    print(f"Database has {existing_count} episodes.")
+    if episodes_to_run == 0:
+        print(f"Target of {args.episodes} episodes already reached. Exiting.")
+        return
+
+    print(f"Starting {episodes_to_run} Self-Play Episodes (Target: {args.episodes})...")
     start_time = time.time()
     
-    for i in range(args.episodes):
-        print(f"\n--- Episode {i+1}/{args.episodes} ---")
+    # Offset seed by existing count to ensure variety
+    seed_offset = existing_count
+    
+    for i in range(episodes_to_run):
+        current_episode_num = existing_count + i + 1
+        print(f"\n--- Episode {current_episode_num}/{args.episodes} ---")
         run_episode_v1_1(
-            db_path=Path(args.db_path),
+            db_path=db_path,
             max_steps=args.steps,
             model=model, # Pass the loaded model!
             resolution=resolution,
             config=config,
-            seed=int(time.time()) + i
+            seed=int(time.time()) + seed_offset + i
         )
         
     total_time = time.time() - start_time
