@@ -1,6 +1,17 @@
 import os
 import subprocess
 import sys
+from pathlib import Path
+
+# Add project root to path (3 levels up from this file: src/neural/colab_entrypoint.py -> src/neural -> src -> alphabuilder -> root)
+# Actually, alphabuilder is the package, so we need the folder CONTAINING alphabuilder.
+# File: .../alphabuilder/src/neural/colab_entrypoint.py
+# Parent: .../alphabuilder/src/neural
+# Parent.Parent: .../alphabuilder/src
+# Parent.Parent.Parent: .../alphabuilder
+# Parent.Parent.Parent.Parent: .../ (Project Root)
+project_root = Path(__file__).resolve().parent.parent.parent.parent
+sys.path.insert(0, str(project_root))
 
 def install_dependencies():
     print("Installing dependencies for AlphaBuilder v1.1...")
