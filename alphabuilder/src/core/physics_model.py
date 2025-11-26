@@ -108,10 +108,10 @@ def initialize_cantilever_context(resolution=(64, 32, 32), props: PhysicalProper
     # LU is too expensive for 64x32x32 (200k DOFs) on Colab
     solver_options = {
         "ksp_type": "cg",
-        "pc_type": "gamg",
+        "pc_type": "jacobi", # Diagonal preconditioner: Lowest memory usage
         "ksp_rtol": 1e-6,
         "ksp_atol": 1e-10,
-        "ksp_max_it": 1000
+        "ksp_max_it": 2000 # Might need more iterations
     }
     problem = dolfinx.fem.petsc.LinearProblem(a, L, bcs=[bc], petsc_options=solver_options, petsc_options_prefix="cantilever")
     
