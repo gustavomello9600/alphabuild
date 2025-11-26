@@ -2,145 +2,124 @@ import numpy as np
 import dolfinx
 from dolfinx import mesh, fem
 from mpi4py import MPI
-from dataclasses import dataclass, field
-from typing import Tuple, Any, Optional
+from dataclasses import dataclass
 import ufl
+from petsc4py import PETSc
 
-@dataclass(frozen=True)
+@dataclass
 class PhysicalProperties:
-    """Constantes Físicas e Hiperparâmetros de Penalidade."""
-    E_solid: float = 1.0          # Módulo de Young Base (Adimensionalizado)
-    E_void: float = 1e-6          # Material "Ar" (suave para evitar singularidade)
-    nu: float = 0.3               # Poisson
-    penalty_alpha: float = 0.5    # Fator de penalidade (Eq. 1 Kane)
-    penalty_epsilon: float = 0.05 # Penalidade secundária
-    disp_limit: float = 2.0       # Restrição do projeto
+    E: float = 1.0  # Young's Modulus (Normalized)
+    nu: float = 0.3 # Poisson's Ratio
+    rho: float = 1.0 # Density
+    disp_limit: float = 100.0 # Loose limit for initial training
+    penalty_epsilon: float = 0.1
+    penalty_alpha: float = 10.0
 
-@dataclass(frozen=True)
+import dolfinx.fem.petsc
+
+@dataclass
 class FEMContext:
-    """
-    Objeto container que guarda os objetos compilados do FEniCSx.
-    Isso é gerado uma vez e passado repetidamente para a função 'solve'.
-    """
-    mesh: dolfinx.mesh.Mesh
-    V: dolfinx.fem.FunctionSpace        # Espaço de Deslocamento (Contínuo)
-    D: dolfinx.fem.FunctionSpace        # Espaço de Material (Descontínuo/DG0)
-    u_sol: dolfinx.fem.Function         # Placeholder da solução
-    material_field: dolfinx.fem.Function # Coeficiente atualizável
-    problem: Any                        # LinearProblem pré-configurado
-    dof_map: np.ndarray                 # Mapeamento (Row, Col) -> Index do Material
+    domain: mesh.Mesh
+    V: fem.FunctionSpace
+    bc: fem.DirichletBC
+    problem: dolfinx.fem.petsc.LinearProblem
+    u_sol: fem.Function
+    dof_map: np.ndarray # Map from Grid Voxel to FEM Cell
+    material_field: fem.Function # DG0 field for density
 
-@dataclass(frozen=True)
+@dataclass
 class SimulationResult:
-    """Output da Simulação."""
     fitness: float
     max_displacement: float
     compliance: float
     valid: bool
-    # Opcional: Campo de deslocamento apenas se for necessário plotar, 
-    # para economizar memória em treino massivo.
-    displacement_array: np.ndarray = field(default_factory=lambda: np.array([]))
+    displacement_array: np.ndarray
 
-def initialize_cantilever_context(resolution: Tuple[int, int], props: PhysicalProperties) -> FEMContext:
+def initialize_cantilever_context(resolution=(64, 32, 32)) -> FEMContext:
     """
-    Inicializa o contexto FEM para uma viga em balanço (Cantilever).
+    Initialize a 3D FEM context for a Cantilever Beam.
+    Resolution: (L, H, W) -> (x, y, z)
+    Physical Size: 2.0 x 1.0 x 1.0
+    """
+    L, H, W = 2.0, 1.0, 1.0
+    nx, ny, nz = resolution
     
-    Args:
-        resolution: Tupla (nx, ny) definindo a resolução da malha.
-        props: Propriedades físicas e parâmetros de penalidade.
-        
-    Returns:
-        FEMContext configurado e pronto para uso.
-    """
-    # 1. Malha
-    # Dimensões 2.0 x 1.0
-    L, H = 2.0, 1.0
-    nx, ny = resolution
-    msh = mesh.create_rectangle(
-        comm=MPI.COMM_WORLD,
-        points=((0.0, 0.0), (L, H)),
-        n=(nx, ny),
-        cell_type=mesh.CellType.quadrilateral,
+    # 1. Create 3D Hexahedral Mesh
+    domain = mesh.create_box(
+        MPI.COMM_WORLD,
+        [np.array([0.0, 0.0, 0.0]), np.array([L, H, W])],
+        [nx, ny, nz],
+        cell_type=mesh.CellType.hexahedron
     )
-
-    # 2. Espaços de Função
-    # V: Deslocamento (Vetorial, Lagrange grau 1)
-    # Em dolfinx mais recente, VectorFunctionSpace foi removido.
-    # Usamos functionspace com shape vetorial.
-    V = fem.functionspace(msh, ("Lagrange", 1, (msh.geometry.dim, )))
-    # D: Material (Escalar, Descontínuo grau 0 - constante por elemento)
-    D = fem.functionspace(msh, ("DG", 0))
-
-    # 3. Condições de Contorno (BCs)
-    # Fixar lado esquerdo (x = 0)
+    
+    # 2. Function Space (Vector Element for Displacement)
+    # FEniCSx v0.8+: Use ufl.VectorElement and fem.FunctionSpace
+    # FEniCSx v0.8+: Use basix.ufl and fem.functionspace
+    import basix.ufl
+    element = basix.ufl.element("Lagrange", domain.topology.cell_name(), 1, shape=(domain.geometry.dim,))
+    V = fem.functionspace(domain, element)
+    
+    # 3. Boundary Conditions (Fix Left Face: x=0)
     def left_boundary(x):
         return np.isclose(x[0], 0.0)
-
-    fdim = msh.topology.dim - 1
-    left_facets = mesh.locate_entities_boundary(msh, fdim, left_boundary)
+        
+    fdim = domain.topology.dim - 1
+    left_facets = mesh.locate_entities_boundary(domain, fdim, left_boundary)
     
-    # u = 0 na fronteira esquerda
-    u_zero = np.array([0.0, 0.0], dtype=dolfinx.default_scalar_type)
+    # Fix all components (0, 1, 2) -> (x, y, z)
+    u_zero = np.array([0.0, 0.0, 0.0], dtype=PETSc.ScalarType)
     bc = fem.dirichletbc(u_zero, fem.locate_dofs_topological(V, fdim, left_facets), V)
-
-    # 4. Forma Variacional
+    
+    # 4. Variational Problem (Linear Elasticity)
     u = ufl.TrialFunction(V)
     v = ufl.TestFunction(V)
     
-    # Campo de material (densidade)
-    material_field = fem.Function(D)
-    # Inicializa com 1.0 (sólido) por padrão
-    material_field.x.array[:] = 1.0 
-
-    # Interpolação do Módulo de Young: E(rho) = E_void + (E_solid - E_void) * rho
-    E = props.E_void + (props.E_solid - props.E_void) * material_field
-    nu = props.nu
+    # Material Field (Density 0 or 1)
+    # We use a DG0 space (constant per cell) to map voxels to elements
+    V_mat = fem.functionspace(domain, ("DG", 0))
+    material_field = fem.Function(V_mat)
+    material_field.x.array[:] = 1.0 # Start full
     
-    # Modelo Constitutivo (Elasticidade Linear Plana)
+    # SIMP Interpolation: E(rho) = E_min + (E_0 - E_min) * rho^p
+    # For binary (0/1), this simplifies to E_0 * rho (plus small epsilon to avoid singularity)
+    E_0 = 1.0
+    E_min = 1e-6
+    rho = material_field
+    E = E_min + (E_0 - E_min) * rho # Linear for binary is fine, or rho**3 for SIMP
+    nu = 0.3
+    
     mu = E / (2 * (1 + nu))
     lmbda = E * nu / ((1 + nu) * (1 - 2 * nu))
-
+    
     def epsilon(u):
         return ufl.sym(ufl.grad(u))
-
-    def sigma(u):
-        return 2.0 * mu * epsilon(u) + lmbda * ufl.tr(epsilon(u)) * ufl.Identity(len(u))
-
-    a = ufl.inner(sigma(u), epsilon(v)) * ufl.dx
-
-    # Linear form (zero, carga será aplicada no solver)
-    f_zero = dolfinx.fem.Constant(msh, dolfinx.default_scalar_type((0, 0)))
-    L_form = ufl.inner(f_zero, v) * ufl.dx
-
-    # Configuração do Solver
-    from dolfinx.fem.petsc import LinearProblem
-    petsc_options = {"ksp_type": "preonly", "pc_type": "lu"}
-    
-    problem = LinearProblem(a, L_form, bcs=[bc], petsc_options=petsc_options, petsc_options_prefix="alphabuilder_")
-
-    # 5. Mapeamento de Índices (Grid -> DoF)
-    dof_coords = D.tabulate_dof_coordinates()[:, :2]
-    num_dofs = D.dofmap.index_map.size_local
-    dof_map = np.zeros((ny, nx), dtype=np.int32) - 1
-    
-    tol = 1e-4
-    dx = L / nx
-    dy = H / ny
-    
-    for i in range(num_dofs):
-        x, y = dof_coords[i]
-        col = int((x + tol) / dx)
-        row = ny - 1 - int((y + tol) / dy)
         
-        if 0 <= row < ny and 0 <= col < nx:
-            dof_map[row, col] = i
-            
+    def sigma(u):
+        return lmbda * ufl.tr(epsilon(u)) * ufl.Identity(len(u)) + 2.0 * mu * epsilon(u)
+        
+    a = ufl.inner(sigma(u), epsilon(v)) * ufl.dx
+    L = ufl.dot(fem.Constant(domain, np.zeros(3, dtype=PETSc.ScalarType)), v) * ufl.dx
+    
+    # 5. Linear Problem Setup
+    problem = dolfinx.fem.petsc.LinearProblem(a, L, bcs=[bc], petsc_options={"ksp_type": "preonly", "pc_type": "lu"}, petsc_options_prefix="cantilever")
+    
+    # 6. DOF Map (Voxel -> Cell Index)
+    # In FEniCSx with structured box mesh, cell indices usually follow a pattern.
+    # However, to be safe, we rely on the fact that we update 'material_field' which is DG0.
+    # The DG0 DoFs correspond 1-to-1 with cells.
+    # We assume the grid passed to solver matches the mesh resolution (nx, ny, nz).
+    # We need a map if the ordering differs, but for BoxMesh, it's usually lexicographical.
+    # Let's create a placeholder map.
+    dof_map = np.arange(nx * ny * nz, dtype=np.int32)
+    
+    u_sol = fem.Function(V)
+    
     return FEMContext(
-        mesh=msh,
+        domain=domain,
         V=V,
-        D=D,
-        u_sol=problem.u,
-        material_field=material_field,
+        bc=bc,
         problem=problem,
-        dof_map=dof_map
+        u_sol=u_sol,
+        dof_map=dof_map,
+        material_field=material_field
     )

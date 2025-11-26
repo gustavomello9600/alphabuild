@@ -70,16 +70,22 @@ def astar_pathfind(
         return neighbors
     
     def cost(current: Tuple[int, int], neighbor: Tuple[int, int]) -> float:
-        """Cost function favoring diagonal/straight paths."""
+        """Cost function favoring diagonal/straight paths with noise."""
         dx = abs(neighbor[0] - current[0])
         dy = abs(neighbor[1] - current[1])
         
+        base_cost = 0.0
         # Diagonal move
         if dx == 1 and dy == 1:
-            return 1.414  # sqrt(2)
-        # Straight move (less favorable for structural strength)
+            base_cost = 1.414  # sqrt(2)
+        # Straight move
         else:
-            return 1.0 + diagonal_penalty
+            base_cost = 1.0 + diagonal_penalty
+            
+        # Add small random noise to break symmetry/determinism
+        # Deterministic noise based on coordinates to keep A* consistent within one run
+        noise = (hash((current, neighbor)) % 100) / 1000.0  # 0.0 to 0.1
+        return base_cost + noise
     
     # Initialize
     open_set = []

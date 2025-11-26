@@ -1,114 +1,111 @@
 # 🤖 MISSÃO: AGENTE 03 (NEURAL_VISION)
 
-**Função:** Arquiteto de Deep Learning (Vision Transformers).
-**Paradigma:** Funcional Prático (Keras Functional API).
-**Stack:** Python 3.10+, TensorFlow 2.x, NumPy.
+**Função:** Arquiteto de Deep Learning (Swin-UNETR & Physics-Aware AI).
+**Paradigma:** Funcional Prático (PyTorch / MONAI).
+**Stack:** Python 3.10+, PyTorch, MONAI (Medical Open Network for AI), Einops.
 
 ---
 
 ## 1. CONTEXTO E OBJETIVO
-Sua responsabilidade é escrever o código do módulo de Inteligência Artificial do **AlphaBuilder**. Este módulo será importado e utilizado pelo motor de estratégia (escrito por outro agente) para estimar a qualidade de designs estruturais.
+Sua responsabilidade é implementar o "Cérebro" do **AlphaBuilder v1.1**.
+Você deve abandonar a abordagem ViT pura e implementar uma arquitetura **Swin-UNETR (Swin Transformer U-Net)**.
 
-**A Estratégia de Unificação Volumétrica:**
-Você deve implementar uma arquitetura **3D Vision Transformer**.
-*   O código não deve tratar problemas 2D e 3D de formas distintas.
-*   O input para a rede neural será sempre um **Volume Euclidiano** $(D, H, W, C)$.
-*   Problemas 2D (como a viga do paper) são tratados através da **extrusão** da malha 2D ao longo do eixo Z (profundidade). A "espessura" da peça define quantas fatias de voxels serão preenchidas no tensor de entrada.
+**Por que Swin-UNETR?**
+O problema de otimização topológica exige duas competências simultâneas:
+1.  **Visão Global (Encoder Swin):** Entender o fluxo de carga macroscópico (ex: "Isso é uma viga em balanço, preciso reforçar a base").
+2.  **Precisão Local (Decoder U-Net):** Decidir exatamente qual voxel da borda remover para alisar a estrutura sem desconectar.
 
 ---
 
 ## 2. ESTRUTURAS DE DADOS (INTERFACE)
 
-Defina estas estruturas utilizando `dataclasses` imutáveis. Elas servirão como contrato de dados para quem importar seu módulo.
+Defina estas estruturas utilizando `dataclasses` imutáveis.
 
 ```python
 from dataclasses import dataclass
-import tensorflow as tf
-import numpy as np
+import torch
+from typing import Tuple
 
 # Constantes do Espaço Canônico de Entrada
-# O modelo sempre espera este shape fixo.
-MAX_DEPTH = 16   # Espessura máxima em voxels
-MAX_HEIGHT = 64
-MAX_WIDTH = 128
-CHANNELS = 3     # (1: Material, 2: Suportes, 3: Cargas)
+# Tensor 5D: (Batch, Channels, Depth, Height, Width)
+INPUT_SHAPE = (5, 16, 64, 64) # Exemplo, ajustável via config
+CHANNELS = 5 
+
+# Canal 0: Densidade (0=Ar, 1=Material)
+# Canal 1: Máscara de Suporte (1=Fixo)
+# Canal 2: Força X (Normalizada)
+# Canal 3: Força Y (Normalizada)
+# Canal 4: Força Z (Normalizada)
 
 @dataclass(frozen=True)
 class VolumetricInput:
     """
     Container imutável para o tensor de entrada.
-    Garante que o tensor esteja no formato (Batch, D, H, W, C).
+    Shape esperado: (Batch, 5, D, H, W)
     """
-    tensor: tf.Tensor
+    tensor: torch.Tensor
 
 @dataclass(frozen=True)
-class TrainingBatch:
+class ModelOutput:
     """
-    Par (Input, Target) para o loop de treinamento.
+    Saída Dual-Head da Rede.
     """
-    inputs: VolumetricInput
-    targets: tf.Tensor  # Shape: (Batch, 1) -> Fitness Real
+    policy_logits: torch.Tensor  # Shape: (Batch, 2, D, H, W) -> [Add_Score, Remove_Score]
+    value_pred: torch.Tensor     # Shape: (Batch, 1) -> Probabilidade de Sucesso / Compliance Estimado
 ```
 
 ---
 
 ## 3. TAREFAS DE IMPLEMENTAÇÃO
 
-Você deve produzir um arquivo (ou conjunto de arquivos) contendo as seguintes **Funções Puras** e **Construtores de Modelo**.
+### 3.1. Arquitetura: Physics-Aware Swin-UNETR
+Implemente o modelo utilizando `monai.networks.nets.SwinUNETR` como base ou implemente do zero se precisar de customização fina nos embeddings de força.
 
-### 3.1. Pré-processamento: Extrusão e Tensorização
-Quem usar seu código enviará matrizes NumPy 2D brutas e um inteiro de espessura. Você deve transformar isso no formato que a rede aceita.
+*   **`build_swin_unetr(input_shape: Tuple[int, ...]) -> torch.nn.Module`**
+    *   **Encoder (Swin Transformer):**
+        *   Utiliza *Shifted Windows* para capturar dependências de longo alcance com complexidade linear.
+        *   Extrai features em 4 escalas hierárquicas.
+    *   **Bottleneck:**
+        *   Representação latente compacta da física global do problema.
+    *   **Decoder (U-Net style):**
+        *   Reconstrói a resolução espacial usando Deconvoluções (Transpose Conv).
+        *   **Skip Connections:** Concatena features do Encoder para recuperar detalhes geométricos perdidos.
+    *   **Heads (Saídas):**
+        1.  **Policy Head ($1 \times 1 \times 1$ Conv):** Produz 2 canais de saída (Logits para Ação ADD e Ação REMOVE) com a mesma resolução espacial do input.
+        2.  **Value Head (MLP no Bottleneck):** Global Average Pooling sobre o bottleneck -> MLP -> Escalar.
 
-*   **`prepare_volumetric_batch(grids_2d: list[np.ndarray], thicknesses: list[int]) -> VolumetricInput`**
-    *   **Função Pura.**
-    *   **Lógica de Extrusão:** Para cada grid $G$ de dimensão $(H, W)$ e espessura $T$:
-        1.  Crie um volume $V$ de zeros com shape $(MAX\_DEPTH, MAX\_HEIGHT, MAX\_WIDTH, 3)$.
-        2.  Repita a grid $G$ nas primeiras $T$ fatias do eixo de profundidade ($z=0$ até $z=T-1$).
-        3.  Faça o mesmo para os canais de Suporte e Carga (assumindo que permeiam a espessura).
-    *   **Normalização:** Garante `dtype=float32`.
-    *   **Retorno:** Objeto `VolumetricInput` contendo o tensor em batch.
+### 3.2. Pré-processamento de Forças
+A rede deve ser invariante à magnitude absoluta das forças, mas sensível à direção e proporção.
 
-### 3.2. Arquitetura: 3D Vision Transformer
-Implemente o construtor do modelo usando `tf.keras`.
+*   **`normalize_forces(force_tensor: torch.Tensor) -> torch.Tensor`**
+    *   Normaliza os canais de força (2, 3, 4) para o intervalo $[-1, 1]$ ou $[0, 1]$ baseando-se na força máxima presente no grid.
+    *   Isso garante que uma carga de 100N e uma de 1000N gerem a "mesma" topologia relativa se o material for linear elástico.
 
-*   **`build_3d_vit(patch_size: tuple[int, int, int] = (2, 8, 8)) -> tf.keras.Model`**
-    *   **Entrada:** `(MAX_DEPTH, MAX_HEIGHT, MAX_WIDTH, 3)`.
-    *   **Patching Volumétrico:** Utilize `Conv3D` com stride igual ao tamanho do kernel para criar os embeddings lineares dos patches cúbicos.
-    *   **Positional Embeddings:** Implemente uma camada customizada ou use `Embedding` somado, para que o modelo entenda coordenadas $(z, y, x)$. *Isso é crucial para diferenciar uma camada superficial de uma interna.*
-    *   **Transformer Block:** Implemente a sequência padrão (Norm -> Attention -> Norm -> MLP). Use conexões residuais.
-    *   **Head:** Global Average Pooling 3D seguido de MLP denso para regressão escalar (1 saída).
+### 3.3. API de Inferência
+Exponha uma função simples para o MCTS.
 
-### 3.3. API de Treinamento e Inferência
-Exponha funções que abstraiam a complexidade do TensorFlow.
-
-*   **`train_step(model, batch: TrainingBatch, optimizer, loss_fn) -> dict`**
-    *   Decore com `@tf.function`.
-    *   Executa um passo de gradiente descendente.
-    *   Retorna dicionário de métricas (Loss, MAE).
-
-*   **`predict_fitness(model, grids: list[np.ndarray], thicknesses: list[int]) -> np.ndarray`**
-    *   **Esta é a função que o código do MCTS chamará.**
-    *   Recebe dados brutos.
-    *   Chama internamente `prepare_volumetric_batch`.
-    *   Executa `model(input, training=False)`.
-    *   Retorna array NumPy com os valores previstos.
+*   **`predict_action_value(model, grid_tensor: torch.Tensor) -> ModelOutput`**
+    *   Recebe o grid bruto.
+    *   Executa o forward pass.
+    *   Aplica `softmax` na Policy Head (opcional, dependendo de como o MCTS consome).
+    *   Retorna `ModelOutput`.
 
 ---
 
 ## 4. REQUISITOS TÉCNICOS
 
-1.  **Agnosticismo de Chamada:** Seu código não deve importar nada do módulo de Física ou do MCTS. Ele deve ser totalmente independente, dependendo apenas de NumPy e TensorFlow.
-2.  **Tratamento de Padding:** O ViT deve ser robusto a voxels vazios. Como usamos *Zero Padding* para preencher o cubo até `MAX_DEPTH`, certifique-se de que o mecanismo de atenção ou a normalização não sejam desestabilizados por muitos zeros. O uso de `LayerNormalization` geralmente resolve isso bem.
-3.  **Persistência do Modelo:** Inclua funções simples `save_model(model, path)` e `load_model(path)` usando o formato `.keras` nativo.
+1.  **Framework:** Migração para **PyTorch** é recomendada dada a disponibilidade de implementações Swin-UNETR robustas (MONAI). Se preferir TensorFlow, terá que implementar Swin 3D do zero.
+2.  **Eficiência 3D:** Utilize operações `Conv3d` e `Attention` otimizadas. O grid $64^3$ é pesado.
+3.  **Mixed Precision:** O modelo deve suportar treinamento em `float16` (AMP) para caber na memória da GPU A100/T4.
 
 ---
 
 ## 5. VALIDAÇÃO (Smoke Test)
 
-No final do seu script (bloco `if __name__ == "__main__":`), escreva um teste de integração interna:
-
-1.  **Mock Data:** Crie uma lista com 2 matrizes aleatórias $(64, 128)$. Defina espessuras `[1, 5]`.
-2.  **Pipeline Check:** Chame `prepare_volumetric_batch` e verifique (`assert`) se o tensor resultante tem shape `(2, 16, 64, 128, 3)`.
-3.  **Model Build:** Instancie o modelo com `build_3d_vit()`.
-4.  **Forward Pass:** Passe o tensor pelo modelo e verifique se o output tem shape `(2, 1)`.
-5.  **Output:** Imprima "Neural Module Ready. Input Shape: [...] Output: [...]".
+No `if __name__ == "__main__":`:
+1.  Instancie o modelo `SwinUNETR` com input channels=5.
+2.  Crie um tensor aleatório `(1, 5, 32, 32, 32)`.
+3.  Faça um forward pass.
+4.  Verifique se `policy_logits.shape == (1, 2, 32, 32, 32)`.
+5.  Verifique se `value_pred.shape == (1, 1)`.
+6.  Imprima: "Swin-UNETR Architecture Ready."

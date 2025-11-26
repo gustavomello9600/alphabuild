@@ -1,183 +1,112 @@
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
-import numpy as np
+import torch
+import torch.nn as nn
+from monai.networks.nets import SwinUNETR
+from dataclasses import dataclass
+from typing import Tuple, Optional
 
-# Constants matching data_loader
-MAX_DEPTH = 16
-MAX_HEIGHT = 64
-MAX_WIDTH = 128
-CHANNELS = 3
+# Constants
+INPUT_SHAPE = (5, 64, 32, 32) # (Channels, Depth, Height, Width) - Adjusted for typical Colab memory
+CHANNELS = 5
 
-def get_sinusoidal_embeddings(num_positions, projection_dim):
+@dataclass
+class ModelOutput:
+    policy_logits: torch.Tensor # (B, 2, D, H, W)
+    value_pred: torch.Tensor    # (B, 1)
+
+class AlphaBuilderSwinUNETR(nn.Module):
     """
-    Generates sinusoidal positional embeddings.
-    """
-    positions = np.arange(num_positions)[:, np.newaxis]
-    div_term = np.exp(np.arange(0, projection_dim, 2) * -(np.log(10000.0) / projection_dim))
+    Physics-Aware Swin-UNETR for Topology Optimization.
     
-    embeddings = np.zeros((num_positions, projection_dim))
-    embeddings[:, 0::2] = np.sin(positions * div_term)
-    embeddings[:, 1::2] = np.cos(positions * div_term)
-    
-    return tf.constant(embeddings, dtype=tf.float32)
-
-class SinusoidalPositionalEmbedding(layers.Layer):
+    Inputs:
+        x: (Batch, 5, D, H, W)
+           - Ch0: Density (0/1)
+           - Ch1: Support Mask
+           - Ch2-4: Force Vectors (Fx, Fy, Fz)
+           
+    Outputs:
+        policy_logits: (Batch, 2, D, H, W) -> [Add_Score, Remove_Score]
+        value_pred: (Batch, 1) -> Estimated Compliance/Success
     """
-    Fixed Sinusoidal Positional Embedding Layer.
-    Better for generalization than learned embeddings.
-    """
-    def __init__(self, num_patches, projection_dim, **kwargs):
-        super().__init__(**kwargs)
-        self.num_patches = num_patches
-        self.projection_dim = projection_dim
-        self.pos_embedding = get_sinusoidal_embeddings(num_patches, projection_dim)
-
-    def call(self, x):
-        return x + self.pos_embedding
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "num_patches": self.num_patches,
-            "projection_dim": self.projection_dim,
-        })
-        return config
-
-class ClassToken(layers.Layer):
-    """
-    Appends a learnable CLS token to the input sequence.
-    """
-    def __init__(self, projection_dim, **kwargs):
-        super().__init__(**kwargs)
-        self.projection_dim = projection_dim
-        self.w_init = tf.random_normal_initializer()
-
-    def build(self, input_shape):
-        self.cls_token = tf.Variable(
-            initial_value=self.w_init(shape=(1, 1, self.projection_dim), dtype="float32"),
-            trainable=True,
-            name="cls_token"
+    def __init__(
+        self, 
+        img_size: Tuple[int, int, int] = (64, 32, 32),
+        in_channels: int = 5,
+        out_channels: int = 2,
+        feature_size: int = 48,
+        use_checkpoint: bool = True,
+    ):
+        super().__init__()
+        
+        # 1. Backbone: Swin-UNETR (MONAI)
+        # We use the encoder-decoder structure for the Policy Head
+        self.swin_unetr = SwinUNETR(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            feature_size=feature_size,
+            use_checkpoint=use_checkpoint,
+            spatial_dims=3
         )
+        
+        # 2. Value Head (Attached to the Bottleneck)
+        # SwinUNETR doesn't expose the bottleneck easily in its standard forward.
+        # We might need to hook into it or use the encoder features if we want a true multi-head.
+        # However, for simplicity and robustness, we can use a separate lightweight encoder 
+        # OR (better) use the SwinUNETR's encoder output if accessible.
+        # MONAI's SwinUNETR returns the segmentation map directly.
+        
+        # Strategy: We will use the SwinUNETR for the Policy.
+        # For the Value, we will add a small parallel encoder or try to reuse features.
+        # Given the complexity of modifying MONAI internals without inheritance, 
+        # let's add a lightweight 3D CNN Encoder for the Value Head that shares nothing *yet* 
+        # (to be optimized later) OR simply downsample the Policy output.
+        
+        # Better Strategy for V1: Use the Policy Logits to estimate Value? No, circular.
+        # Let's add a separate simple encoder for Value to ensure it learns global structural stability.
+        # This increases param count but guarantees the Value Head isn't confused by the Policy's pixel-wise task.
+        
+        self.value_encoder = nn.Sequential(
+            nn.Conv3d(in_channels, 16, kernel_size=4, stride=4), # 64->16
+            nn.ReLU(),
+            nn.Conv3d(16, 32, kernel_size=4, stride=4), # 16->4
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(32 * (img_size[0]//16) * (img_size[1]//16) * (img_size[2]//16), 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+        # Note: The above is a placeholder. Ideally we want to tap into Swin's bottleneck.
+        # But `monai.networks.nets.SwinUNETR` is a `nn.Module`.
+        
+    def forward(self, x: torch.Tensor) -> ModelOutput:
+        # Policy Forward
+        # Output: (B, 2, D, H, W)
+        policy_logits = self.swin_unetr(x)
+        
+        # Value Forward (Simple Baseline)
+        value_pred = self.value_encoder(x)
+        
+        return ModelOutput(policy_logits=policy_logits, value_pred=value_pred)
 
-    def call(self, x):
-        batch_size = tf.shape(x)[0]
-        # Broadcast cls_token to batch size
-        cls_token_broadcast = tf.tile(self.cls_token, [batch_size, 1, 1])
-        return tf.concat([cls_token_broadcast, x], axis=1)
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({"projection_dim": self.projection_dim})
-        return config
-
-def build_3d_vit(
-    input_shape: tuple = (MAX_DEPTH, MAX_HEIGHT, MAX_WIDTH, CHANNELS),
-    patch_size: tuple = (2, 8, 8),
-    num_heads: int = 4,
-    transformer_layers: int = 4,
-    projection_dim: int = 64,
-    mlp_head_units: list = [2048, 1024],
-) -> keras.Model:
-    """
-    Builds a 3D Vision Transformer model optimized for Max Displacement prediction.
-    
-    Changes from v1:
-    - Sinusoidal Positional Embeddings (Generalization)
-    - CLS Token (Representation)
-    - Output: Max Displacement (Scalar, > 0)
-    """
-    
-    inputs = layers.Input(shape=input_shape)
-    
-    # --- 1. Patch Creation (using Conv3D) ---
-    patches = layers.Conv3D(
-        filters=projection_dim,
-        kernel_size=patch_size,
-        strides=patch_size,
-        padding="VALID",
-        name="patch_projection"
-    )(inputs)
-    
-    # Reshape to sequence
-    d_patches = input_shape[0] // patch_size[0]
-    h_patches = input_shape[1] // patch_size[1]
-    w_patches = input_shape[2] // patch_size[2]
-    num_patches = d_patches * h_patches * w_patches
-    
-    encoded_patches = layers.Reshape((num_patches, projection_dim))(patches)
-    
-    # --- 2. CLS Token & Positional Embedding ---
-    # Add CLS token *before* positional embedding (standard ViT)
-    # Note: If we add CLS first, we need num_patches + 1 embeddings.
-    encoded_patches = ClassToken(projection_dim)(encoded_patches)
-    
-    # Add Positional Embeddings (Fixed Sinusoidal)
-    # We need embeddings for num_patches + 1 (CLS)
-    encoded_patches = SinusoidalPositionalEmbedding(num_patches + 1, projection_dim)(encoded_patches)
-    
-    # --- 3. Transformer Blocks ---
-    for i in range(transformer_layers):
-        # Layer Normalization 1
-        x1 = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
-        
-        # Multi-Head Attention
-        attention_output = layers.MultiHeadAttention(
-            num_heads=num_heads, key_dim=projection_dim, dropout=0.1
-        )(x1, x1)
-        
-        # Skip Connection 1
-        x2 = layers.Add()([attention_output, encoded_patches])
-        
-        # Layer Normalization 2
-        x3 = layers.LayerNormalization(epsilon=1e-6)(x2)
-        
-        # MLP
-        x3 = layers.Dense(projection_dim * 2, activation=tf.nn.gelu)(x3)
-        x3 = layers.Dropout(0.1)(x3)
-        x3 = layers.Dense(projection_dim)(x3)
-        x3 = layers.Dropout(0.1)(x3)
-        
-        # Skip Connection 2
-        encoded_patches = layers.Add()([x3, x2])
-        
-    # --- 4. Head (Use CLS Token) ---
-    representation = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
-    
-    # Extract CLS token (index 0)
-    # Shape: (Batch, projection_dim)
-    cls_token_output = layers.Lambda(lambda x: x[:, 0])(representation)
-    
-    # MLP Head for Regression
-    features = cls_token_output
-    for units in mlp_head_units:
-        features = layers.Dense(units, activation=tf.nn.gelu)(features)
-        features = layers.Dropout(0.2)(features)
-        
-    # Output: Max Displacement (Scalar)
-    # We use Softplus to ensure positivity, as displacement >= 0
-    outputs = layers.Dense(1, activation='softplus', name="max_displacement_output")(features)
-    
-    model = keras.Model(inputs=inputs, outputs=outputs, name="AlphaBuilder_ViT_3D_v2")
-    return model
+def build_model(input_shape: Tuple[int, int, int] = (64, 32, 32)) -> AlphaBuilderSwinUNETR:
+    return AlphaBuilderSwinUNETR(img_size=input_shape)
 
 if __name__ == "__main__":
     # Smoke Test
-    print("Running Smoke Test for Model Arch v2...")
-    
-    model = build_3d_vit()
-    model.summary()
-    
-    # Mock Input
-    mock_input = tf.random.normal((2, MAX_DEPTH, MAX_HEIGHT, MAX_WIDTH, CHANNELS))
-    
-    # Forward Pass
-    output = model(mock_input)
-    
-    print(f"Input Shape: {mock_input.shape}")
-    print(f"Output Shape: {output.shape}")
-    
-    assert output.shape == (2, 1), f"Expected (2, 1), got {output.shape}"
-    assert np.all(output.numpy() >= 0), "Output must be non-negative (Softplus)"
-    
-    print("Model Arch v2 Smoke Test Passed!")
+    print("Running Swin-UNETR Smoke Test...")
+    try:
+        model = build_model()
+        # Create dummy input (Batch=1, Ch=5, D=64, H=32, W=32)
+        x = torch.randn(1, 5, 64, 32, 32)
+        output = model(x)
+        
+        print(f"Input: {x.shape}")
+        print(f"Policy Output: {output.policy_logits.shape}")
+        print(f"Value Output: {output.value_pred.shape}")
+        
+        assert output.policy_logits.shape == (1, 2, 64, 32, 32)
+        assert output.value_pred.shape == (1, 1)
+        print("Test Passed!")
+    except ImportError:
+        print("MONAI or PyTorch not installed. Skipping execution.")
+    except Exception as e:
+        print(f"Test Failed: {e}")

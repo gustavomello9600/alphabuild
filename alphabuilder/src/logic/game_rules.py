@@ -1,105 +1,136 @@
 import numpy as np
-from typing import Tuple, FrozenSet, Set
-from alphabuilder.src.logic.game_types import DesignState, GameAction, Coord, PhaseType
-from alphabuilder.src.logic.graph_ops import check_global_connectivity, get_articulation_points
+from typing import Tuple, List, Set, NamedTuple
+from dataclasses import dataclass
 
-def get_perimeter(grid: np.ndarray) -> FrozenSet[Coord]:
-    """
-    Identifies all empty cells adjacent to at least one material cell.
-    """
-    rows, cols = grid.shape
-    perimeter = set()
-    
-    # Get all material indices
-    material_indices = np.argwhere(grid == 1)
-    
-    for r, c in material_indices:
-        neighbors = [
-            (r-1, c), (r+1, c), 
-            (r, c-1), (r, c+1)
-        ]
-        for nr, nc in neighbors:
-            if 0 <= nr < rows and 0 <= nc < cols:
-                if grid[nr, nc] == 0:
-                    perimeter.add((nr, nc))
-                    
-    return frozenset(perimeter)
+# Type Definitions
+Coord = Tuple[int, int, int] # (z, y, x) or (d, h, w)
 
-def get_legal_actions(state: DesignState) -> Tuple[GameAction, ...]:
+@dataclass(frozen=True)
+class GameState:
+    tensor: np.ndarray # (5, D, H, W)
+    phase: str # 'GROWTH' or 'REFINEMENT'
+    step_count: int
+    
+    @property
+    def density(self) -> np.ndarray:
+        return self.tensor[0]
+
+    @property
+    def shape(self) -> Tuple[int, int, int]:
+        return self.tensor.shape[1:]
+
+def get_neighbors_3d(coord: Coord, shape: Tuple[int, int, int]) -> List[Coord]:
+    """Return 6-connected neighbors."""
+    d, h, w = coord
+    D, H, W = shape
+    neighbors = []
+    for dd, dh, dw in [(-1,0,0), (1,0,0), (0,-1,0), (0,1,0), (0,0,-1), (0,0,1)]:
+        nd, nh, nw = d+dd, h+dh, w+dw
+        if 0 <= nd < D and 0 <= nh < H and 0 <= nw < W:
+            neighbors.append((nd, nh, nw))
+    return neighbors
+
+def check_connectivity_3d(density: np.ndarray, starts: List[Coord], ends: List[Coord]) -> bool:
     """
-    Returns a tuple of all legal actions for the current state.
+    Check if any start is connected to any end via material (1s).
+    """
+    if not starts or not ends:
+        return False
+        
+    shape = density.shape
+    visited = set()
+    queue = list(starts)
+    visited.update(starts)
+    
+    found_end = False
+    
+    # Optimization: Convert ends to set for O(1) lookup
+    end_set = set(ends)
+    
+    while queue:
+        curr = queue.pop(0)
+        
+        if curr in end_set:
+            return True
+            
+        for n in get_neighbors_3d(curr, shape):
+            if density[n] == 1 and n not in visited:
+                visited.add(n)
+                queue.append(n)
+                
+    return False
+
+def get_legal_actions_3d(state: GameState) -> List[Tuple[str, Coord]]:
+    """
+    Get legal actions based on phase.
     """
     actions = []
+    D, H, W = state.shape
+    density = state.density
     
-    # ADD Actions: Always allowed on perimeter
-    # Heuristic ordering could be applied here, but we'll keep it simple for now
-    for coord in state.perimeter:
-        actions.append(GameAction(type='ADD', coord=coord))
+    # GROWTH: Add material adjacent to existing material or seeds
+    if state.phase == 'GROWTH':
+        # Find all 0s adjacent to 1s OR Seeds (Supports/Loads)
         
-    if state.phase == 'REFINEMENT':
-        # REMOVE Actions: Allowed on material, with exceptions
+        # 1. Material Indices
+        mat_indices = np.argwhere(density == 1)
         
-        # 1. Calculate Articulation Points (expensive, only if needed)
-        # We only need to check this if we are considering removing material
-        articulation_points = get_articulation_points(state.grid)
+        # 2. Support Indices (Ch1)
+        support_indices = np.argwhere(state.tensor[1] == 1)
         
-        # Get all material coordinates
-        rows, cols = state.grid.shape
-        for r in range(rows):
-            for c in range(cols):
-                if state.grid[r, c] == 1:
-                    coord = (r, c)
+        # 3. Load Indices (Ch2-4)
+        load_indices = np.argwhere(state.tensor[2:].sum(axis=0) != 0)
+        
+        # Combine all "Active" voxels
+        # We use a set of tuples for uniqueness
+        active_voxels = set()
+        for idx in mat_indices: active_voxels.add(tuple(idx))
+        for idx in support_indices: active_voxels.add(tuple(idx))
+        for idx in load_indices: active_voxels.add(tuple(idx))
+        
+        potential_adds = set()
+        for coord in active_voxels:
+            for n in get_neighbors_3d(coord, state.shape):
+                if density[n] == 0:
+                    potential_adds.add(n)
                     
-                    # Constraint 1: Cannot remove fixed supports
-                    if coord in state.supports:
-                        continue
-                        
-                    # Constraint 2: Cannot remove load points
-                    if coord in state.loads:
-                        continue
-                        
-                    # Constraint 3: Cannot remove articulation points (would disconnect graph)
-                    if coord in articulation_points:
-                        continue
-                        
-                    actions.append(GameAction(type='REMOVE', coord=coord))
-                    
-    return tuple(actions)
-
-def apply_action(state: DesignState, action: GameAction) -> DesignState:
-    """
-    Applies an action to the state and returns a new immutable state.
-    """
-    new_grid = state.grid.copy()
-    r, c = action.coord
-    
-    if action.type == 'ADD':
-        new_grid[r, c] = 1
-    elif action.type == 'REMOVE':
-        new_grid[r, c] = 0
+        for coord in potential_adds:
+            actions.append(('ADD', coord))
+            
+    # REFINEMENT: Add or Remove
+    elif state.phase == 'REFINEMENT':
+        # ADD: Same as above (Perimeter)
+        mat_indices = np.argwhere(density == 1)
+        potential_adds = set()
+        for idx in mat_indices:
+            coord = tuple(idx)
+            for n in get_neighbors_3d(coord, state.shape):
+                if density[n] == 0:
+                    potential_adds.add(n)
+        for coord in potential_adds:
+            actions.append(('ADD', coord))
+            
+        # REMOVE: Any material that is NOT a support or load
+        # And does not break connectivity (expensive check!)
+        # For MCTS, we might allow breaking and punish with reward?
+        # Or strictly forbid.
         
-    # Recalculate derived metadata
-    new_perimeter = get_perimeter(new_grid)
-    new_volume = int(np.sum(new_grid))
-    
-    # Check connectivity
-    # Optimization: If phase is GROWTH, we check if we just connected everything.
-    # If phase is REFINEMENT, we assume it stays connected because we forbid removing articulation points.
-    # However, 'check_global_connectivity' is the ground truth.
-    
-    is_connected = check_global_connectivity(new_grid, state.supports, state.loads)
-    
-    # Determine Phase Transition
-    new_phase = state.phase
-    if state.phase == 'GROWTH' and is_connected:
-        new_phase = 'REFINEMENT'
+        # Supports: Ch1
+        supports = np.argwhere(state.tensor[1] == 1)
+        support_set = set(map(tuple, supports))
         
-    return DesignState(
-        grid=new_grid,
-        supports=state.supports,
-        loads=state.loads,
-        phase=new_phase,
-        is_connected=is_connected,
-        volume=new_volume,
-        perimeter=new_perimeter
-    )
+        # Loads: Ch2-4
+        loads = np.argwhere(state.tensor[2:].sum(axis=0) != 0)
+        load_set = set(map(tuple, loads))
+        
+        for idx in mat_indices:
+            coord = tuple(idx)
+            if coord in support_set or coord in load_set:
+                continue
+                
+            # Check Articulation Point (Optional/Expensive)
+            # For now, allow removal. If it breaks, the Physics Solver 
+            # will return 0 fitness (Singular Matrix) or we check connectivity after.
+            actions.append(('REMOVE', coord))
+            
+    return actions
