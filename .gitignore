@@ -1,3 +1,4 @@
+download_artifacts.py
 __pycache__/
 *.pyc
 *.pyo
@@ -7,6 +8,33 @@ __pycache__/
 .venv
 env/
 venv/
+
+# Model Checkpoints & Large Files
+checkpoints/
+*.pt
+*.pth
+*.keras
+*.h5
+
+# Logs
+logs/
+data/logs/
 *.log
-*.sqlite
+
+# Web / Node
+node_modules/
+dist/
+.npm/
+alphabuilder/web/node_modules/
+alphabuilder/web/dist/
+
+# Data
 *.db
+*.sqlite
+data/*.db
+
+# Coverage
+.coverage
+htmlcov/
+coverage.xml
+alphabuilder/.coverage
