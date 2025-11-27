@@ -52,6 +52,7 @@ def parse_args():
     parser.add_argument("--db-path", type=str, default="data/training_data.db", help="Path to SQLite database")
     parser.add_argument("--steps", type=int, default=100, help="Max refinement steps per episode")
     parser.add_argument("--strategy", type=str, default="balanced", choices=["random", "simp", "balanced"], help="Data generation strategy")
+    parser.add_argument("--seed-offset", type=int, default=0, help="Manual seed offset for parallel runs")
     return parser.parse_args()
 
 
@@ -140,8 +141,8 @@ def main():
     
     episode_times = []
     
-    # Use existing count to offset seed, ensuring variety if run multiple times
-    seed_offset = existing_episodes
+    # Use existing count OR manual offset to ensure variety
+    seed_offset = args.seed_offset if args.seed_offset > 0 else existing_episodes
     
     from tqdm import tqdm
     episode_pbar = tqdm(range(num_episodes), desc="Total Progress", unit="ep", ncols=100, mininterval=0.5)
