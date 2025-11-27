@@ -15,12 +15,21 @@ dependencies:
   - numpy
   - pandas
   
-  # Pip packages (IA e Web)
+  # Deep Learning (PyTorch)
+  - pytorch
+  - torchvision
+  - torchaudio
+  - cpuonly  # Default to CPU for stability, user can install cuda version if needed
+  
+  # Pip packages
   - pip
   - pip:
-    - tensorflow
-    - keras
+    - monai
+    - einops
+    - tqdm
     - fastapi
     - uvicorn[standard]
     - plotly
     - streamlit-drawable-canvas
+    - pytest
+    - pytest-cov
