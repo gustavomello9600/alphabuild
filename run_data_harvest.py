@@ -213,7 +213,7 @@ def main():
             from alphabuilder.src.logic.data_mining import extract_discrete_actions
             
             # Extract samples (State, Policy, Value)
-            training_samples = extract_discrete_actions(history, jump_size=5)
+            training_samples = extract_discrete_actions(history, jump_size=5, resolution=resolution)
             
             episode_id = generate_episode_id()
             

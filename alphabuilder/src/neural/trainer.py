@@ -1,81 +1,110 @@
-import tensorflow as tf
-import numpy as np
-import os
-from typing import Dict, List
-from .data_loader import TrainingBatch, prepare_volumetric_batch
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from pathlib import Path
+from typing import Optional, Dict
+import time
+from tqdm import tqdm
 
-@tf.function
-def train_step(model: tf.keras.Model, inputs: tf.Tensor, targets: tf.Tensor, optimizer: tf.keras.optimizers.Optimizer, loss_fn: tf.keras.losses.Loss) -> Dict[str, tf.Tensor]:
-    """
-    Executes one training step using Gradient Descent.
-    
-    Args:
-        model: Keras model (ViT 3D)
-        inputs: Input tensor (Batch, D, H, W, C)
-        targets: Target tensor (Batch, 1)
-        optimizer: Keras optimizer
-        loss_fn: Keras loss function
-        
-    Returns:
-        Dictionary of metrics (loss, mae)
-    """
-    with tf.GradientTape() as tape:
-        # Forward pass
-        predictions = model(inputs, training=True)
-        
-        # Compute loss
-        loss = loss_fn(targets, predictions)
-        
-    # Compute gradients
-    gradients = tape.gradient(loss, model.trainable_variables)
-    
-    # Update weights
-    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-    
-    # Compute metrics
-    mae = tf.reduce_mean(tf.abs(targets - predictions))
-    
-    return {"loss": loss, "mae": mae}
+from .model_arch import AlphaBuilderSwinUNETR
+from .dataset import AlphaBuilderDataset
 
-def predict_fitness(model: tf.keras.Model, grids: List[np.ndarray], thicknesses: List[int]) -> np.ndarray:
-    """
-    Predicts fitness for a list of 2D grids.
-    This is the main interface for the MCTS agent.
-    
-    Args:
-        model: Trained Keras model
-        grids: List of 2D numpy arrays
-        thicknesses: List of thicknesses
+class AlphaBuilderTrainer:
+    def __init__(
+        self,
+        model: AlphaBuilderSwinUNETR,
+        db_path: str,
+        checkpoint_dir: str = "checkpoints",
+        lr: float = 1e-4,
+        batch_size: int = 4,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    ):
+        self.model = model.to(device)
+        self.device = device
+        self.batch_size = batch_size
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.checkpoint_dir.mkdir(exist_ok=True, parents=True)
         
-    Returns:
-        Numpy array of predicted fitness scores (Batch, 1)
-    """
-    # Preprocess
-    vol_input = prepare_volumetric_batch(grids, thicknesses)
-    
-    # Inference
-    predictions = model(vol_input.tensor, training=False)
-    
-    return predictions.numpy()
-
-def save_model(model: tf.keras.Model, path: str):
-    """
-    Saves the model to the specified path.
-    """
-    # Ensure directory exists
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    model.save(path)
-    print(f"Model saved to {path}")
-
-def load_model(path: str) -> tf.keras.Model:
-    """
-    Loads the model from the specified path.
-    """
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Model not found at {path}")
+        self.dataset = AlphaBuilderDataset(db_path)
+        self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True, num_workers=0) # 0 workers for safety
         
-    # We might need to register custom objects if we used custom layers like PatchEncoder
-    # But since PatchEncoder is defined in model_arch, we need to import it or pass custom_objects
-    from .model_arch import PatchEncoder
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
+        
+        # Losses
+        # Policy: Cross Entropy or BCE?
+        # Policy output is logits for 2 channels (Add, Remove).
+        # We can treat it as multi-label or separate BCEs.
+        # Spec says: "Entropia Cruzada Ponderada".
+        # Since channels are independent (Add vs Remove), BCEWithLogitsLoss is appropriate.
+        self.policy_criterion = nn.BCEWithLogitsLoss()
+        self.value_criterion = nn.MSELoss()
+        
+    def train_epoch(self, epoch: int) -> Dict[str, float]:
+        self.model.train()
+        total_loss = 0.0
+        p_loss_total = 0.0
+        v_loss_total = 0.0
+        
+        pbar = tqdm(self.dataloader, desc=f"Epoch {epoch}")
+        
+        for batch_idx, (state, policy, value) in enumerate(pbar):
+            state = state.to(self.device)
+            policy = policy.to(self.device)
+            value = value.to(self.device)
+            
+            self.optimizer.zero_grad()
+            
+            output = self.model(state)
+            
+            # Calculate Losses
+            # Policy Loss
+            p_loss = self.policy_criterion(output.policy_logits, policy)
+            
+            # Value Loss
+            v_loss = self.value_criterion(output.value_pred, value)
+            
+            # Total Loss (Weighted?)
+            loss = p_loss + 0.5 * v_loss
+            
+            loss.backward()
+            self.optimizer.step()
+            
+            total_loss += loss.item()
+            p_loss_total += p_loss.item()
+            v_loss_total += v_loss.item()
+            
+            pbar.set_postfix({"Loss": f"{loss.item():.4f}", "P_Loss": f"{p_loss.item():.4f}", "V_Loss": f"{v_loss.item():.4f}"})
+            
+        avg_loss = total_loss / len(self.dataloader)
+        return {
+            "loss": avg_loss,
+            "policy_loss": p_loss_total / len(self.dataloader),
+            "value_loss": v_loss_total / len(self.dataloader)
+        }
+        
+    def save_checkpoint(self, name: str):
+        path = self.checkpoint_dir / f"{name}.pt"
+        torch.save(self.model.state_dict(), path)
+        print(f"Saved checkpoint to {path}")
+        
+    def load_checkpoint(self, path: str):
+        self.model.load_state_dict(torch.load(path, map_location=self.device))
+        print(f"Loaded checkpoint from {path}")
+
+def train_loop(db_path: str, epochs: int = 10):
+    from .model_arch import build_model
     
-    return tf.keras.models.load_model(path, custom_objects={"PatchEncoder": PatchEncoder})
+    # Init Model
+    model = build_model()
+    
+    trainer = AlphaBuilderTrainer(model, db_path)
+    
+    for epoch in range(1, epochs + 1):
+        metrics = trainer.train_epoch(epoch)
+        print(f"Epoch {epoch} Metrics: {metrics}")
+        
+        if epoch % 5 == 0:
+            trainer.save_checkpoint(f"epoch_{epoch}")
+            
+    trainer.save_checkpoint("final")

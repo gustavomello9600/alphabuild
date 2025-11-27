@@ -4,7 +4,7 @@ from pathlib import Path
 from alphabuilder.src.logic.runner import run_episode_v1_1, EpisodeConfig
 from alphabuilder.src.core.physics_model import initialize_cantilever_context
 from alphabuilder.src.logic.storage import get_episode_count
-from alphabuilder.src.neural.dataset import CantileverDataset
+from alphabuilder.src.neural.dataset import AlphaBuilderDataset
 import torch
 
 def test_full_episode_execution(sample_props, temp_db):
@@ -57,11 +57,12 @@ def test_training_loop_integration(sample_props, temp_db, tmp_path):
     )
     
     # 2. Setup Training
-    dataset = CantileverDataset(temp_db)
+    dataset = AlphaBuilderDataset(str(temp_db))
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=2)
     
     # 3. Run one step
-    for x, y in dataloader:
-        assert x.shape[0] <= 2
-        assert y.shape[0] <= 2
+    for state, policy, value in dataloader:
+        assert state.shape[0] <= 2
+        assert policy.shape[0] <= 2
+        assert value.shape[0] <= 2
         break

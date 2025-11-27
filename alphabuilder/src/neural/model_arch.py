@@ -64,13 +64,23 @@ class AlphaBuilderSwinUNETR(nn.Module):
         # Let's add a separate simple encoder for Value to ensure it learns global structural stability.
         # This increases param count but guarantees the Value Head isn't confused by the Policy's pixel-wise task.
         
+        # Calculate padded dimensions for Value Encoder
+        # We pad to multiples of 32 in forward()
+        pad_d = (32 - img_size[0] % 32) % 32
+        pad_h = (32 - img_size[1] % 32) % 32
+        pad_w = (32 - img_size[2] % 32) % 32
+        
+        d_padded = img_size[0] + pad_d
+        h_padded = img_size[1] + pad_h
+        w_padded = img_size[2] + pad_w
+        
         self.value_encoder = nn.Sequential(
             nn.Conv3d(in_channels, 16, kernel_size=4, stride=4), # 64->16
             nn.ReLU(),
             nn.Conv3d(16, 32, kernel_size=4, stride=4), # 16->4
             nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(32 * (img_size[0]//16) * (img_size[1]//16) * (img_size[2]//16), 128),
+            nn.Linear(32 * (d_padded//16) * (h_padded//16) * (w_padded//16), 128),
             nn.ReLU(),
             nn.Linear(128, 1)
         )
@@ -78,12 +88,36 @@ class AlphaBuilderSwinUNETR(nn.Module):
         # But `monai.networks.nets.SwinUNETR` is a `nn.Module`.
         
     def forward(self, x: torch.Tensor) -> ModelOutput:
+        # Pad input to be divisible by 32 (SwinUNETR requirement)
+        # x shape: (B, C, D, H, W)
+        b, c, d, h, w = x.shape
+        
+        # Calculate padding
+        pd = (32 - d % 32) % 32
+        ph = (32 - h % 32) % 32
+        pw = (32 - w % 32) % 32
+        
+        # Pad if necessary
+        if pd > 0 or ph > 0 or pw > 0:
+            # F.pad expects (last_dim_left, last_dim_right, 2nd_last_left, ...)
+            # So (w_left, w_right, h_left, h_right, d_left, d_right)
+            x_padded = torch.nn.functional.pad(x, (0, pw, 0, ph, 0, pd))
+        else:
+            x_padded = x
+            
         # Policy Forward
-        # Output: (B, 2, D, H, W)
-        policy_logits = self.swin_unetr(x)
+        # Output: (B, 2, D_pad, H_pad, W_pad)
+        policy_logits_padded = self.swin_unetr(x_padded)
         
         # Value Forward (Simple Baseline)
-        value_pred = self.value_encoder(x)
+        # We use the padded input for now
+        value_pred = self.value_encoder(x_padded)
+        
+        # Unpad Policy Output
+        if pd > 0 or ph > 0 or pw > 0:
+            policy_logits = policy_logits_padded[..., :d, :h, :w]
+        else:
+            policy_logits = policy_logits_padded
         
         return ModelOutput(policy_logits=policy_logits, value_pred=value_pred)
 
