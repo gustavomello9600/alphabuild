@@ -1,10 +1,12 @@
 import numpy as np
 import dolfinx
-from dolfinx import fem
+import dolfinx.fem as fem
 import ufl
 from petsc4py import PETSc
-from typing import List, Tuple, Dict, Any, Optional
 from dataclasses import dataclass
+from typing import List, Dict, Any, Tuple, Optional
+import time
+from tqdm import tqdm
 
 from alphabuilder.src.core.physics_model import FEMContext, PhysicalProperties, SimulationResult
 
@@ -333,11 +335,14 @@ def run_simp_optimization_3d(
         dolfinx.fem.petsc.set_bc(b, ctx.problem.bcs)
         
         # Solve
+        t0 = time.time()
         solver = ctx.problem.solver
         solver.solve(b, u.x.petsc_vec)
         u.x.scatter_forward()
+        t_solve = time.time() - t0
         
         # 4. Compute Compliance and Sensitivity
+        t1 = time.time()
         compliance = b.dot(u.x.petsc_vec)
         
         # Sensitivity
@@ -346,9 +351,9 @@ def run_simp_optimization_3d(
         # Compute Strain Energy Density
         # We need to project it to DG0
         if not hasattr(ctx, 'energy_expr'):
-             # Define expression
+             # We need to define this expression once
              E_solid = props.E
-             E_void = 1e-6
+             E_void = 1e-3 # Increased from 1e-6 for CG stability
              E_var = E_void + (E_solid - E_void) * ctx.material_field
              mu = E_var / (2 * (1 + props.nu))
              lmbda = E_var * props.nu / ((1 + props.nu) * (1 - 2 * props.nu))
@@ -375,12 +380,17 @@ def run_simp_optimization_3d(
         # Avoid division by zero
         x_safe = np.maximum(x, 1e-3)
         dc = -config.penal * energies / x_safe
+        t_sens = time.time() - t1
         
         # 5. Filtering
+        t2 = time.time()
         dc = apply_sensitivity_filter(x, dc, H, Hs)
+        t_filter = time.time() - t2
         
         # 6. Update Design
+        t3 = time.time()
         x_new = optimality_criteria(x, dc, config.vol_frac, config.move_limit)
+        t_update = time.time() - t3
         
         change = np.max(np.abs(x_new - x))
         x = x_new
@@ -405,7 +415,13 @@ def run_simp_optimization_3d(
         
         if loop % 10 == 0 or loop == 1:
             # print(f"  SIMP Iter {loop}: Change={change:.4f}, Compliance={compliance:.4f}, MaxDisp={max_disp:.4f}")
-            pbar.set_postfix({"Change": f"{change:.4f}", "C": f"{compliance:.2f}", "Disp": f"{max_disp:.2f}"})
+            pbar.set_postfix({
+                "Chg": f"{change:.3f}", 
+                "C": f"{compliance:.1f}", 
+                "T_sol": f"{t_solve:.2f}s",
+                "T_sen": f"{t_sens:.2f}s",
+                "T_fil": f"{t_filter:.2f}s"
+            })
             
         pbar.update(1)
             

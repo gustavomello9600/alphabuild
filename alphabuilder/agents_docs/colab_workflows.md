@@ -40,9 +40,8 @@ Clone o repo (ou puxe atualizações) e instale as libs.
 ```python
 !python run_data_harvest.py \
   --episodes 1000 \
-  --steps 50 \
-  --resolution 64x32x32 \
-  --strategy balanced \
+  --resolution 64x32x8 \
+  --strategy simp \
   --db-path "/content/drive/MyDrive/AlphaBuilder/data/warmup_data.db"
 ```
 
