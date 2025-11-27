@@ -65,7 +65,14 @@ def main():
             model = model.cuda()
             x = x.cuda()
         y = model(x)
-        print("Smoke Test Passed! Model is ready.")
+        print("Smoke Test 1 (Standard) Passed!")
+        
+        # Test Padding Logic
+        x_pad = torch.randn(1, 5, 64, 32, 8)
+        if torch.cuda.is_available():
+            x_pad = x_pad.cuda()
+        y_pad = model(x_pad)
+        print("Smoke Test 2 (Padding 64x32x8) Passed! Model is ready.")
     except Exception as e:
         print(f"Smoke Test Failed: {e}")
         return
