@@ -229,7 +229,8 @@ def run_simp_optimization_3d(
     u = ctx.u_sol
     
     from tqdm import tqdm
-    pbar = tqdm(total=config.max_iter, desc="SIMP Optimization", unit="iter", leave=False)
+    # Use ncols=100 to prevent wrapping in Colab
+    pbar = tqdm(total=config.max_iter, desc="SIMP Optimization", unit="iter", leave=False, ncols=100, mininterval=0.5)
     
     while change > config.change_tol and loop < config.max_iter:
         loop += 1

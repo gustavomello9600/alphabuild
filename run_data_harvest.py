@@ -144,7 +144,7 @@ def main():
     seed_offset = existing_episodes
     
     from tqdm import tqdm
-    episode_pbar = tqdm(range(num_episodes), desc="Total Progress", unit="ep")
+    episode_pbar = tqdm(range(num_episodes), desc="Total Progress", unit="ep", ncols=100, mininterval=0.5)
     
     for i in episode_pbar:
         episode_start = time.time()
