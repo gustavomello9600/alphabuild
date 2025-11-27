@@ -1,5 +1,6 @@
 name: alphabuilder
 channels:
+  - pytorch
   - conda-forge
   - defaults
 dependencies:
