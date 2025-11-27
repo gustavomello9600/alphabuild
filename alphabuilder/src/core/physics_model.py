@@ -108,7 +108,7 @@ def initialize_cantilever_context(resolution=(64, 32, 32), props: PhysicalProper
     # LU is too expensive for 64x32x32 (200k DOFs) on Colab
     solver_options = {
         "ksp_type": "cg",
-        "pc_type": "sor",
+        "pc_type": "gamg",
         "ksp_rtol": 1e-6,
         "ksp_atol": 1e-10,
         "ksp_max_it": 2000,

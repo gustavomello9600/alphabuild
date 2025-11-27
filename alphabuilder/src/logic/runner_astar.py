@@ -63,12 +63,17 @@ def run_episode_astar(
         load_coords, support_coords, (D, H, W)
     )
     
+    # Thicken the backbone for structural robustness
+    from .astar_pathfinder import thicken_backbone
+    thickened_coords = thicken_backbone(backbone_coords, (D, H, W), thickness=2)
+    
     # Apply to tensor
-    for d, h, w in backbone_coords:
+    for d, h, w in thickened_coords:
         tensor[0, d, h, w] = 1.0
     
-    volume_fraction = len(backbone_coords) / (D * H * W)
-    print(f"  Built backbone with {len(backbone_coords)} voxels ({volume_fraction:.2%} volume)")
+    volume_fraction = len(thickened_coords) / (D * H * W)
+    print(f"  Built backbone with {len(backbone_coords)} voxels (thin)")
+    print(f"  Thickened to {len(thickened_coords)} voxels ({volume_fraction:.2%} volume)")
     
     # Create final state (Phase 2 ready)
     state = GameState(tensor=tensor, phase='REFINEMENT', step_count=0)

@@ -61,6 +61,7 @@ if mock_dolfinx:
     sys.modules["mpi4py"] = MagicMock()
     sys.modules["petsc4py"] = MagicMock()
     sys.modules["ufl"] = MagicMock()
+    sys.modules["ufl"] = MagicMock()
 else:
     try:
         import dolfinx
