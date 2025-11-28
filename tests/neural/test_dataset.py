@@ -46,7 +46,9 @@ def test_cantilever_dataset(temp_db):
         assert isinstance(value_t, torch.Tensor)
         assert state_t.shape == (5, 64, 32, 32)
         assert policy_t.shape == (2, 64, 32, 32)
-        assert value_t.item() == 0.5
+        # Value is now log(fitness + epsilon)
+        expected_val = np.log(0.5 + 1e-6)
+        assert np.isclose(value_t.item(), expected_val, atol=1e-4)
         break
 
 def test_dataset_empty(temp_db):

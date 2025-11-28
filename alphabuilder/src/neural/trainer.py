@@ -10,6 +10,32 @@ from tqdm import tqdm
 from .model_arch import AlphaBuilderSwinUNETR
 from .dataset import AlphaBuilderDataset
 
+class AlphaLoss(nn.Module):
+    def __init__(self, bce_weight=1.0, dice_weight=1.0):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([10.0])) # Penaliza 10x mais errar um voxel de remoção
+        self.dice_w = dice_weight
+        
+    def forward(self, pred_logits, target_mask):
+        # BCE
+        # Ensure target is on same device
+        if target_mask.device != pred_logits.device:
+            target_mask = target_mask.to(pred_logits.device)
+            
+        # pos_weight needs to be on the same device as input
+        if self.bce.pos_weight.device != pred_logits.device:
+            self.bce.pos_weight = self.bce.pos_weight.to(pred_logits.device)
+
+        loss_b = self.bce(pred_logits, target_mask)
+        
+        # Dice Approximation
+        probs = torch.sigmoid(pred_logits)
+        intersection = (probs * target_mask).sum()
+        union = probs.sum() + target_mask.sum()
+        dice = 1.0 - (2. * intersection + 1e-5) / (union + 1e-5)
+        
+        return loss_b + self.dice_w * dice
+
 class AlphaBuilderTrainer:
     def __init__(
         self,
@@ -18,6 +44,7 @@ class AlphaBuilderTrainer:
         checkpoint_dir: str = "checkpoints",
         lr: float = 1e-4,
         batch_size: int = 4,
+        augment: bool = False,
         device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
         self.model = model.to(device)
@@ -26,7 +53,7 @@ class AlphaBuilderTrainer:
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True, parents=True)
         
-        self.dataset = AlphaBuilderDataset(db_path)
+        self.dataset = AlphaBuilderDataset(db_path, augment=augment)
         self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True, num_workers=0) # 0 workers for safety
         
         self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
@@ -37,9 +64,9 @@ class AlphaBuilderTrainer:
         # We can treat it as multi-label or separate BCEs.
         # Spec says: "Entropia Cruzada Ponderada".
         # Since channels are independent (Add vs Remove), BCEWithLogitsLoss is appropriate.
-        self.policy_criterion = nn.BCEWithLogitsLoss()
+        self.policy_criterion = AlphaLoss()
         self.value_criterion = nn.MSELoss()
-        
+
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()
         total_loss = 0.0

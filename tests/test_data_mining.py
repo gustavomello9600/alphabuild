@@ -35,7 +35,7 @@ def test_extract_discrete_actions_removal():
     ]
     
     # Extract
-    samples = extract_discrete_actions(history, jump_size=5)
+    samples = extract_discrete_actions(history, jump_size=5, resolution=(3, 3, 3))
     
     assert len(samples) == 1
     sample = samples[0]
@@ -43,10 +43,11 @@ def test_extract_discrete_actions_removal():
     assert sample['step'] == 0
     assert sample['target_value'] == 90.0
     
-    # Verify Policy Target (Removal Mask)
-    # Should be 0 everywhere except center (1,1,1) which is 1
-    expected_policy = np.zeros((3, 3, 3), dtype=np.int8)
-    expected_policy[1, 1, 1] = 1
+    # Verify Policy Target (2 Channels)
+    # Channel 0: Addition (All 0)
+    # Channel 1: Removal (1 at center)
+    expected_policy = np.zeros((2, 3, 3, 3), dtype=np.float32)
+    expected_policy[1, 1, 1, 1] = 1.0
     
     np.testing.assert_array_equal(sample['target_policy'], expected_policy)
     print("✅ Removal action correctly identified")
@@ -56,12 +57,12 @@ def test_extract_discrete_actions_no_change():
     state = np.ones((3, 3, 3), dtype=np.int8)
     
     history = [
-        {'step': 0, 'binary_map': state, 'compliance': 100.0},
+        {'step': 0, 'binary_map': state, 'compliance': 100.0, 'max_displacement': 1.0},
         {}, {}, {}, {},
-        {'step': 5, 'binary_map': state, 'compliance': 100.0}
+        {'step': 5, 'binary_map': state, 'compliance': 100.0, 'max_displacement': 1.0}
     ]
     
-    samples = extract_discrete_actions(history, jump_size=5)
+    samples = extract_discrete_actions(history, jump_size=5, resolution=(3, 3, 3))
     assert len(samples) == 0
     print("✅ No samples generated for static state")
 

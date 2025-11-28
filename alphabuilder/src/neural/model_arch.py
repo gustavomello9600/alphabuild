@@ -47,45 +47,34 @@ class AlphaBuilderSwinUNETR(nn.Module):
             spatial_dims=3
         )
         
-        # 2. Value Head (Attached to the Bottleneck)
-        # SwinUNETR doesn't expose the bottleneck easily in its standard forward.
-        # We might need to hook into it or use the encoder features if we want a true multi-head.
-        # However, for simplicity and robustness, we can use a separate lightweight encoder 
-        # OR (better) use the SwinUNETR's encoder output if accessible.
-        # MONAI's SwinUNETR returns the segmentation map directly.
+        # 2. Hook to capture Bottleneck Features (Block C)
+        # The SwinViT module returns a list of hidden states. The last one is the bottleneck.
+        self.bottleneck_features = None
         
-        # Strategy: We will use the SwinUNETR for the Policy.
-        # For the Value, we will add a small parallel encoder or try to reuse features.
-        # Given the complexity of modifying MONAI internals without inheritance, 
-        # let's add a lightweight 3D CNN Encoder for the Value Head that shares nothing *yet* 
-        # (to be optimized later) OR simply downsample the Policy output.
+        def hook_fn(module, input, output):
+            # output is a list of hidden states from each stage
+            # The last element corresponds to the bottleneck features
+            if isinstance(output, (list, tuple)):
+                self.bottleneck_features = output[-1]
+            else:
+                self.bottleneck_features = output
+                
+        # Register hook on the SwinViT backbone
+        self.swin_unetr.swinViT.register_forward_hook(hook_fn)
         
-        # Better Strategy for V1: Use the Policy Logits to estimate Value? No, circular.
-        # Let's add a separate simple encoder for Value to ensure it learns global structural stability.
-        # This increases param count but guarantees the Value Head isn't confused by the Policy's pixel-wise task.
+        # 3. Value Head (Attached to Block C)
+        # Bottleneck channels = feature_size * 2^4 = 48 * 16 = 768
+        bottleneck_channels = feature_size * 16
         
-        # Calculate padded dimensions for Value Encoder
-        # We pad to multiples of 32 in forward()
-        pad_d = (32 - img_size[0] % 32) % 32
-        pad_h = (32 - img_size[1] % 32) % 32
-        pad_w = (32 - img_size[2] % 32) % 32
-        
-        d_padded = img_size[0] + pad_d
-        h_padded = img_size[1] + pad_h
-        w_padded = img_size[2] + pad_w
-        
-        self.value_encoder = nn.Sequential(
-            nn.Conv3d(in_channels, 16, kernel_size=4, stride=4), # 64->16
+        self.value_head = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1), # Global Average Pooling -> (B, 768, 1, 1, 1)
+            nn.Flatten(),            # -> (B, 768)
+            nn.Linear(bottleneck_channels, 256),
             nn.ReLU(),
-            nn.Conv3d(16, 32, kernel_size=4, stride=4), # 16->4
+            nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(32 * (d_padded//16) * (h_padded//16) * (w_padded//16), 128),
-            nn.ReLU(),
-            nn.Linear(128, 1)
+            nn.Linear(128, 1)        # -> (B, 1) Scalar Value
         )
-        # Note: The above is a placeholder. Ideally we want to tap into Swin's bottleneck.
-        # But `monai.networks.nets.SwinUNETR` is a `nn.Module`.
         
     def forward(self, x: torch.Tensor) -> ModelOutput:
         # Pad input to be divisible by 32 (SwinUNETR requirement)
@@ -105,13 +94,19 @@ class AlphaBuilderSwinUNETR(nn.Module):
         else:
             x_padded = x
             
-        # Policy Forward
-        # Output: (B, 2, D_pad, H_pad, W_pad)
+        # 1. Policy Forward (Backbone + Decoder)
+        # This triggers the hook, capturing self.bottleneck_features
         policy_logits_padded = self.swin_unetr(x_padded)
         
-        # Value Forward (Simple Baseline)
-        # We use the padded input for now
-        value_pred = self.value_encoder(x_padded)
+        # 2. Value Forward (Using captured Bottleneck features)
+        # Ensure we have captured features
+        if self.bottleneck_features is None:
+            raise RuntimeError("Bottleneck features not captured. Hook failed.")
+            
+        value_pred = self.value_head(self.bottleneck_features)
+        
+        # Clear captured features to avoid memory leaks
+        self.bottleneck_features = None
         
         # Unpad Policy Output
         if pd > 0 or ph > 0 or pw > 0:

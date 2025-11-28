@@ -51,7 +51,7 @@ def parse_args():
                         help='Grid resolution as LxHxD (e.g., 64x32x8 for cantilever beam with 2:1:0.25 ratio)')
     parser.add_argument("--db-path", type=str, default="data/training_data.db", help="Path to SQLite database")
     parser.add_argument("--steps", type=int, default=100, help="Max refinement steps per episode")
-    parser.add_argument("--strategy", type=str, default="balanced", choices=["random", "simp", "balanced"], help="Data generation strategy")
+    parser.add_argument("--strategy", type=str, default="balanced", choices=["random", "simp", "balanced", "full_domain"], help="Data generation strategy")
     parser.add_argument("--seed-offset", type=int, default=0, help="Manual seed offset for parallel runs")
     return parser.parse_args()
 
@@ -171,26 +171,35 @@ def main():
             else:
                 current_strategy = "random"
         
-        if current_strategy == "simp":
-            # Run A* + SIMP Optimization
-            # Phase 1: Build connectivity backbone with A*
-            # Phase 2: Optimize with SIMP
+        if current_strategy in ["simp", "full_domain"]:
             from alphabuilder.src.logic.simp_generator import run_simp_optimization_3d, SIMPConfig
             from alphabuilder.src.logic.storage import TrainingRecord, Phase, serialize_state, save_record, generate_episode_id
             from alphabuilder.src.logic.runner_astar import run_episode_astar
+            from alphabuilder.src.logic.data_mining import extract_discrete_actions
             
-            # Build A* backbone first
-            backbone_state = run_episode_astar(ctx, props, resolution=resolution)
-            
-            # Extract backbone density for SIMP initialization
-            initial_density = backbone_state.density.flatten()
-            initial_vol_frac = np.mean(initial_density)
-            
-            # EXPERT DIRECTIVE: SIMP should remove excess material from dilation
-            # Set target volume to be LOWER than initial (e.g., 50-90% of initial)
-            # This forces the "refinement" behavior we want to learn
-            reduction_factor = np.random.uniform(0.5, 0.9)
-            vol_frac = initial_vol_frac * reduction_factor
+            if current_strategy == "simp":
+                # Strategy: A* Backbone -> SIMP Refinement
+                # Build A* backbone first
+                backbone_state = run_episode_astar(ctx, props, resolution=resolution)
+                
+                # Extract backbone density for SIMP initialization
+                initial_density = backbone_state.density.flatten()
+                initial_vol_frac = np.mean(initial_density)
+                
+                # SIMP should remove excess material from dilation
+                reduction_factor = np.random.uniform(0.5, 0.9)
+                vol_frac = initial_vol_frac * reduction_factor
+                
+            else: # full_domain
+                # Strategy: Full Solid Block -> SIMP Carving
+                # Start with 100% density
+                initial_density = np.ones(np.prod(resolution))
+                initial_vol_frac = 1.0
+                
+                # Target a realistic volume fraction for structural parts (30-50%)
+                vol_frac = np.random.uniform(0.3, 0.5)
+                
+                print(f"  Full Domain Strategy: Carving from 100% to {vol_frac:.2%}")
             
             # Ensure it's not too small (min 10%)
             vol_frac = max(0.1, vol_frac)
@@ -202,15 +211,12 @@ def main():
                 max_iter=50
             )
             
-            # Run SIMP starting from A* backbone
+            # Run SIMP
             history = run_simp_optimization_3d(
                 ctx, props, simp_config, 
                 resolution=resolution,
                 initial_density=initial_density
             )
-            
-            # EXPERT DIRECTIVE: Extract discrete actions from SIMP history
-            from alphabuilder.src.logic.data_mining import extract_discrete_actions
             
             # Extract samples (State, Policy, Value)
             training_samples = extract_discrete_actions(history, jump_size=5, resolution=resolution)
@@ -226,15 +232,6 @@ def main():
                 policy_blob = serialize_state(sample['target_policy'])
                 
                 # Calculate fitness (Value)
-                # Use the target value from the sample (final compliance)
-                # Or compute local fitness? Expert says "target_value" is final compliance.
-                # We'll store the final compliance as the score, normalized if needed.
-                # For consistency with previous schema, let's use the game fitness formula
-                # based on the sample's metadata if available, or just the target value.
-                
-                # Reconstruct fitness from metadata for consistency
-                # But the sample has 'target_value' which is final_compliance.
-                # Let's use that, but inverted for "fitness" (higher is better).
                 compliance = sample['target_value']
                 fitness = 1.0 / compliance if compliance > 1e-9 else 0.0
                 
@@ -248,21 +245,19 @@ def main():
                     metadata={
                         "compliance": sample['metadata']['compliance'],
                         "max_displacement": sample['metadata']['max_displacement'],
-                        "strategy": "astar+simp+mining"
+                        "strategy": current_strategy
                     },
-                    policy_blob=policy_blob # NEW
+                    policy_blob=policy_blob
                 )
                 save_record(db_path, record)
                 
-            # print(f"  ✓ A*+SIMP Episode completed. Steps: {len(history)}, Extracted Samples: {len(training_samples)}")
-            
             # Log metrics
             logger.log({
                 "episode": global_episode_num,
                 "duration": time.time() - episode_start,
                 "steps": len(history),
                 "samples": len(training_samples),
-                "strategy": "astar+simp+mining",
+                "strategy": current_strategy,
                 "compliance": history[-1]['compliance'],
                 "max_displacement": history[-1]['max_displacement'],
                 "volume_fraction": vol_frac
