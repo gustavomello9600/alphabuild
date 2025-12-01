@@ -2,6 +2,8 @@
 
 Projeto de otimização topológica usando redes neurais e SIMP/FEniTop.
 
+**📋 Especificação Atual:** [specs/CURRENT.md](specs/CURRENT.md) → [v3.1](specs/v3.1_spec.md)
+
 ## Estrutura do Projeto
 
 ```
