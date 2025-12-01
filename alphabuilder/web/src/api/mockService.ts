@@ -1,6 +1,7 @@
 import type { GameState, Phase, Project } from './types';
 import mockEpisodeBezier from '../data/mock_episode_bezier.json';
 import mockEpisodeFullDomain from '../data/mock_episode_fulldomain.json';
+import mockEpisodeMBB from '../data/mock_episode_mbb.json';
 
 // Define interface for the JSON structure
 interface MockEpisodeData {
@@ -42,6 +43,7 @@ export class MockService {
 
     // Simulate database of projects
     private projects: Project[] = [
+        { id: 'mbb-validation', name: 'MBB Validation (SIMP)', status: 'COMPLETED', thumbnail_url: '/placeholder.png', last_modified: '2025-11-30', episode_id: 'mbb_validation_test' },
         { id: 'bezier-run', name: 'Bezier Strategy', status: 'COMPLETED', thumbnail_url: '/placeholder.png', last_modified: '2025-11-29', episode_id: 'bezier-run' },
         { id: 'full-domain-run', name: 'Full Domain Strategy', status: 'COMPLETED', thumbnail_url: '/placeholder.png', last_modified: '2025-11-29', episode_id: 'full-domain-run' }
     ];
@@ -69,6 +71,8 @@ export class MockService {
         let data: MockEpisodeData;
         if (id === 'full-domain-run') {
             data = mockEpisodeFullDomain as unknown as MockEpisodeData;
+        } else if (id === 'mbb-validation' || id === 'mbb_validation_test') {
+            data = mockEpisodeMBB as unknown as MockEpisodeData;
         } else {
             // Default to Bezier - fetch from public folder
             try {
@@ -142,8 +146,19 @@ export class MockService {
                             const idx = 0 * (D * H * W) + d * (H * W) + h * W + w;
                             tensorData[idx] = val;
 
-                            // Add Support (Channel 1) if X=0 (d=0)
+                            // Add Support (Channel 1)
+                            // Default: Cantilever (X=0)
+                            // MBB: Symmetry (X=0) + Roller (X=L, Y=0)
+                            const isMBB = data.episode_id.includes('mbb');
+                            let isSupportVoxel = false;
+
                             if (d === 0) {
+                                isSupportVoxel = true; // Left Face (Fixed or Symmetry)
+                            } else if (isMBB && d === D - 1 && h === 0) {
+                                isSupportVoxel = true; // Bottom Right Edge (Roller)
+                            }
+
+                            if (isSupportVoxel) {
                                 const sIdx = 1 * (D * H * W) + d * (H * W) + h * W + w;
                                 tensorData[sIdx] = 1.0;
                             }

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple, Optional
 import time
 from tqdm import tqdm
+import scipy.ndimage
 
 from alphabuilder.src.core.physics_model import FEMContext, PhysicalProperties, SimulationResult
 
@@ -15,10 +16,11 @@ class SIMPConfig:
     """Configuration for SIMP optimization."""
     vol_frac: float = 0.3         # Target volume fraction (Updated for stability)
     penal: float = 3.0            # Penalization power (p)
-    r_min: float = 2.0            # Filter radius (in elements) (Updated for cubic voxels)
+    r_min: float = 3.5            # Filter radius (in elements) (Increased for better connectivity)
     max_iter: int = 50            # Max iterations
     change_tol: float = 0.01      # Convergence tolerance (change in density)
     move_limit: float = 0.2       # Max density change per step
+    adaptive_penal: bool = False  # Enable adaptive penalty schedule (delayed continuation)
     load_config: Optional[Dict] = None # Custom load configuration
 
 def apply_sensitivity_filter(
@@ -58,8 +60,6 @@ def apply_heaviside_projection(x: np.ndarray, beta: float, eta: float = 0.5) -> 
     
     return x_new, derivative
 
-# ... (precompute_filter_3d remains same)
-
 class HelmholtzFilter:
     """
     Helmholtz PDE Filter for Topology Optimization.
@@ -97,45 +97,34 @@ class HelmholtzFilter:
         # Create Solver
         self.solver = PETSc.KSP().create(ctx.domain.comm)
         self.solver.setOperators(self.A)
-        self.solver.setType(PETSc.KSP.Type.PREONLY)
-        self.solver.getPC().setType(PETSc.PC.Type.LU)
+        self.solver.setType(PETSc.KSP.Type.CG)
+        self.solver.getPC().setType(PETSc.PC.Type.GAMG)
+        self.solver.setFromOptions()
         
-        # Placeholders
         self.u_sol = fem.Function(self.V_cg)
-        self.x_dg = fem.Function(self.V_dg) # Helper for input
         
-        # Pre-compile Linear Form
+    def apply(self, x_dens: np.ndarray) -> np.ndarray:
+        # 1. Map x_dens (numpy) to DG0 Function
+        # We assume x_dens is ordered same as DG0 dofs.
+        # If not, we need the map. But usually for DG0 it matches cell index.
+        # Let's assume it matches for now (standard for FEniCSx if we extract correctly)
+        
+        # Create input function
+        f_in = fem.Function(self.V_dg)
+        f_in.x.array[:] = x_dens
+        
+        # 2. Solve PDE
+        # L = f_in * v * dx
         v = ufl.TestFunction(self.V_cg)
-        self.L = ufl.inner(self.x_dg, v) * ufl.dx
-        self.L_form = fem.form(self.L)
+        L = ufl.inner(f_in, v) * ufl.dx
+        b = fem.petsc.assemble_vector(fem.form(L))
+        b.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)
         
-        # Create RHS Vector
-        # Use assemble_vector to create the vector initially
-        self.b_vec = fem.petsc.assemble_vector(self.L_form)
-        
-    def apply(self, x_array: np.ndarray) -> np.ndarray:
-        """
-        Apply filter: DG0 -> CG1 (Solve) -> DG0 (Interpolate/Project)
-        """
-        # 1. Load input into DG0 function
-        self.x_dg.x.array[:] = x_array
-        self.x_dg.x.scatter_forward() # Ensure ghost values are updated
-        
-        # 2. Assemble RHS: L = x_dg * v * dx
-        # Zero out the vector first
-        with self.b_vec.localForm() as b_loc:
-            b_loc.set(0.0)
-            
-        fem.petsc.assemble_vector(self.b_vec, self.L_form)
-        self.b_vec.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)
-        
-        # 3. Solve
-        self.solver.solve(self.b_vec, self.u_sol.x.petsc_vec)
+        self.solver.solve(b, self.u_sol.x.petsc_vec)
         self.u_sol.x.scatter_forward()
         
-        # 4. Return to DG0
-        # We can interpolate CG1 -> DG0 directly
-        # Or project? Interpolation is faster and usually sufficient.
+        # 3. Map result (CG1) back to DG0 (Element-wise average/centroid)
+        # We can just interpolate CG1 -> DG0
         # Create a temp DG0 function to hold result
         result_dg = fem.Function(self.V_dg)
         result_dg.interpolate(self.u_sol)
@@ -207,31 +196,13 @@ def run_simp_optimization_3d(
          objectsetattr(ctx, 'dof_indices', (ix, iy, iz))
 
     # Initialize Helmholtz Filter
-    # Note: r_min is in element units. We need physical units?
-    # If mesh coordinates are physical, r_min should be physical.
-    # Our mesh is 1.0 per voxel? Yes, we scaled it.
-    # Wait, in physics_model.py we might have scaled the mesh?
-    # Let's assume coords are physical.
-    # If r_min=2.0 (voxels), and voxel_size=1.0, then r_min_phys=2.0.
-    
-    # Check if we need to scale r_min
-    # In run_data_harvest, we set r_min=2.0.
-    # If we use Helmholtz, we use that directly.
-    
-    # Initialize Filter
     pde_filter = HelmholtzFilter(ctx, config.r_min)
     
     history = []
 
     # Helper to record state
     def record_state(step_num, current_x, current_compliance=0.0):
-        # With Helmholtz, we don't rely on dof_indices for the map anymore!
-        # We can just reshape the array if ordering matches?
-        # NO! FEniCSx ordering is still different from grid ordering.
-        # We still need dof_indices to map back to (nx, ny, nz) for visualization.
-        
         if not hasattr(ctx, 'dof_indices'):
-             # Compute mapping if missing (should be there from init block)
              pass
              
         ix, iy, iz = ctx.dof_indices
@@ -256,7 +227,6 @@ def run_simp_optimization_3d(
     u = ctx.u_sol
     
     # Pre-assemble Load Vector b (Constant Force)
-    # Assemble b once
     b.zeroEntries()
     dolfinx.fem.petsc.assemble_vector(b, ctx.problem.L)
     
@@ -264,18 +234,12 @@ def run_simp_optimization_3d(
     if hasattr(config, 'load_config') and config.load_config:
         lc = config.load_config
         
-        # Adaptive Physical Domain (Step 1)
         voxel_size = 1.0
-        phys_L = nx * voxel_size
-        phys_H = ny * voxel_size
-        phys_W = nz * voxel_size
-        
         grid_x = lc.get('x', nx-1)
         grid_y = lc.get('y', ny//2)
         grid_z_start = lc.get('z_start', nz//2)
         grid_z_end = lc.get('z_end', grid_z_start + 3)
         
-        # Step 2: Synchronize Masks
         px = (grid_x + 0.5) * voxel_size
         py = (grid_y + 0.5) * voxel_size
         pz_start = grid_z_start * voxel_size
@@ -337,13 +301,37 @@ def run_simp_optimization_3d(
     while change > config.change_tol and loop < config.max_iter:
         loop += 1
         
-        # Beta Continuation Schedule
-        if loop <= 10:
-            beta = 1.0
-        elif loop <= 40:
-            beta = 2.0 ** ((loop - 10) / 5.0)
+        # Continuation Schedule (Penalty & Beta)
+        current_penal = config.penal
+        beta = 1.0
+        
+        if config.adaptive_penal:
+            # Delayed continuation:
+            # Iter 0-20: p=1.0 (Convex)
+            # Iter 21-40: p -> 3.0
+            # Iter 41+: Beta increase
+            
+            if loop <= 20:
+                current_penal = 1.0
+                beta = 1.0
+            elif loop <= 40:
+                # Ramp p from 1.0 to config.penal
+                progress = (loop - 20) / 20.0
+                current_penal = 1.0 + (config.penal - 1.0) * progress
+                beta = 1.0
+            else:
+                current_penal = config.penal
+                # Start Beta continuation late
+                beta = 2.0 ** ((loop - 40) / 5.0)
+                beta = min(beta, 64.0)
         else:
-            beta = 64.0
+            # Standard Beta Schedule
+            if loop <= 10:
+                beta = 1.0
+            elif loop <= 40:
+                beta = 2.0 ** ((loop - 10) / 5.0)
+            else:
+                beta = 64.0
             
         # Filtering (Three-Field Scheme)
         t_filter_start = time.time()
@@ -353,7 +341,8 @@ def run_simp_optimization_3d(
         x_phys, dx_proj_dx = apply_heaviside_projection(x_tilde, beta)
         
         # Update FEM Material Field
-        penalized_density = x_phys ** config.penal
+        x_phys = np.clip(x_phys, 0.0, 1.0)
+        penalized_density = x_phys ** current_penal
         ctx.material_field.x.array[:] = penalized_density
         ctx.material_field.x.scatter_forward()
         t_filter = time.time() - t_filter_start
@@ -366,157 +355,134 @@ def run_simp_optimization_3d(
         A.assemble()
         t_asm = time.time() - t_asm_start
         
-        # b is already assembled and constant!
-        
         # Solve
         t0 = time.time()
         solver = ctx.problem.solver
         solver.solve(b, u.x.petsc_vec)
         u.x.scatter_forward()
-        t_solve = time.time() - t0
+        t_sol = time.time() - t0
         
-        # Compute Compliance and Sensitivity
-        t1 = time.time()
+        # Compliance and Sensitivity
+        # C = f^T u = u^T K u
+        # Sensitivity: dC/dx = -p * x^(p-1) * (u^T K_e u)
+        
+        # Calculate Strain Energy Density (Element-wise)
+        # We can use UFL to compute strain energy density field
+        # W = 0.5 * sigma : epsilon
+        # Compliance density = 2 * W
+        
+        # But we need it per element (DG0)
+        # Let's compute it efficiently.
+        # For SIMP, dC/drho = -p * rho^(p-1) * (u_e^T k_0 u_e)
+        # We can compute (u^T k_0 u) by assembling a form with E=1 (or E_0)
+        
+        # Define strain energy form for full material
+        E_0 = props.E
+        E_min = 1e-6
+        nu = props.nu
+        mu_0 = E_0 / (2 * (1 + nu))
+        lmbda_0 = E_0 * nu / ((1 + nu) * (1 - 2 * nu))
+        
+        def sigma_0(u):
+            return lmbda_0 * ufl.tr(ufl.sym(ufl.grad(u))) * ufl.Identity(len(u)) + 2.0 * mu_0 * ufl.sym(ufl.grad(u))
+            
+        # Strain energy density (scalar field)
+        strain_energy = ufl.inner(sigma_0(u), ufl.sym(ufl.grad(u))) # This is 2*W if E=E_0
+        
+        # Project strain energy to DG0 space to get element values
+        # This gives us (u^T k_0 u) per cell approximately
+        W_dg = fem.Function(ctx.material_field.function_space)
+        
+        # Projection solver
+        # We can use a simple projection since it's DG0 (just integrate over cell and divide by volume)
+        # But fem.Expression is easier
+        expr = fem.Expression(strain_energy, ctx.material_field.function_space.element.interpolation_points)
+        W_dg.interpolate(expr)
+        strain_energy_values = W_dg.x.array
+        
+        # Compliance
+        # C = integral(rho^p * strain_energy)
+        # But we computed strain_energy using u, which comes from penalized stiffness.
+        # So C = b.dot(u.vector)
         compliance = b.dot(u.x.petsc_vec)
         
-        # Sensitivity Calculation
-        if not hasattr(ctx, 'energy_expr'):
-             E_solid = props.E
-             E_void = 1e-6
-             E_var = E_void + (E_solid - E_void) * ctx.material_field
-             mu = E_var / (2 * (1 + props.nu))
-             lmbda = E_var * props.nu / ((1 + props.nu) * (1 - 2 * props.nu))
-             eps = ufl.sym(ufl.grad(u))
-             sig = 2.0 * mu * eps + lmbda * ufl.tr(eps) * ufl.Identity(len(u))
-             comp_dens = ufl.inner(sig, eps)
-             W = fem.functionspace(ctx.domain, ("DG", 0))
-             expr = fem.Expression(comp_dens, W.element.interpolation_points)
-             objectsetattr(ctx, 'energy_expr', expr)
-             objectsetattr(ctx, 'W_space', W)
-             energy_vals = fem.Function(W)
-             objectsetattr(ctx, 'energy_vals', energy_vals)
-             
-        energy_vals = ctx.energy_vals
-        energy_vals.interpolate(ctx.energy_expr)
-        energies = energy_vals.x.array
+        # Sensitivity
+        # dC/dx_phys = -p * x_phys^(p-1) * strain_energy_values
+        # Note: strain_energy_values is roughly u^T k_0 u
+        # Actually, if we use E_min, it's slightly more complex, but for E_min << E_0, this holds.
         
-        x_phys_safe = np.maximum(x_phys, 1e-3)
-        dc_phys = -config.penal * energies / x_phys_safe
+        dc = -current_penal * (x_phys ** (current_penal - 1)) * strain_energy_values
         
-        dc_tilde = dc_phys * dx_proj_dx
+        # Chain Rule for Projection: dC/dx_tilde = dC/dx_phys * dx_phys/dx_tilde
+        dc = dc * dx_proj_dx
         
-        # Filter Sensitivity
-        dc = pde_filter.apply(dc_tilde)
+        # Chain Rule for Filter: dC/dx = Filter^T * dC/dx_tilde
+        # Since filter is self-adjoint (Helmholtz), we just apply filter again
+        dc = pde_filter.apply(dc)
         
-        t_sens = time.time() - t1
+        # Optimality Criteria Update
+        # x_new = x * ( -dc / lambda )^eta
+        # We need to find lambda (Lagrange multiplier) such that sum(x_new) = vol_frac
         
-        # Update Design
-        t3 = time.time()
-        
-        if loop <= 5:
-            current_move_limit = 0.05
-        else:
-            current_move_limit = config.move_limit
+        def optimality_criteria(x, dc, target_vol, limit):
+            l1 = 0.0
+            l2 = 1e9
+            move = limit
+            
+            # Damping
+            damping = 0.5
+            
+            x_new = np.zeros_like(x)
+            
+            while (l2 - l1) / (l1 + l2 + 1e-9) > 1e-3:
+                l_mid = 0.5 * (l2 + l1)
+                
+                # OC Update Rule
+                # B_e = -dc / lambda
+                # x_new = max(0, max(x - move, min(1, min(x + move, x * sqrt(B_e)))))
+                
+                # Avoid division by zero
+                # dc is negative, so -dc is positive.
+                # We want B_e = (-dc) / l_mid
+                
+                factor = np.sqrt(np.maximum(1e-10, -dc) / l_mid)
+                
+                x_trial = x * factor
+                
+                x_lower = np.maximum(0.0, x - move)
+                x_upper = np.minimum(1.0, x + move)
+                
+                x_new = np.clip(x_trial, x_lower, x_upper)
+                
+                if np.mean(x_new) > target_vol:
+                    l1 = l_mid
+                else:
+                    l2 = l_mid
+            return x_new
+
+        # Dynamic Move Limit?
+        current_move_limit = config.move_limit
         
         x_new = optimality_criteria(x, dc, config.vol_frac, current_move_limit)
-        t_update = time.time() - t3
+        t_update = time.time() - t0 # Fix timer approximation
         
         change = np.max(np.abs(x_new - x))
         x = x_new
         
-        # Enforce passive elements
-        if passive_mask is None and hasattr(config, 'load_config') and config.load_config:
-             lc = config.load_config
-             if hasattr(ctx, 'dof_indices'):
-                 ix, iy, iz = ctx.dof_indices
-                 grid_x = lc.get('x', nx-1)
-                 grid_y = lc.get('y', ny//2)
-                 grid_z_start = lc.get('z_start', nz//2)
-                 grid_z_end = lc.get('z_end', grid_z_start + 3)
-                 
-                 local_mask = (np.abs(ix - grid_x) <= 1) & \
-                              (np.abs(iy - grid_y) <= 1) & \
-                              (iz >= grid_z_start - 1) & (iz <= grid_z_end + 1)
-                 
-                 x[local_mask] = 1.0
+        # Record
+        record_state(loop, x_phys, compliance)
         
-        elif passive_mask is not None:
-             if not hasattr(ctx, 'flat_passive_mask_arg'):
-                 ix, iy, iz = ctx.dof_indices
-                 flat_mask = passive_mask[ix, iy, iz].astype(bool)
-                 objectsetattr(ctx, 'flat_passive_mask_arg', flat_mask)
-             x[ctx.flat_passive_mask_arg] = 1.0
-        
-        # History
-        u_vals = u.x.array.reshape(-1, 3)
-        max_disp = np.max(np.linalg.norm(u_vals, axis=1))
-        
-        ix, iy, iz = ctx.dof_indices
-        density_map = np.zeros((nx, ny, nz), dtype=np.float32)
-        density_map[ix, iy, iz] = x
-        binary_map = (density_map > 0.5).astype(np.int32)
-        
-        history.append({
-            'step': loop,
-            'density_map': density_map.copy(),
-            'binary_map': binary_map,
-            'fitness': 0.0,
-            'max_displacement': max_disp,
-            'compliance': compliance,
-            'valid': True
+        pbar.set_postfix({
+            'Chg': f"{change:.3f}", 
+            'C': f"{compliance:.1f}",
+            'T_sol': f"{t_sol:.2f}s",
+            'T_asm': f"{t_asm:.2f}s"
         })
-        
-        if loop % 10 == 0 or loop == 1:
-            pbar.set_postfix({
-                "Chg": f"{change:.3f}", 
-                "C": f"{compliance:.1f}", 
-                "T_sol": f"{t_solve:.2f}s",
-                "T_asm": f"{t_asm:.2f}s",
-                "T_sen": f"{t_sens:.2f}s"
-            })
-            
         pbar.update(1)
-            
+        
     pbar.close()
     return history
 
-# Removed precompute_filter_3d (Replaced by HelmholtzFilter)
-
-def optimality_criteria(
-    x: np.ndarray, 
-    dc: np.ndarray, 
-    vol_frac: float, 
-    move_limit: float
-) -> np.ndarray:
-    """
-    Optimality Criteria (OC) update scheme.
-    """
-    l1, l2 = 0.0, 1e9
-    x_new = np.zeros_like(x)
-    
-    while (l2 - l1) / (l1 + l2 + 1e-9) > 1e-3:
-        l_mid = 0.5 * (l2 + l1)
-        
-        term = np.sqrt(np.maximum(0, -dc / l_mid))
-        x_trial = x * term
-        
-        x_lower = np.maximum(0.0, x - move_limit)
-        x_upper = np.minimum(1.0, x + move_limit)
-        
-        x_new = np.clip(x_trial, x_lower, x_upper)
-        
-        if np.mean(x_new) > vol_frac:
-            l1 = l_mid
-        else:
-            l2 = l_mid
-            
-    return x_new
-
-
-# Helper to allow setting attributes on frozen dataclass (for caching)
 def objectsetattr(obj, name, value):
+    """Helper to set attribute on frozen dataclass or object"""
     object.__setattr__(obj, name, value)
-
-
-
-
