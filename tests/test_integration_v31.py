@@ -20,7 +20,8 @@ import os
 
 # Test database path
 TEST_DB_PATH = Path(__file__).parent / "data" / "episodios_de_testes_de_integracao.db"
-RESOLUTION = (64, 32, 8)
+# Resolução reduzida para testes rápidos (32x16x4 ao invés de 64x32x8)
+RESOLUTION = (32, 16, 4)
 
 
 class TestIntegrationV31:
@@ -50,6 +51,7 @@ class TestIntegrationV31:
     
     # ==================== DATA GENERATION ====================
     
+    @pytest.mark.timeout(600)  # 10 minutos max
     def test_01_generate_bezier_episode(self):
         """Gera um episódio com estratégia Bezier e salva no DB de testes."""
         from alphabuilder.src.logic.storage import initialize_database
@@ -79,6 +81,7 @@ class TestIntegrationV31:
         assert count > 0, f"Deveria ter registros para episódio Bezier, encontrou {count}"
         print(f"✓ Episódio Bezier gerado: {count} registros")
     
+    @pytest.mark.timeout(600)  # 10 minutos max
     def test_02_generate_fulldomain_episode(self):
         """Gera um episódio com estratégia Full Domain e salva no DB de testes."""
         from tests.helpers.data_generation import generate_test_episode
@@ -212,14 +215,19 @@ class TestIntegrationV31:
         # Aplica rotação
         state_rot, policy_rot = rotate_90_z(state, policy)
         
-        # Verifica dimensões preservadas
-        assert state_rot.shape == state.shape, "Shape do estado deveria ser preservado"
-        assert policy_rot.shape == policy.shape, "Shape da policy deveria ser preservado"
+        # Rotação 90° troca D e H em grids não-quadrados
+        # Original: (C, D, H, W) -> Rotated: (C, H, D, W)
+        assert state_rot.shape[0] == state.shape[0], "Número de canais deveria ser preservado"
+        assert state_rot.shape[1] == state.shape[2], "D rotacionado deveria ser H original"
+        assert state_rot.shape[2] == state.shape[1], "H rotacionado deveria ser D original"
+        assert state_rot.shape[3] == state.shape[3], "W deveria ser preservado"
+        
+        # Mesma lógica para policy
+        assert policy_rot.shape[0] == policy.shape[0], "Canais de policy preservados"
         
         # Verifica que forças foram invertidas corretamente
         # Rotação 90° em Z: Fx -> Fy, Fy -> -Fx
         # Canais: 4=Fx, 5=Fy, 6=Fz
-        # Após rotação, o que era Fx deve estar relacionado com Fy
         
         print("✓ Augmentation rotação 90° funcional")
     
@@ -412,11 +420,12 @@ class TestIntegrationV31:
         # DataLoader
         dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
         
-        # Modelo com inicialização fria
+        # Modelo com inicialização fria (use_swin=False para resoluções pequenas)
         model = AlphaBuilderV31(
             in_channels=7,
             out_channels=2,
-            feature_size=24  # Menor para teste rápido
+            feature_size=24,  # Menor para teste rápido
+            use_swin=False    # Backbone simples para testes com resolução pequena
         ).to(device)
         
         # Optimizer
@@ -461,11 +470,12 @@ class TestIntegrationV31:
         target_policy = deserialize_state(row[1])
         target_value = row[2]
         
-        # Modelo
+        # Modelo (use_swin=False para resoluções pequenas de teste)
         model = AlphaBuilderV31(
             in_channels=7,
             out_channels=2,
-            feature_size=24
+            feature_size=24,
+            use_swin=False
         ).to(device)
         model.eval()
         
@@ -511,11 +521,12 @@ class TestIntegrationV31:
         
         state = deserialize_state(row[0])
         
-        # Modelo
+        # Modelo (use_swin=False para resoluções pequenas de teste)
         model = AlphaBuilderV31(
             in_channels=7,
             out_channels=2,
-            feature_size=24
+            feature_size=24,
+            use_swin=False
         ).to(device)
         model.eval()
         

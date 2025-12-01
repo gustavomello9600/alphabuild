@@ -537,6 +537,7 @@ def parse_args():
     parser.add_argument("--resolution", type=str, default="64x32x8")
     parser.add_argument("--seed-offset", type=int, default=0, help="Offset for random seed")
     parser.add_argument("--strategy", type=str, choices=['BEZIER', 'FULL_DOMAIN'], help="Force specific strategy")
+    parser.add_argument("--max-iter", type=int, default=120, help="Max SIMP iterations (default 120, use 30 for tests)")
     return parser.parse_args()
 
 def main():
@@ -602,7 +603,7 @@ def main():
 
         simp_config = SIMPConfig(
             vol_frac=target_vol,
-            max_iter=120,  # More iterations for lower volume targets
+            max_iter=args.max_iter,  # Controlado via argumento (default 120, 30 para testes)
             r_min=1.5,     # Filter radius ~1.5 elements
             adaptive_penal=True, 
             load_config=load_config,
@@ -779,16 +780,24 @@ def main():
             
         # 7. Save to DB
         # Common function to save
-        def save_batch(records, phase_enum):
-            for rec in records:
-                # Build Input Tensor (5 Channels)
+        def save_batch(records, phase_enum, is_final_list=None):
+            for idx, rec in enumerate(records):
+                # Build Input Tensor v3.1 (7 Channels)
                 # 0: Density
-                # 1: Mask (Support) -> X=0
-                # 2,3,4: Forces
+                # 1: Mask X (support)
+                # 2: Mask Y (support)
+                # 3: Mask Z (support)
+                # 4: Force X
+                # 5: Force Y
+                # 6: Force Z
                 
-                # Support Mask (full clamped wall at X=0)
-                mask = np.zeros(resolution, dtype=np.float32)
-                mask[0, :, :] = 1.0
+                # Support Masks (full clamped wall at X=0)
+                mask_x = np.zeros(resolution, dtype=np.float32)
+                mask_y = np.zeros(resolution, dtype=np.float32)
+                mask_z = np.zeros(resolution, dtype=np.float32)
+                mask_x[0, :, :] = 1.0
+                mask_y[0, :, :] = 1.0
+                mask_z[0, :, :] = 1.0
                 
                 # Force Channels
                 fx = np.zeros(resolution, dtype=np.float32)
@@ -796,30 +805,34 @@ def main():
                 fz = np.zeros(resolution, dtype=np.float32)
                 
                 # Apply Load to Force Channels
-                # Load is surface traction at X=Lx (free end), 2x2 patch
                 ly = load_config['y']
                 lz_center = (load_config['z_start'] + load_config['z_end']) / 2.0
-                load_half_width = 1.0  # 2x2 load region
+                load_half_width = 1.0
                 
-                # Mark load region at X=nx-1 (free end face)
                 y_min = max(0, int(ly - load_half_width))
                 y_max = min(ny, int(ly + load_half_width) + 1)
                 z_min = max(0, int(lz_center - load_half_width))
                 z_max = min(nz, int(lz_center + load_half_width) + 1)
                 
-                # Force is -Y direction (traction = -2.0, normalized to -1 for NN input)
+                # Force is -Y direction
                 fy[nx-1, y_min:y_max, z_min:z_max] = -1.0
                 
-                # Input State
-                # rec['input_state'] is the density channel
+                # Input State (density)
                 density = rec['input_state']
                 
-                # Stack
-                input_tensor = np.stack([density, mask, fx, fy, fz], axis=0)
+                # Stack 7 channels
+                input_tensor = np.stack([density, mask_x, mask_y, mask_z, fx, fy, fz], axis=0)
                 
                 # Target Policy
-                # Stack Add/Remove
                 policy_tensor = np.stack([rec['target_add'], rec['target_remove']], axis=0)
+                
+                # Determine is_final_step and is_connected
+                is_final = is_final_list[idx] if is_final_list else False
+                
+                # Check connectivity (for Phase 2 records)
+                is_conn = False
+                if phase_enum == Phase.REFINEMENT:
+                    is_conn, _ = check_connectivity(density, 0.5, load_config)
                 
                 db_record = TrainingRecord(
                     episode_id=episode_id,
@@ -833,13 +846,22 @@ def main():
                         "compliance": rec.get('current_compliance', s_final_compliance),
                         "vol_frac": rec.get('current_vol', s_final_vol),
                         "load_config": load_config,
-                        "phase": "GROWTH" if phase_enum == Phase.GROWTH else "REFINEMENT"
+                        "phase": "GROWTH" if phase_enum == Phase.GROWTH else "REFINEMENT",
+                        "is_final_step": is_final,
+                        "is_connected": is_conn
                     }
                 )
                 save_record(db_path, db_record)
 
-        save_batch(phase1_records, Phase.GROWTH) # Map to GROWTH (Phase 1)
-        save_batch(phase2_records, Phase.REFINEMENT) # Map to REFINEMENT (Phase 2)
+        # Phase 1: None are final steps
+        phase1_final = [False] * len(phase1_records)
+        save_batch(phase1_records, Phase.GROWTH, phase1_final)
+        
+        # Phase 2: Last record is final step
+        phase2_final = [False] * len(phase2_records)
+        if phase2_final:
+            phase2_final[-1] = True  # Mark last as final
+        save_batch(phase2_records, Phase.REFINEMENT, phase2_final)
         
         duration = time.time() - start_time
         logger.log({
