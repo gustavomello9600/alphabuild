@@ -189,7 +189,7 @@ def run_mbb_test():
 def export_to_mock_json(history, config, resolution):
     import json
     
-    output_path = "alphabuilder/web/src/data/mock_episode_mbb.json"
+    output_path = "alphabuilder/web/public/data/mock_episode_mbb.json"
     print(f"Exporting mock data to {output_path}...")
     
     frames = []

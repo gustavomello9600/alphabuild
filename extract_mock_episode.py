@@ -5,11 +5,10 @@ import numpy as np
 import random
 from pathlib import Path
 
-DB_PATH = "data/training_data.db"
-OUTPUT_FILE = "alphabuilder/web/public/mock_episode.json"
+import argparse
 
-def extract_episode():
-    conn = sqlite3.connect(DB_PATH)
+def extract_episode(db_path, output_path):
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
     # Get the latest episode ID
@@ -48,7 +47,7 @@ def extract_episode():
             metadata['volume_fraction'] = metadata['vol_frac']
         
         # Deserialize policy if present (mock if not)
-        policy_heatmap = None
+        policy_data = None
         if policy_blob:
             try:
                 policy_tensor = pickle.loads(policy_blob)
@@ -91,11 +90,22 @@ def extract_episode():
     }
 
     # Save to JSON
-    with open(OUTPUT_FILE, 'w') as f:
+    # Ensure directory exists
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(output_path, 'w') as f:
         json.dump(output_data, f)
     
-    print(f"Saved {len(steps)} steps to {OUTPUT_FILE}")
+    print(f"Saved {len(steps)} steps to {output_path}")
     conn.close()
 
+def main():
+    parser = argparse.ArgumentParser(description="Extract mock episode from DB")
+    parser.add_argument("--db-path", type=str, default="data/training_data.db", help="Path to database")
+    parser.add_argument("--output", type=str, default="alphabuilder/web/public/mock_episode.json", help="Output JSON path")
+    args = parser.parse_args()
+
+    extract_episode(args.db_path, args.output)
+
 if __name__ == "__main__":
-    extract_episode()
+    main()

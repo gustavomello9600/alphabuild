@@ -1,7 +1,4 @@
 import type { GameState, Phase, Project } from './types';
-import mockEpisodeBezier from '../data/mock_episode_bezier.json';
-import mockEpisodeFullDomain from '../data/mock_episode_fulldomain.json';
-import mockEpisodeMBB from '../data/mock_episode_mbb.json';
 
 // Define interface for the JSON structure
 interface MockEpisodeData {
@@ -69,22 +66,27 @@ export class MockService {
         this.isPlaying = false;
 
         let data: MockEpisodeData;
+        let url = '';
+
         if (id === 'full-domain-run') {
-            data = mockEpisodeFullDomain as unknown as MockEpisodeData;
+            url = '/data/mock_episode_fulldomain.json';
         } else if (id === 'mbb-validation' || id === 'mbb_validation_test') {
-            data = mockEpisodeMBB as unknown as MockEpisodeData;
+            url = '/data/mock_episode_mbb.json';
         } else {
-            // Default to Bezier - fetch from public folder
-            try {
-                const response = await fetch('/mock_episode.json');
-                if (!response.ok) {
-                    throw new Error(`HTTP error! status: ${response.status}`);
-                }
-                data = await response.json() as MockEpisodeData;
-            } catch (e) {
-                console.error("Failed to fetch mock_episode.json, falling back to static data", e);
-                data = mockEpisodeBezier as unknown as MockEpisodeData;
+            // Default to Bezier
+            url = '/data/mock_episode_bezier.json';
+        }
+
+        try {
+            console.log(`[MockService] Fetching data from ${url}...`);
+            const response = await fetch(url);
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
             }
+            data = await response.json() as MockEpisodeData;
+        } catch (e) {
+            console.error(`[MockService] Failed to fetch ${url}`, e);
+            return;
         }
 
         console.log(`[MockService] Loading episode data for ${id}. ID: ${data.episode_id}`);

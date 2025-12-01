@@ -59,8 +59,8 @@ def generate_bezier_structure(
     Generate a procedural structure using Bézier curves with rectangular sections.
     """
     nx, ny, nz = resolution
-    # Initialize with small density to allow SIMP growth
-    voxel_grid = np.full(resolution, 0.01, dtype=np.float32)
+    # Safe Background: 0.15 to allow sensitivity flow (Vanishing Gradient Fix)
+    voxel_grid = np.full(resolution, 0.15, dtype=np.float32)
     
     # 1. Determine Number of Curves
     # Increased to ensure higher initial volume (Erosion Target)
@@ -182,12 +182,66 @@ def generate_bezier_structure(
     # The spec says "connecting the wall". The curves start at X=0.
     # We might want to enforce a base plate or just trust the curves.
     # Let's trust the curves but ensure at least some voxels at X=0 are 1.
-    if np.sum(voxel_grid[0, :, :]) == 0:
-        # Fallback: create a small base if missed
-        mid_y, mid_z = ny//2, nz//2
-        voxel_grid[0:2, mid_y-4:mid_y+4, mid_z-4:mid_z+4] = 1.0
+    mid_y, mid_z = ny//2, nz//2
+    voxel_grid[0:2, mid_y-4:mid_y+4, mid_z-4:mid_z+4] = 1.0
+
+    # Load Anchor: Force solid material at load application point
+    # This prevents immediate disconnection at the load singularity
+    lx, ly = load_config['x'], load_config['y']
+    lz_s, lz_e = load_config['z_start'], load_config['z_end']
+    
+    # Clip coordinates
+    lx = min(lx, nx-1)
+    ly = min(ly, ny-1)
+    lz_s = max(0, lz_s)
+    lz_e = min(nz, lz_e)
+    
+    # Create a 3x3x(Z) anchor block
+    x_s, x_e = max(0, lx-1), min(nx, lx+2)
+    y_s, y_e = max(0, ly-1), min(ny, ly+2)
+    
+    voxel_grid[x_s:x_e, y_s:y_e, lz_s:lz_e] = 1.0
         
     return voxel_grid
+
+def generate_seeded_cantilever(
+    resolution: Tuple[int, int, int],
+    load_config: Dict[str, Any]
+) -> np.ndarray:
+    """
+    Generate a seeded initialization for Full Domain strategy.
+    Creates a gray background with a solid bar connecting load to support.
+    """
+    nx, ny, nz = resolution
+    
+    # 1. Gray Background (0.35)
+    grid = np.full(resolution, 0.35, dtype=np.float32)
+    
+    # 2. Define Seed Bar (Load -> Support)
+    # Point A: Load
+    p1 = np.array([load_config['x'], load_config['y'], (load_config['z_start'] + load_config['z_end']) / 2])
+    
+    # Point B: Support Center (X=0)
+    p0 = np.array([0.0, ny / 2.0, nz / 2.0])
+    
+    # Rasterize Line
+    num_steps = int(np.linalg.norm(p1 - p0)) * 2
+    t_values = np.linspace(0, 1, num_steps)
+    
+    thickness = 2 # Radius of the bar
+    
+    for t in t_values:
+        p = p0 + (p1 - p0) * t
+        cx, cy, cz = int(p[0]), int(p[1]), int(p[2])
+        
+        # Draw sphere/box at p
+        x_min, x_max = max(0, cx-thickness), min(nx, cx+thickness+1)
+        y_min, y_max = max(0, cy-thickness), min(ny, cy+thickness+1)
+        z_min, z_max = max(0, cz-thickness), min(nz, cz+thickness+1)
+        
+        grid[x_min:x_max, y_min:y_max, z_min:z_max] = 1.0
+        
+    return grid
 
 # --- Phase 1: Slicing ---
 
@@ -307,7 +361,8 @@ def generate_random_load_config(resolution):
         'x': load_x,
         'y': load_y,
         'z_start': load_z_start,
-        'z_end': load_z_end
+        'z_end': load_z_end,
+        'magnitude': -100.0 # Increased load as requested
     }
 
 def parse_args():
@@ -364,7 +419,8 @@ def main():
         load_config = generate_random_load_config(resolution)
         
         if strategy == 'FULL_DOMAIN':
-            v_constructed = np.ones(resolution, dtype=np.float32)
+            # Hybrid Seeding: Gray background + Connection Bar
+            v_constructed = generate_seeded_cantilever(resolution, load_config)
         else:
             v_constructed = generate_bezier_structure(resolution, load_config)
         
@@ -372,18 +428,24 @@ def main():
         # We run this FIRST to get S_final (Oracle Value)
         # Spec: "Calcular Score Final (S_final)... Este S_final será usado como Target Value para TODOS os registros"
         
-        # Force Erosion: Target Volume = 60% of Initial Volume
-        initial_vol = np.mean(v_constructed)
-        target_vol = initial_vol * 0.6
-        # Ensure target is not too small (min 10%)
-        target_vol = max(0.1, target_vol)
+        # Force Erosion: Target Volume = 40% (0.4) for FULL_DOMAIN to match MBB validation
+        if strategy == 'FULL_DOMAIN':
+            target_vol = 0.4
+        else:
+            initial_vol = np.mean(v_constructed)
+            target_vol = initial_vol * 0.75
+            # Ensure target is not too small (min 15%)
+            target_vol = max(0.15, target_vol)
         
-        print(f"Episode {i}: Initial V={initial_vol:.3f}, Target V={target_vol:.3f} (Erosion)")
+        print(f"Episode {i}: Strategy={strategy}, Target V={target_vol:.3f}")
 
         simp_config = SIMPConfig(
             vol_frac=target_vol,
-            max_iter=50,
-            load_config=load_config
+            max_iter=60, 
+            r_min=2.5,   # Recommended 2.5 in Spec v2.1
+            adaptive_penal=True, 
+            load_config=load_config,
+            debug_log_path=f"debug_simp_log_ep{i}.csv" 
         )
         
         # Run SIMP starting from V_constructed
@@ -456,21 +518,22 @@ def main():
             # Try lower threshold?
             is_connected_low, _ = check_connectivity(final_state['density_map'], 0.1, load_config)
             if not is_connected_low:
-                print(f"Episode {i}: Final structure DISCONNECTED. Skipping Save.")
+                print(f"Episode {i}: WARNING: Final structure DISCONNECTED. Proceeding with save as requested.")
                 logger.log({
                     "episode": i,
                     "duration": 0,
-                    "compliance": 0,
-                    "vol_frac": 0,
+                    "compliance": s_final_compliance,
+                    "vol_frac": s_final_vol,
                     "phase1_samples": 0,
                     "phase2_samples": 0,
-                    "status": "DISCONNECTED"
+                    "status": "DISCONNECTED_SAVED"
                 })
-                continue
+                # continue # Proceed anyway
             else:
                  print(f"Episode {i}: Final structure connected only at low threshold (0.1). Saving with warning.")
         
-        print(f"Episode {i}: Final structure CONNECTED. Proceeding to save.")
+        else:
+            print(f"Episode {i}: Final structure CONNECTED. Proceeding to save.")
 
         # 5. Generate Phase 1 Records (Slicing)
         # Skip Phase 1 for FULL_DOMAIN as it starts from solid block
@@ -481,7 +544,12 @@ def main():
         
         # 6. Generate Phase 2 Records (SIMP History)
         phase2_records = []
-        for t in range(len(simp_history) - 1):
+        
+        # Filter: Skip first 20 steps if adaptive_penal is used (Policy Pollution Prevention)
+        # The first 20 steps use p=1 (convex), which is not representative of the final topology optimization problem.
+        start_step = 20 if simp_config.adaptive_penal else 0
+        
+        for t in range(start_step, len(simp_history) - 1):
             current_frame = simp_history[t]
             next_frame = simp_history[t+1]
             
@@ -553,8 +621,8 @@ def main():
                 lz_s = max(0, lz_s)
                 lz_e = min(nz, lz_e)
                 
-                # Force is -Y direction (-1.0)
-                fy[lx, ly, lz_s:lz_e] = -1.0
+                # Force is -Y direction (magnitude)
+                fy[lx, ly, lz_s:lz_e] = load_config.get('magnitude', -1.0)
                 
                 # Input State
                 # rec['input_state'] is the density channel

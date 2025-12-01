@@ -21,7 +21,9 @@ class SIMPConfig:
     change_tol: float = 0.01      # Convergence tolerance (change in density)
     move_limit: float = 0.2       # Max density change per step
     adaptive_penal: bool = False  # Enable adaptive penalty schedule (delayed continuation)
+    adaptive_penal: bool = False  # Enable adaptive penalty schedule (delayed continuation)
     load_config: Optional[Dict] = None # Custom load configuration
+    debug_log_path: Optional[str] = None # Path to save detailed CSV log
 
 def apply_sensitivity_filter(
     x: np.ndarray, 
@@ -259,7 +261,7 @@ def run_simp_optimization_3d(
         load_dofs = fem.locate_dofs_geometrical(V, load_locator)
         bs = V.dofmap.index_map_bs
         with b.localForm() as b_local:
-            f_total = -1.0
+            f_total = lc.get('magnitude', -1.0)
             n_nodes = len(load_dofs) // bs if bs > 0 else 1
             if n_nodes > 0:
                 f_node = f_total / n_nodes
@@ -297,6 +299,22 @@ def run_simp_optimization_3d(
 
     from tqdm import tqdm
     pbar = tqdm(total=config.max_iter, desc="SIMP Optimization", unit="iter", leave=False, ncols=100, mininterval=0.5)
+    
+    # Initialize Debug CSV
+    if config.debug_log_path:
+        import csv
+        with open(config.debug_log_path, 'w', newline='') as csvfile:
+            fieldnames = [
+                'iter', 'compliance', 'vol_frac', 'target_vol', 'change', 
+                'penalty', 'beta', 
+                'dens_min', 'dens_max', 'dens_mean', 'dens_std',
+                'gray_frac', 'solid_frac', 'void_frac',
+                'sens_min', 'sens_max', 'sens_mean',
+                'max_disp', 'n_components',
+                't_solve', 't_filter', 't_update'
+            ]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
     
     while change > config.change_tol and loop < config.max_iter:
         loop += 1
@@ -479,6 +497,70 @@ def run_simp_optimization_3d(
             'T_asm': f"{t_asm:.2f}s"
         })
         pbar.update(1)
+
+        # Detailed Logging
+        if config.debug_log_path:
+            # Calculate extra stats
+            # Density Stats
+            d_flat = x_phys.flatten()
+            dens_min, dens_max = np.min(d_flat), np.max(d_flat)
+            dens_mean, dens_std = np.mean(d_flat), np.std(d_flat)
+            gray_frac = np.mean((d_flat > 0.1) & (d_flat < 0.9))
+            solid_frac = np.mean(d_flat >= 0.9)
+            void_frac = np.mean(d_flat <= 0.1)
+            
+            # Sensitivity Stats
+            s_flat = dc.flatten()
+            sens_min, sens_max, sens_mean = np.min(s_flat), np.max(s_flat), np.mean(s_flat)
+            
+            # Max Displacement
+            # u is a vector function. We need magnitude.
+            # u.x.petsc_vec is the vector.
+            # We can get it from u.x.array (which is flattened dofs)
+            # This is approximate but fast.
+            u_arr = u.x.array
+            # Reshape to (N, 3)? No, it's blocked by dof.
+            # Just take max abs value of any component as a proxy, or norm if possible.
+            # For logging, max component is fine, or we can compute norm properly if cheap.
+            # Let's use max absolute value of any DOF for speed.
+            max_disp = np.max(np.abs(u_arr))
+            
+            # Connectivity (Expensive but requested)
+            # Reconstruct 3D map for connectivity
+            if hasattr(ctx, 'dof_indices'):
+                ix, iy, iz = ctx.dof_indices
+                d_map_temp = np.zeros((nx, ny, nz), dtype=np.float32)
+                d_map_temp[ix, iy, iz] = x_phys
+                labeled, n_components = scipy.ndimage.label(d_map_temp > 0.5)
+            else:
+                n_components = -1
+
+            with open(config.debug_log_path, 'a', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writerow({
+                    'iter': loop,
+                    'compliance': compliance,
+                    'vol_frac': np.mean(x_phys),
+                    'target_vol': config.vol_frac,
+                    'change': change,
+                    'penalty': current_penal,
+                    'beta': beta,
+                    'dens_min': dens_min,
+                    'dens_max': dens_max,
+                    'dens_mean': dens_mean,
+                    'dens_std': dens_std,
+                    'gray_frac': gray_frac,
+                    'solid_frac': solid_frac,
+                    'void_frac': void_frac,
+                    'sens_min': sens_min,
+                    'sens_max': sens_max,
+                    'sens_mean': sens_mean,
+                    'max_disp': max_disp,
+                    'n_components': n_components,
+                    't_solve': t_sol,
+                    't_filter': t_filter,
+                    't_update': t_update
+                })
         
     pbar.close()
     return history
