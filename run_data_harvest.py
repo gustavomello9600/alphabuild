@@ -45,7 +45,172 @@ from alphabuilder.src.logic.storage import (
 from alphabuilder.src.utils.logger import TrainingLogger
 from alphabuilder.src.core.tensor_utils import build_input_tensor
 
-# --- Generator v2: Bézier & Rectangular Sections ---
+# --- FEniTop Integration (Based on fenitop/scripts/beam_3d.py) ---
+from alphabuilder.src.logic.fenitop.topopt import topopt
+from dolfinx.mesh import create_box, CellType
+from dolfinx.fem import functionspace
+from mpi4py import MPI
+import basix.ufl
+
+def run_fenitop_optimization(
+    resolution: Tuple[int, int, int],
+    props: PhysicalProperties,
+    simp_config: SIMPConfig,
+    initial_density: np.ndarray = None,
+    strategy: str = 'BEZIER'
+) -> List[Dict[str, Any]]:
+    """
+    Run Topology Optimization using FEniTop Core.
+    
+    Based directly on fenitop/scripts/beam_3d.py reference implementation.
+    Cantilever beam: fixed at X=0, surface traction at X=Lx (free end).
+    
+    Physical model (from beam_3d.py):
+    - E = 100, nu = 0.25
+    - Surface traction at free end
+    - Full clamped support at X=0
+    
+    Args:
+        resolution: (nx, ny, nz) voxel grid dimensions
+        props: Physical properties (unused - we use beam_3d.py values)
+        simp_config: SIMP configuration with load_config, vol_frac, etc.
+        initial_density: Optional initial density grid (nx, ny, nz)
+        strategy: 'BEZIER' or 'FULL_DOMAIN' - affects optimization params
+    
+    Returns:
+        List of step dictionaries with density_map, compliance, vol_frac, beta
+    """
+    comm = MPI.COMM_WORLD
+    nx, ny, nz = resolution
+    
+    # Physical dimensions (1:1 mapping with voxels)
+    Lx, Ly, Lz = float(nx), float(ny), float(nz)
+    
+    # --- Mesh Creation (following beam_3d.py pattern) ---
+    mesh = create_box(comm, [[0, 0, 0], [Lx, Ly, Lz]], [nx, ny, nz], CellType.hexahedron)
+    
+    if comm.rank == 0:
+        mesh_serial = create_box(MPI.COMM_SELF, [[0, 0, 0], [Lx, Ly, Lz]], [nx, ny, nz], CellType.hexahedron)
+    else:
+        mesh_serial = None
+    
+    # --- Grid Mapper for DOF -> Voxel conversion ---
+    grid_mapper = None
+    if comm.rank == 0 and mesh_serial is not None:
+        element = basix.ufl.element("Lagrange", mesh_serial.topology.cell_name(), 1)
+        V_serial = functionspace(mesh_serial, element)
+        coords = V_serial.tabulate_dof_coordinates()
+        
+        x_idx = np.rint(coords[:, 0]).astype(int)
+        y_idx = np.rint(coords[:, 1]).astype(int)
+        z_idx = np.rint(coords[:, 2]).astype(int)
+        
+        x_idx = np.clip(x_idx, 0, nx)
+        y_idx = np.clip(y_idx, 0, ny)
+        z_idx = np.clip(z_idx, 0, nz)
+        
+        grid_mapper = (x_idx, y_idx, z_idx)
+    
+    # --- Load Configuration (beam_3d.py style: surface traction at free end) ---
+    # Load is applied at X=Lx face (free end), centered in Y and Z
+    load_cfg = simp_config.load_config
+    
+    # Load region: 2x2 patch at X=Lx face
+    load_y_center = float(load_cfg['y'])
+    load_z_center = (float(load_cfg['z_start']) + float(load_cfg['z_end'])) / 2.0
+    load_half_width = 1.0  # Half-width of 2x2 load region
+    
+    # --- FEM Parameters (beam_3d.py style) ---
+    fem = {
+        "mesh": mesh,
+        "mesh_serial": mesh_serial,
+        # Physical properties from beam_3d.py
+        "young's modulus": 100,
+        "poisson's ratio": 0.25,
+        # Displacement BC: Fix ALL DOFs at X=0 (full clamped wall)
+        "disp_bc": lambda x: np.isclose(x[0], 0),
+        # Traction BC: Surface traction at X=Lx (free end), force in -Y direction
+        # Using >= and <= with 0.5 tolerance to ensure nodes are captured
+        "traction_bcs": [[
+            (0, -2.0, 0),  # Force vector (Fx, Fy, Fz) - same magnitude as beam_3d.py
+            lambda x, _Lx=Lx, _yc=load_y_center, _zc=load_z_center, _hw=load_half_width: (
+                np.isclose(x[0], _Lx) &  # At free end face
+                (x[1] >= _yc - _hw - 0.5) & (x[1] <= _yc + _hw + 0.5) &
+                (x[2] >= _zc - _hw - 0.5) & (x[2] <= _zc + _hw + 0.5)
+            )
+        ]],
+        "body_force": (0, 0, 0),
+        "quadrature_degree": 2,
+        "petsc_options": {
+            "ksp_type": "cg",
+            "pc_type": "gamg",
+        },
+    }
+    
+    # --- Optimization Parameters (beam_3d.py style, tuned for speed) ---
+    if strategy == 'FULL_DOMAIN':
+        max_iter = min(simp_config.max_iter, 120)
+        beta_interval = 30
+        move_limit = 0.02
+    else:  # BEZIER - starts closer to solution
+        max_iter = min(simp_config.max_iter, 100)
+        beta_interval = 25
+        move_limit = 0.02
+    
+    # Filter radius: ~1.5-2 elements for good filtering (beam_3d.py uses 0.6 for finer mesh)
+    filter_r = max(simp_config.r_min, 1.2)
+    
+    opt = {
+        "max_iter": max_iter,
+        "opt_tol": 1e-4,
+        "vol_frac": simp_config.vol_frac,
+        "solid_zone": lambda x: np.full(x.shape[1], False),
+        "void_zone": lambda x: np.full(x.shape[1], False),
+        "penalty": 3.0,
+        "epsilon": 1e-6,
+        "filter_radius": filter_r,
+        "beta_interval": beta_interval,
+        "beta_max": 128,
+        "use_oc": True,  # OC optimizer (as in beam_3d.py)
+        "move": move_limit,
+        "opt_compliance": True,
+    }
+    
+    # --- History Recording ---
+    history = []
+    
+    def record_step(data):
+        if comm.rank == 0:
+            rho_flat = data['density']
+            
+            # Reconstruct 3D voxel grid from flat DOF array
+            if grid_mapper is None:
+                rho_3d = np.full((nx, ny, nz), simp_config.vol_frac, dtype=np.float32)
+            elif len(rho_flat) != len(grid_mapper[0]):
+                print(f"  WARNING: Size mismatch in record_step")
+                rho_3d = np.full((nx, ny, nz), simp_config.vol_frac, dtype=np.float32)
+            else:
+                rho_nodal = np.zeros((nx+1, ny+1, nz+1), dtype=np.float32)
+                rho_nodal[grid_mapper[0], grid_mapper[1], grid_mapper[2]] = rho_flat
+                rho_3d = rho_nodal[:-1, :-1, :-1]
+
+            history.append({
+                'step': data['iter'],
+                'density_map': rho_3d,
+                'compliance': float(data['compliance']),
+                'vol_frac': float(data['vol_frac']),
+                'beta': data.get('beta', 1)  # Track beta for filtering later
+            })
+            
+            if data['iter'] % 10 == 0:
+                print(f"  Step {data['iter']:3d}: C={data['compliance']:.4f} V={data['vol_frac']:.4f} β={data.get('beta', 1)}")
+
+    # --- Run Optimization ---
+    if comm.rank == 0:
+        print(f"  FEniTop: iter={max_iter}, V={simp_config.vol_frac:.2f}, r={filter_r:.1f}, strategy={strategy}")
+    topopt(fem, opt, initial_density=initial_density, callback=record_step)
+    
+    return history
 
 def quadratic_bezier(p0, p1, p2, t):
     """Calculate point on quadratic Bézier curve at t."""
@@ -57,40 +222,36 @@ def generate_bezier_structure(
 ) -> np.ndarray:
     """
     Generate a procedural structure using Bézier curves with rectangular sections.
+    Uses triangular distribution biased toward smaller section sizes.
     """
     nx, ny, nz = resolution
     # Safe Background: 0.15 to allow sensitivity flow (Vanishing Gradient Fix)
     voxel_grid = np.full(resolution, 0.15, dtype=np.float32)
     
     # 1. Determine Number of Curves
-    # Increased to ensure higher initial volume (Erosion Target)
-    num_curves = random.randint(3, 5)
+    num_curves = random.randint(2, 4)
     
     # Load Point (Target)
-    # Load is a line in Z. We target the center of that line.
     target_x = load_config['x']
     target_y = load_config['y']
     target_z_center = (load_config['z_start'] + load_config['z_end']) / 2.0
     
-    # Adjust target to be slightly below the load point to ensure the "top" of the bar hits the load
-    # But simpler: just target the load point and ensure the section is large enough.
     p2 = np.array([target_x, target_y, target_z_center])
+    
+    # Track final section positions for anchor placement
+    final_positions = []
+    final_sections = []
     
     for _ in range(num_curves):
         # 2. Start Point (Wall X=0)
-        # Random Y and Z on the wall
         start_y = random.uniform(0, ny-1)
         start_z = random.uniform(0, nz-1)
         p0 = np.array([0.0, start_y, start_z])
         
-        # 3. Control Point (Intermediate)
-        # Random point in the volume, biased towards center?
-        # Add noise as per spec.
-        # Let's pick a midpoint and add gaussian noise.
+        # 3. Control Point (Intermediate) - reduced noise for less curvature
         midpoint = (p0 + p2) / 2.0
-        noise = np.random.normal(0, 5.0, size=3) # Sigma=5 voxels
+        noise = np.random.normal(0, 3.0, size=3)  # Reduced from 5.0
         p1 = midpoint + noise
-        # Clip to bounds
         p1[0] = np.clip(p1[0], 0, nx-1)
         p1[1] = np.clip(p1[1], 0, ny-1)
         p1[2] = np.clip(p1[2], 0, nz-1)
@@ -99,108 +260,78 @@ def generate_bezier_structure(
         num_steps = 100
         t_values = np.linspace(0, 1, num_steps)
         
-        # Section dimensions (Linear Interpolation)
-        # Ensure minimum width/height is 4 as requested
-        # Section dimensions (Linear Interpolation)
-        # Increased dimensions to ensure initial volume > 30%
-        w_base = random.uniform(8, 14)
-        h_base = random.uniform(12, 24)
-        w_tip = random.uniform(6, 10) 
-        h_tip = random.uniform(6, 10)
+        # Section dimensions with BIAS toward smaller values using triangular distribution
+        # triangular(low, mode, high) - mode near low creates bias toward smaller values
+        # Constraints: 2 <= w_f <= w_i <= 8 and 2 <= h_f <= h_i <= 32
+        w_tip = random.triangular(2, 2.5, 6)    # Bias toward 2-3
+        w_base = random.triangular(w_tip, w_tip + 0.5, 8)  # Slightly larger than tip
+        h_tip = random.triangular(2, 3, 12)     # Bias toward 2-4, max reduced to 12
+        h_base = random.triangular(h_tip, h_tip + 2, min(h_tip + 10, 20))  # Controlled growth
         
-        for t in t_values:
-            # Current point
+        for i, t in enumerate(t_values):
+            # Current point on curve
             p = quadratic_bezier(p0, p1, p2, t)
             cx, cy, cz = p
             
-            # Current section size
+            # Current section size (interpolated)
             w_curr = w_base + (w_tip - w_base) * t
             h_curr = h_base + (h_tip - h_base) * t
             
-            # Adjust cy so that the top of the section aligns with the target Y at the end
-            # At t=1, we want cy + h_tip/2 approx target_y? 
-            # Actually, the load is at target_y. We want the material to be UNDER the load?
-            # Or the load is applied TO the material.
-            # Let's assume the load is at (target_x, target_y, ...).
-            # We want the material to exist at that location.
-            # The current logic centers the box at (cx, cy, cz).
-            # If p2 = (target_x, target_y, ...), then at t=1, center is at target_y.
-            # So material extends from target_y - h/2 to target_y + h/2.
-            # This covers the load point.
-            
-            # However, user said: "receber a carga em seus voxels superiores" (receive load on its top voxels).
-            # This implies the load should be at the TOP surface.
-            # So at t=1, we want (cy + h_curr/2) == target_y.
-            # So cy should be target_y - h_curr/2.
-            # But p2 is the target center.
-            # Let's shift the curve vertically by offset.
-            
-            # Calculate offset to align top surface with curve path
-            # We want the curve p(t) to represent the TOP surface? 
-            # Or just shift the box down?
-            # Let's shift the box down relative to the curve point.
-            # Box Y range: [cy - h_curr, cy] (Top is cy)
-            
-            # Let's modify the box limits definition:
-            y_max = int(cy) # Top is at curve
-            y_min = int(cy - h_curr) # Bottom extends down
-            
-            # But wait, p0 is at (0, start_y, start_z). start_y is random.
-            # If we shift the box, we shift the start too.
-            # Let's keep center alignment but ensure p2 is at the top?
-            # If p2 is (target_x, target_y, ...), and we want target_y to be the top.
-            # Then the curve should end at target_y.
-            # And the box should be below it.
-            
-            # So:
-            y_max = int(cy + 1) # Ensure we cover the line
-            y_min = int(cy - h_curr + 1)
-            
+            # Section centered on curve point
+            y_min = int(cy - h_curr / 2)
+            y_max = int(cy + h_curr / 2)
             z_min = int(cz - w_curr / 2)
             z_max = int(cz + w_curr / 2)
             x_curr = int(cx)
             
-            # Clip
+            # Clip to bounds
             y_min = max(0, y_min)
             y_max = min(ny, y_max)
             z_min = max(0, z_min)
             z_max = min(nz, z_max)
             x_curr = max(0, min(nx-1, x_curr))
             
-            # Fill voxels
-            # We fill a small slice in X to ensure continuity?
-            # Or just the point?
-            # To ensure connectivity, we might need to fill x_prev to x_curr.
-            # But with 100 steps for 64 voxels, we are likely fine.
-            # Let's fill a small block in X too (thickness 1 or 2)
+            # Fill voxels (thin slice in X for connectivity)
             x_min = max(0, x_curr)
             x_max = min(nx, x_curr + 2)
             
             voxel_grid[x_min:x_max, y_min:y_max, z_min:z_max] = 1.0
             
-    # Ensure Wall Connection (X=0) is solid where curves start?
-    # The spec says "connecting the wall". The curves start at X=0.
-    # We might want to enforce a base plate or just trust the curves.
-    # Let's trust the curves but ensure at least some voxels at X=0 are 1.
+            # Track final position (last step of each curve)
+            if i == len(t_values) - 1:
+                final_positions.append((cx, cy, cz))
+                final_sections.append((w_tip, h_tip))
+            
+    # Ensure Wall Connection (X=0) - small base plate
     mid_y, mid_z = ny//2, nz//2
-    voxel_grid[0:2, mid_y-4:mid_y+4, mid_z-4:mid_z+4] = 1.0
+    voxel_grid[0:2, mid_y-3:mid_y+3, mid_z-2:mid_z+2] = 1.0
 
-    # Load Anchor: Force solid material at load application point
-    # This prevents immediate disconnection at the load singularity
-    lx, ly = load_config['x'], load_config['y']
-    lz_s, lz_e = load_config['z_start'], load_config['z_end']
+    # Load Anchor: Positioned at the CENTER of final Bezier sections
+    # Use average of final curve endpoints to determine anchor position
+    if final_positions:
+        avg_y = np.mean([p[1] for p in final_positions])
+        avg_z = np.mean([p[2] for p in final_positions])
+        max_w = max([s[0] for s in final_sections])
+        max_h = max([s[1] for s in final_sections])
+    else:
+        avg_y = load_config['y']
+        avg_z = (load_config['z_start'] + load_config['z_end']) / 2.0
+        max_w, max_h = 4, 6
     
-    # Clip coordinates
-    lx = min(lx, nx-1)
-    ly = min(ly, ny-1)
-    lz_s = max(0, lz_s)
-    lz_e = min(nz, lz_e)
+    # Anchor covers the average final section position
+    # Extends back 3 voxels for connectivity, sized to cover final section
+    anchor_depth = 3
+    anchor_hw = max(2, int(max_w / 2) + 1)  # Half-width in Z
+    anchor_hh = max(2, int(max_h / 2) + 1)  # Half-height in Y
     
-    # Create a 3x3x(Z) anchor block
-    x_s, x_e = max(0, lx-1), min(nx, lx+2)
-    y_s, y_e = max(0, ly-1), min(ny, ly+2)
+    x_s = max(0, nx - anchor_depth)
+    x_e = nx
+    y_s = max(0, int(avg_y - anchor_hh))
+    y_e = min(ny, int(avg_y + anchor_hh))
+    z_s = max(0, int(avg_z - anchor_hw))
+    z_e = min(nz, int(avg_z + anchor_hw))
     
-    voxel_grid[x_s:x_e, y_s:y_e, lz_s:lz_e] = 1.0
+    voxel_grid[x_s:x_e, y_s:y_e, z_s:z_e] = 1.0
         
     return voxel_grid
 
@@ -218,8 +349,11 @@ def generate_seeded_cantilever(
     grid = np.full(resolution, 0.35, dtype=np.float32)
     
     # 2. Define Seed Bar (Load -> Support)
-    # Point A: Load
-    p1 = np.array([load_config['x'], load_config['y'], (load_config['z_start'] + load_config['z_end']) / 2])
+    ly = load_config['y']
+    lz_center = (load_config['z_start'] + load_config['z_end']) / 2
+    
+    # Point A: Load (at free end)
+    p1 = np.array([nx - 1, ly, lz_center])
     
     # Point B: Support Center (X=0)
     p0 = np.array([0.0, ny / 2.0, nz / 2.0])
@@ -240,6 +374,19 @@ def generate_seeded_cantilever(
         z_min, z_max = max(0, cz-thickness), min(nz, cz+thickness+1)
         
         grid[x_min:x_max, y_min:y_max, z_min:z_max] = 1.0
+    
+    # 3. Load Anchor at free end (ensures connection with 2x2 load region)
+    anchor_depth = 4
+    anchor_margin = 3
+    
+    x_s = max(0, nx - anchor_depth)
+    x_e = nx
+    y_s = max(0, int(ly - anchor_margin))
+    y_e = min(ny, int(ly + anchor_margin + 1))
+    z_s = max(0, int(lz_center - anchor_margin))
+    z_e = min(nz, int(lz_center + anchor_margin + 1))
+    
+    grid[x_s:x_e, y_s:y_e, z_s:z_e] = 1.0
         
     return grid
 
@@ -350,19 +497,37 @@ def generate_phase1_slices(
 # --- Main Script ---
 
 def generate_random_load_config(resolution):
+    """
+    Generate load configuration for cantilever beam.
+    
+    Load is applied as surface traction at X=nx (free end face),
+    similar to beam_3d.py from FEniTop. The load region is a 
+    centered patch on the free end face.
+    """
     nx, ny, nz = resolution
-    # x in [nx/2, nx-1], y in [0, ny-1], z in [0, nz-5]
-    load_x = random.randint(nx//2, nx-1)
-    load_y = random.randint(0, ny-1)
-    load_z_start = random.randint(0, nz-5)
-    load_z_end = load_z_start + 4
+    
+    # Load always at X=nx-1 (free end face)
+    load_x = nx - 1
+    
+    # Center the load region in Y and Z with some randomness
+    # Similar to beam_3d.py where load is centered on the end face
+    load_y = ny // 2 + random.randint(-ny//4, ny//4)
+    load_y = max(2, min(ny-3, load_y))  # Keep within bounds
+    
+    load_z_center = nz // 2 + random.randint(-nz//4, nz//4)
+    load_z_center = max(2, min(nz-3, load_z_center))
+    
+    # 2x2 load region
+    half_width = 1
+    load_z_start = load_z_center - half_width
+    load_z_end = load_z_center + half_width
     
     return {
         'x': load_x,
         'y': load_y,
         'z_start': load_z_start,
         'z_end': load_z_end,
-        'magnitude': -100.0 # Increased load as requested
+        # Magnitude now handled by FEniTop config (-2.0 as in beam_3d.py)
     }
 
 def parse_args():
@@ -375,34 +540,37 @@ def parse_args():
     return parser.parse_args()
 
 def main():
+    from mpi4py import MPI
+    comm = MPI.COMM_WORLD
+    is_main_rank = (comm.rank == 0)
+    
     args = parse_args()
     
-    # Setup
+    # Setup (only main rank does IO)
     db_path = Path(args.db_path)
-    initialize_database(db_path)
+    if is_main_rank:
+        initialize_database(db_path)
     
     # Resolution
     resolution = [int(x) for x in args.resolution.split("x")]
     nx, ny, nz = resolution
     
-    # Logger
-    logger = TrainingLogger(str(db_path.parent / "logs"), "harvest_v2.csv", 
-                           ["episode", "duration", "compliance", "vol_frac", "phase1_samples", "phase2_samples"])
+    # Logger (only main rank)
+    logger = None
+    if is_main_rank:
+        logger = TrainingLogger(str(db_path.parent / "logs"), "harvest_v2.csv", 
+                               ["episode", "duration", "compliance", "vol_frac", "phase1_samples", "phase2_samples"])
     
     # Physics Props
     props = PhysicalProperties()
     
-    # Initialize Context
-    print("Initializing FEM Context...")
-    ctx = initialize_cantilever_context(resolution, props)
-    
-    print(f"Starting Harvest: {args.episodes} episodes")
+    if is_main_rank:
+        print(f"Starting Harvest: {args.episodes} episodes")
     
     for i in range(args.episodes):
         start_time = time.time()
-        episode_id = generate_episode_id()
         
-        # Set seed
+        # Set seed (all ranks must use same seed for consistency)
         seed = args.seed_offset + i
         np.random.seed(seed)
         random.seed(seed)
@@ -415,52 +583,58 @@ def main():
         else:
             strategy = 'FULL_DOMAIN' if random.random() < 0.2 else 'BEZIER'
         
-        # 1. Generate Initial Structure
+        # 1. Generate Initial Structure (all ranks generate same structure due to same seed)
         load_config = generate_random_load_config(resolution)
         
         if strategy == 'FULL_DOMAIN':
-            # Hybrid Seeding: Gray background + Connection Bar
             v_constructed = generate_seeded_cantilever(resolution, load_config)
         else:
             v_constructed = generate_bezier_structure(resolution, load_config)
         
-        # 2. Run SIMP (Phase 2 Ground Truth)
-        # We run this FIRST to get S_final (Oracle Value)
-        # Spec: "Calcular Score Final (S_final)... Este S_final será usado como Target Value para TODOS os registros"
-        
-        # Force Erosion: Target Volume = 40% (0.4) for FULL_DOMAIN to match MBB validation
+        # Target volumes
         if strategy == 'FULL_DOMAIN':
-            target_vol = 0.4
+            target_vol = 0.15
         else:
-            initial_vol = np.mean(v_constructed)
-            target_vol = initial_vol * 0.75
-            # Ensure target is not too small (min 15%)
-            target_vol = max(0.15, target_vol)
+            target_vol = 0.10
         
-        print(f"Episode {i}: Strategy={strategy}, Target V={target_vol:.3f}")
+        if is_main_rank:
+            print(f"Episode {i}: Strategy={strategy}, Target V={target_vol:.3f}")
 
         simp_config = SIMPConfig(
             vol_frac=target_vol,
-            max_iter=60, 
-            r_min=2.5,   # Recommended 2.5 in Spec v2.1
+            max_iter=120,  # More iterations for lower volume targets
+            r_min=1.5,     # Filter radius ~1.5 elements
             adaptive_penal=True, 
             load_config=load_config,
             debug_log_path=f"debug_simp_log_ep{i}.csv" 
         )
         
-        # Run SIMP starting from V_constructed
-        simp_history = run_simp_optimization_3d(
-            ctx, props, simp_config, resolution, 
-            initial_density=v_constructed
-        )
+        # Run FEniTop Optimization (ALL ranks must participate in MPI collective operations)
+        try:
+            simp_history = run_fenitop_optimization(
+                resolution, props, simp_config, 
+                initial_density=v_constructed,
+                strategy=strategy
+            )
+        except Exception as e:
+            if is_main_rank:
+                print(f"Episode {i}: FEniTop failed with error: {e}")
+                import traceback
+                traceback.print_exc()
+            continue
+        
+        # Only main rank has the full history (callback only runs on rank 0)
+        if not is_main_rank:
+            continue  # Other ranks skip the rest of episode processing
         
         if not simp_history:
-            print(f"Episode {i}: SIMP failed. Skipping.")
+            print(f"Episode {i}: SIMP failed (no history). Skipping.")
             continue
             
         final_state = simp_history[-1]
         s_final_compliance = final_state['compliance']
-        s_final_vol = np.mean(final_state['binary_map'])
+        # s_final_vol = np.mean(final_state['binary_map']) # FEniTop returns continuous density
+        s_final_vol = final_state['vol_frac'] # Use the volume fraction from FEniTop
         
         # Calculate Value Score (Tanh normalized)
         # Formula: tanh( (-log(C) - alpha*V - mu) / sigma )
@@ -545,9 +719,19 @@ def main():
         # 6. Generate Phase 2 Records (SIMP History)
         phase2_records = []
         
-        # Filter: Skip first 20 steps if adaptive_penal is used (Policy Pollution Prevention)
-        # The first 20 steps use p=1 (convex), which is not representative of the final topology optimization problem.
-        start_step = 20 if simp_config.adaptive_penal else 0
+        # Filter: Skip steps where beta=1 (pure density manipulation phase)
+        # FEniTop uses Heaviside continuation: beta starts at 1 (soft projection)
+        # and increases over iterations. We only save steps after beta > 1
+        # when real topology decisions are being made.
+        
+        # Find first step where beta > 1
+        start_step = 0
+        for t, frame in enumerate(simp_history):
+            if frame.get('beta', 1) > 1:
+                start_step = t
+                break
+        
+        print(f"  Phase 2: Skipping first {start_step} steps (beta=1 phase), saving from step {start_step}")
         
         for t in range(start_step, len(simp_history) - 1):
             current_frame = simp_history[t]
@@ -582,12 +766,13 @@ def main():
             
             phase2_records.append({
                 "phase": Phase.REFINEMENT,
-                "step": len(phase1_records) + t,
-                "input_state": input_state, # Saved as Connected Binary
+                "step": len(phase1_records) + (t - start_step),  # Renumber from 0
+                "input_state": input_state,
                 "target_add": target_add,
                 "target_remove": target_remove,
                 "target_value": 1.0 / (float(current_frame['compliance']) + 1e-9),
                 "threshold": found_threshold,
+                "beta": current_frame.get('beta', 1),
                 "current_compliance": float(current_frame['compliance']),
                 "current_vol": float(np.mean(curr_dens))
             })
@@ -601,7 +786,7 @@ def main():
                 # 1: Mask (Support) -> X=0
                 # 2,3,4: Forces
                 
-                # Support Mask
+                # Support Mask (full clamped wall at X=0)
                 mask = np.zeros(resolution, dtype=np.float32)
                 mask[0, :, :] = 1.0
                 
@@ -611,18 +796,19 @@ def main():
                 fz = np.zeros(resolution, dtype=np.float32)
                 
                 # Apply Load to Force Channels
-                # Load is distributed line
-                # We can just paint the load region
-                # Load Config: x, y, z_start, z_end
-                lx, ly, lz_s, lz_e = load_config['x'], load_config['y'], load_config['z_start'], load_config['z_end']
-                # Clip
-                lx = min(lx, nx-1)
-                ly = min(ly, ny-1)
-                lz_s = max(0, lz_s)
-                lz_e = min(nz, lz_e)
+                # Load is surface traction at X=Lx (free end), 2x2 patch
+                ly = load_config['y']
+                lz_center = (load_config['z_start'] + load_config['z_end']) / 2.0
+                load_half_width = 1.0  # 2x2 load region
                 
-                # Force is -Y direction (magnitude)
-                fy[lx, ly, lz_s:lz_e] = load_config.get('magnitude', -1.0)
+                # Mark load region at X=nx-1 (free end face)
+                y_min = max(0, int(ly - load_half_width))
+                y_max = min(ny, int(ly + load_half_width) + 1)
+                z_min = max(0, int(lz_center - load_half_width))
+                z_max = min(nz, int(lz_center + load_half_width) + 1)
+                
+                # Force is -Y direction (traction = -2.0, normalized to -1 for NN input)
+                fy[nx-1, y_min:y_max, z_min:z_max] = -1.0
                 
                 # Input State
                 # rec['input_state'] is the density channel
