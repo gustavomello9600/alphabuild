@@ -1,106 +1,160 @@
+"""
+PyTorch Dataset for AlphaBuilder v3.1.
+
+Loads data from SQLite DB with on-the-fly augmentation.
+"""
+import sqlite3
+import numpy as np
 import torch
 from torch.utils.data import Dataset
-import sqlite3
-import pickle
-import numpy as np
 from pathlib import Path
-from typing import Tuple, Optional
-import random
+from typing import Optional
+import json
 
-class PhysicsAugment:
-    """Aplica transformações consistentes na Geometria E nos Vetores de Força."""
+from alphabuilder.src.logic.storage import deserialize_state
+from alphabuilder.src.neural.augmentation import (
+    rotate_90_z, flip_y, erosion_attack, 
+    load_multiplier, sabotage, saboteur
+)
+
+
+class TopologyDatasetV31(Dataset):
+    """
+    Dataset for topology optimization training.
     
-    def __call__(self, state: torch.Tensor, policy: torch.Tensor):
-        # state: (5, D, H, W)
-        # policy: (2, D, H, W)
-        
-        # 1. Random Flip X (Axis 1 - Depth/Length)
-        if random.random() > 0.5:
-            state = torch.flip(state, dims=[1])
-            policy = torch.flip(policy, dims=[1])
-            # Se inverter eixo X, força X inverte sinal (Channel 2 is Fx)
-            state[2, ...] = -state[2, ...] 
-            
-        # 2. Random Flip Y (Axis 2 - Height)
-        if random.random() > 0.5:
-            state = torch.flip(state, dims=[2])
-            policy = torch.flip(policy, dims=[2])
-            # Se inverter eixo Y, força Y inverte sinal (Channel 3 is Fy)
-            state[3, ...] = -state[3, ...]
-
-        # 3. Random Flip Z (Axis 3 - Width)
-        if random.random() > 0.5:
-            state = torch.flip(state, dims=[3])
-            policy = torch.flip(policy, dims=[3])
-            # Se inverter eixo Z, força Z inverte sinal (Channel 4 is Fz)
-            state[4, ...] = -state[4, ...]
-
-        # Nota: Rotações de 90 graus são mais complexas para os vetores. 
-        # Para Warm-up inicial, os Flips são suficientes para cobrir os 8 quadrantes.
-        
-        return state, policy
-
-class AlphaBuilderDataset(Dataset):
+    Loads 7-channel states and 2-channel policies from SQLite DB.
+    Applies augmentation on-the-fly based on sample metadata.
     """
-    PyTorch Dataset for AlphaBuilder training data.
-    Loads (State, Policy, Value) tuples from SQLite.
-    """
-    def __init__(self, db_path: str, transform=None, augment: bool = False):
-        self.db_path = db_path
-        self.transform = transform
+    
+    def __init__(
+        self,
+        db_path: Path,
+        augment: bool = True,
+        phase_filter: Optional[str] = None  # 'GROWTH' or 'REFINEMENT'
+    ):
+        """
+        Args:
+            db_path: Path to SQLite database
+            augment: Whether to apply data augmentation
+            phase_filter: Optional filter for specific phase
+        """
+        self.db_path = Path(db_path)
         self.augment = augment
-        self.augmentor = PhysicsAugment() if augment else None
-        self.indices = self._index_db()
+        self.phase_filter = phase_filter
         
-    def _index_db(self):
-        """Get list of valid row IDs."""
-        if not Path(self.db_path).exists():
-            return []
-            
+        # Load index of all records
+        self._load_index()
+    
+    def _load_index(self):
+        """Load record IDs and metadata from database."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        # Only select rows with valid FEM and policy
-        cursor.execute("SELECT rowid FROM training_data WHERE valid_fem=1 AND policy_blob IS NOT NULL")
-        indices = [row[0] for row in cursor.fetchall()]
+        
+        query = "SELECT id, phase, metadata, fitness_score FROM training_data"
+        if self.phase_filter:
+            query += f" WHERE phase = '{self.phase_filter}'"
+        
+        cursor.execute(query)
+        rows = cursor.fetchall()
         conn.close()
-        return indices
         
+        self.record_ids = []
+        self.phases = []
+        self.metadata = []
+        self.values = []
+        
+        for row in rows:
+            self.record_ids.append(row[0])
+            self.phases.append(row[1])
+            self.metadata.append(json.loads(row[2]) if row[2] else {})
+            self.values.append(row[3])
+    
     def __len__(self):
-        return len(self.indices)
-        
+        return len(self.record_ids)
+    
     def __getitem__(self, idx):
-        rowid = self.indices[idx]
+        """
+        Get a training sample.
         
+        Returns:
+            dict with:
+                - state: (7, D, H, W) tensor
+                - policy: (2, D, H, W) tensor
+                - value: scalar
+                - phase: 'GROWTH' or 'REFINEMENT'
+                - is_final: bool
+                - is_connected: bool
+        """
+        record_id = self.record_ids[idx]
+        phase = self.phases[idx]
+        meta = self.metadata[idx]
+        value = self.values[idx]
+        
+        # Load blobs from DB
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT state_blob, policy_blob, fitness_score FROM training_data WHERE rowid=?", (rowid,))
+        cursor.execute(
+            "SELECT state_blob, policy_blob FROM training_data WHERE id = ?",
+            (record_id,)
+        )
         row = cursor.fetchone()
         conn.close()
         
-        state_blob, policy_blob, fitness = row
+        state = deserialize_state(row[0])
+        policy = deserialize_state(row[1])
         
-        # Deserialize
-        state = pickle.loads(state_blob).astype(np.float32) # (5, D, H, W)
-        policy = pickle.loads(policy_blob).astype(np.float32) # (2, D, H, W)
-        # value = np.array([fitness], dtype=np.float32) # (1,) -> REMOVED
+        # Get metadata flags
+        is_final = meta.get('is_final_step', False)
+        is_connected = meta.get('is_connected', False)
         
-        # Convert to Tensor
-        state_t = torch.from_numpy(state)
-        policy_t = torch.from_numpy(policy)
+        # Apply augmentation if enabled
+        if self.augment:
+            state, policy, value = self._apply_augmentation(
+                state, policy, value, is_final, is_connected
+            )
         
-        # Normalização Logarítmica do Value Target (Supondo Fitness = 1/Compliance)
-        # Se Fitness for alto (bom), log(Fitness) é alto.
-        # Target deve ser positivo para uma boa estrutura.
-        epsilon = 1e-6
-        # fitness comes from DB as float, convert to tensor
-        value_t = torch.log(torch.tensor([fitness], dtype=torch.float32) + epsilon)
+        return {
+            'state': torch.from_numpy(state).float(),
+            'policy': torch.from_numpy(policy).float(),
+            'value': torch.tensor([value], dtype=torch.float32),
+            'phase': phase,
+            'is_final': is_final,
+            'is_connected': is_connected
+        }
+    
+    def _apply_augmentation(self, state, policy, value, is_final, is_connected):
+        """
+        Apply augmentation based on spec v3.1.
+        
+        Priority order:
+        1. Final step -> Erosion Attack (100%)
+        2. Connected -> Load Multiplier (5%)
+        3. General -> Sabotage (5%) or Saboteur (10%)
+        4. Always: Random flip (50%) - rotation only if D==H
+        """
+        # Physical augmentation (always, 50% chance)
+        if np.random.random() < 0.5:
+            # Only rotate if D == H (to preserve shape for batching)
+            D, H = state.shape[1], state.shape[2]
+            if D == H and np.random.random() < 0.5:
+                state, policy = rotate_90_z(state, policy)
+            else:
+                # Flip always preserves shape
+                state, policy = flip_y(state, policy)
+        
+        # Negative sampling based on conditions
+        if is_final:
+            # Condition A: Final Step -> Erosion Attack (100%)
+            state, policy, value = erosion_attack(state, policy, value)
+        elif is_connected and np.random.random() < 0.05:
+            # Condition B: Connected -> Load Multiplier (5%)
+            state, policy, value = load_multiplier(state, policy, value, k=3.0)
+        elif np.random.random() < 0.05:
+            # Condition C: Sabotage (5%)
+            state, policy, value = sabotage(state, policy, value)
+        elif np.random.random() < 0.10:
+            # Condition D: Saboteur (10%)
+            state, policy, value = saboteur(state, policy, value)
+        
+        return state, policy, value
 
-        # Aplicar Augmentation se estiver em modo de treino
-        if self.augment and self.augmentor:
-            state_t, policy_t = self.augmentor(state_t, policy_t)
-            
-        if self.transform:
-            # Apply transforms if any
-            pass
-            
-        return state_t, policy_t, value_t

@@ -1,137 +1,139 @@
+"""
+Training Loop for AlphaBuilder v3.1.
+
+Implements weighted loss as per spec:
+- Policy Loss with phase-aware masking
+- Value Loss with negative sample weighting (w_neg = 5.0)
+"""
 import torch
 import torch.nn as nn
-import torch.optim as optim
+import torch.nn.functional as F
+from typing import Dict, Any
 from torch.utils.data import DataLoader
-from pathlib import Path
-from typing import Optional, Dict
-import time
-from tqdm import tqdm
 
-from .model_arch import AlphaBuilderSwinUNETR
-from .dataset import AlphaBuilderDataset
 
-class AlphaLoss(nn.Module):
-    def __init__(self, bce_weight=1.0, dice_weight=1.0):
-        super().__init__()
-        self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([10.0])) # Penaliza 10x mais errar um voxel de remoção
-        self.dice_w = dice_weight
-        
-    def forward(self, pred_logits, target_mask):
-        # BCE
-        # Ensure target is on same device
-        if target_mask.device != pred_logits.device:
-            target_mask = target_mask.to(pred_logits.device)
-            
-        # pos_weight needs to be on the same device as input
-        if self.bce.pos_weight.device != pred_logits.device:
-            self.bce.pos_weight = self.bce.pos_weight.to(pred_logits.device)
+# Negative sample weight
+W_NEG = 5.0
 
-        loss_b = self.bce(pred_logits, target_mask)
-        
-        # Dice Approximation
-        probs = torch.sigmoid(pred_logits)
-        intersection = (probs * target_mask).sum()
-        union = probs.sum() + target_mask.sum()
-        dice = 1.0 - (2. * intersection + 1e-5) / (union + 1e-5)
-        
-        return loss_b + self.dice_w * dice
+# Policy weight in total loss
+LAMBDA_POLICY = 1.0
 
-class AlphaBuilderTrainer:
-    def __init__(
-        self,
-        model: AlphaBuilderSwinUNETR,
-        db_path: str,
-        checkpoint_dir: str = "checkpoints",
-        lr: float = 1e-4,
-        batch_size: int = 4,
-        augment: bool = False,
-        device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    ):
-        self.model = model.to(device)
-        self.device = device
-        self.batch_size = batch_size
-        self.checkpoint_dir = Path(checkpoint_dir)
-        self.checkpoint_dir.mkdir(exist_ok=True, parents=True)
-        
-        self.dataset = AlphaBuilderDataset(db_path, augment=augment)
-        self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True, num_workers=0) # 0 workers for safety
-        
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
-        
-        # Losses
-        # Policy: Cross Entropy or BCE?
-        # Policy output is logits for 2 channels (Add, Remove).
-        # We can treat it as multi-label or separate BCEs.
-        # Spec says: "Entropia Cruzada Ponderada".
-        # Since channels are independent (Add vs Remove), BCEWithLogitsLoss is appropriate.
-        self.policy_criterion = AlphaLoss()
-        self.value_criterion = nn.MSELoss()
 
-    def train_epoch(self, epoch: int) -> Dict[str, float]:
-        self.model.train()
-        total_loss = 0.0
-        p_loss_total = 0.0
-        v_loss_total = 0.0
-        
-        pbar = tqdm(self.dataloader, desc=f"Epoch {epoch}")
-        
-        for batch_idx, (state, policy, value) in enumerate(pbar):
-            state = state.to(self.device)
-            policy = policy.to(self.device)
-            value = value.to(self.device)
-            
-            self.optimizer.zero_grad()
-            
-            output = self.model(state)
-            
-            # Calculate Losses
-            # Policy Loss
-            p_loss = self.policy_criterion(output.policy_logits, policy)
-            
-            # Value Loss
-            v_loss = self.value_criterion(output.value_pred, value)
-            
-            # Total Loss (Weighted?)
-            loss = p_loss + 0.5 * v_loss
-            
-            loss.backward()
-            self.optimizer.step()
-            
-            total_loss += loss.item()
-            p_loss_total += p_loss.item()
-            v_loss_total += v_loss.item()
-            
-            pbar.set_postfix({"Loss": f"{loss.item():.4f}", "P_Loss": f"{p_loss.item():.4f}", "V_Loss": f"{v_loss.item():.4f}"})
-            
-        avg_loss = total_loss / len(self.dataloader)
-        return {
-            "loss": avg_loss,
-            "policy_loss": p_loss_total / len(self.dataloader),
-            "value_loss": v_loss_total / len(self.dataloader)
-        }
-        
-    def save_checkpoint(self, name: str):
-        path = self.checkpoint_dir / f"{name}.pt"
-        torch.save(self.model.state_dict(), path)
-        print(f"Saved checkpoint to {path}")
-        
-    def load_checkpoint(self, path: str):
-        self.model.load_state_dict(torch.load(path, map_location=self.device))
-        print(f"Loaded checkpoint from {path}")
-
-def train_loop(db_path: str, epochs: int = 10):
-    from .model_arch import build_model
+def weighted_value_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Weighted MSE loss for value prediction.
     
-    # Init Model
-    model = build_model()
+    Applies higher weight (w_neg) to negative targets to combat
+    imbalance where most samples are "good".
     
-    trainer = AlphaBuilderTrainer(model, db_path)
-    
-    for epoch in range(1, epochs + 1):
-        metrics = trainer.train_epoch(epoch)
-        print(f"Epoch {epoch} Metrics: {metrics}")
+    Args:
+        pred: (B, 1) predicted values
+        target: (B, 1) target values
         
-        if epoch % 5 == 0:
-            trainer.save_checkpoint(f"epoch_{epoch}")
-            
-    trainer.save_checkpoint("final")
+    Returns:
+        Weighted MSE loss
+    """
+    mse = (pred - target) ** 2
+    
+    # Weight negative targets more heavily
+    weights = torch.where(target <= 0, W_NEG, 1.0)
+    
+    return (weights * mse).mean()
+
+
+def policy_loss(
+    pred: torch.Tensor, 
+    target: torch.Tensor,
+    phase: str = None
+) -> torch.Tensor:
+    """
+    Binary cross-entropy loss for policy prediction.
+    
+    Phase-aware:
+    - GROWTH: Focus on Add channel, mask Remove
+    - REFINEMENT: Both channels active
+    
+    Args:
+        pred: (B, 2, D, H, W) policy logits
+        target: (B, 2, D, H, W) target policy
+        phase: 'GROWTH' or 'REFINEMENT' (optional)
+        
+    Returns:
+        Policy loss
+    """
+    # Apply sigmoid to get probabilities
+    pred_prob = torch.sigmoid(pred)
+    
+    # Binary cross-entropy with logits
+    loss = F.binary_cross_entropy_with_logits(
+        pred, target, 
+        reduction='none'
+    )
+    
+    # Phase-aware masking
+    if phase == 'GROWTH':
+        # Focus on Add channel (index 0), reduce weight on Remove (index 1)
+        mask = torch.ones_like(loss)
+        mask[:, 1, :, :, :] = 0.1  # Low weight for Remove in Growth phase
+        loss = loss * mask
+    
+    return loss.mean()
+
+
+def train_one_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device
+) -> Dict[str, float]:
+    """
+    Train model for one epoch.
+    
+    Args:
+        model: AlphaBuilderV31 model
+        dataloader: Training data loader
+        optimizer: Optimizer
+        device: Device to train on
+        
+    Returns:
+        Dict with loss metrics
+    """
+    model.train()
+    
+    total_loss = 0.0
+    total_policy_loss = 0.0
+    total_value_loss = 0.0
+    num_batches = 0
+    
+    for batch in dataloader:
+        # Move to device
+        state = batch['state'].to(device)
+        target_policy = batch['policy'].to(device)
+        target_value = batch['value'].to(device)
+        
+        # Forward pass
+        optimizer.zero_grad()
+        pred_policy, pred_value = model(state)
+        
+        # Compute losses
+        v_loss = weighted_value_loss(pred_value, target_value)
+        p_loss = policy_loss(pred_policy, target_policy)
+        
+        loss = v_loss + LAMBDA_POLICY * p_loss
+        
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+        
+        # Track metrics
+        total_loss += loss.item()
+        total_policy_loss += p_loss.item()
+        total_value_loss += v_loss.item()
+        num_batches += 1
+    
+    return {
+        'loss': total_loss / max(num_batches, 1),
+        'policy_loss': total_policy_loss / max(num_batches, 1),
+        'value_loss': total_value_loss / max(num_batches, 1)
+    }
+

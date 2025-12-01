@@ -402,9 +402,9 @@ class TestIntegrationV31:
     
     def test_13_train_one_epoch(self):
         """Treina uma epoch com dados augmentados + originais."""
-        from alphabuilder.src.neural.dataset_v31 import TopologyDatasetV31
-        from alphabuilder.src.neural.model_v31 import AlphaBuilderV31
-        from alphabuilder.src.neural.trainer_v31 import train_one_epoch
+        from alphabuilder.src.neural.dataset import TopologyDatasetV31
+        from alphabuilder.src.neural.model import AlphaBuilderV31
+        from alphabuilder.src.neural.trainer import train_one_epoch
         from torch.utils.data import DataLoader
         
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -447,7 +447,7 @@ class TestIntegrationV31:
     
     def test_14_inference_phase1(self):
         """Testa inferência em um ponto de dados da Fase 1 (GROWTH)."""
-        from alphabuilder.src.neural.model_v31 import AlphaBuilderV31
+        from alphabuilder.src.neural.model import AlphaBuilderV31
         from alphabuilder.src.logic.storage import deserialize_state
         
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -500,7 +500,7 @@ class TestIntegrationV31:
     
     def test_15_inference_phase2(self):
         """Testa inferência em um ponto de dados da Fase 2 (REFINEMENT)."""
-        from alphabuilder.src.neural.model_v31 import AlphaBuilderV31
+        from alphabuilder.src.neural.model import AlphaBuilderV31
         from alphabuilder.src.logic.storage import deserialize_state
         
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

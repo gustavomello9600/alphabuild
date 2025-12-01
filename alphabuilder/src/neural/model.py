@@ -1,208 +1,174 @@
-import tensorflow as tf
-from tensorflow.keras import layers, models
-import numpy as np
+"""
+Neural Network Model for AlphaBuilder v3.1.
+
+Swin-UNETR based model with:
+- 7 input channels
+- Dynamic padding for arbitrary resolutions
+- InstanceNorm3d
+- Policy Head (2 channels) + Value Head (1 scalar)
+"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Tuple, Optional
+
+# Try to import MONAI's SwinUNETR, fallback to simple conv model
+try:
+    from monai.networks.nets import SwinUNETR
+    HAS_MONAI = True
+except ImportError:
+    HAS_MONAI = False
 
 
-def get_sinusoidal_embeddings(num_positions, projection_dim):
+class AlphaBuilderV31(nn.Module):
     """
-    Generates fixed sinusoidal positional embeddings.
+    AlphaBuilder v3.1 Neural Network.
+    
+    Input: (B, 7, D, H, W) - 7-channel state tensor
+    Output: 
+        - policy: (B, 2, D, H, W) - Add/Remove logits
+        - value: (B, 1) - Quality score in [-1, 1]
     """
-    positions = np.arange(num_positions)[:, np.newaxis]
-    div_term = np.exp(np.arange(0, projection_dim, 2) * -(np.log(10000.0) / projection_dim))
     
-    embeddings = np.zeros((num_positions, projection_dim))
-    embeddings[:, 0::2] = np.sin(positions * div_term)
-    embeddings[:, 1::2] = np.cos(positions * div_term)
+    def __init__(
+        self,
+        in_channels: int = 7,
+        out_channels: int = 2,
+        feature_size: int = 24,
+        use_swin: bool = True
+    ):
+        super().__init__()
+        
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.window_size = 2  # For dynamic padding
+        
+        if use_swin and HAS_MONAI:
+            try:
+                # Try newer MONAI API (without img_size)
+                self.backbone = SwinUNETR(
+                    in_channels=in_channels,
+                    out_channels=feature_size,
+                    feature_size=feature_size,
+                    use_checkpoint=False,
+                    spatial_dims=3,
+                    norm_name="instance"
+                )
+                self.use_swin = True
+            except TypeError:
+                # Fallback to simple backbone if MONAI API incompatible
+                self.backbone = SimpleBackbone(in_channels, feature_size)
+                self.use_swin = False
+        else:
+            # Fallback: Simple 3D UNet-like architecture
+            self.backbone = SimpleBackbone(in_channels, feature_size)
+            self.use_swin = False
+        
+        # Policy Head
+        self.policy_head = nn.Sequential(
+            nn.Conv3d(feature_size, feature_size, kernel_size=3, padding=1),
+            nn.InstanceNorm3d(feature_size),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(feature_size, out_channels, kernel_size=1)
+        )
+        
+        # Value Head (Global pooling + MLP)
+        self.value_head = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),
+            nn.Flatten(),
+            nn.Linear(feature_size, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1),
+            nn.Tanh()  # Output in [-1, 1]
+        )
     
-    return tf.constant(embeddings, dtype=tf.float32)
-
-@tf.keras.utils.register_keras_serializable()
-class UniversalPatchEncoder(layers.Layer):
-    def __init__(self, patch_size=4, projection_dim=64, **kwargs):
-        super().__init__(**kwargs)
-        self.patch_size = patch_size
-        self.projection_dim = projection_dim
-
-    def build(self, input_shape):
-        # Input shape can be (B, H, W, C) or (B, D, H, W, C)
-        # Channel dim is always last
-        channels = input_shape[-1]
-        if channels is None:
-             raise ValueError("Channel dimension must be defined.")
-
-        # 2D Kernel: (h, w, cin, cout)
-        self.kernel_2d = self.add_weight(
-            name="kernel_2d",
-            shape=(self.patch_size, self.patch_size, channels, self.projection_dim),
-            initializer="glorot_uniform",
-            trainable=True
-        )
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass with dynamic padding.
         
-        # 3D Kernel: (d, h, w, cin, cout)
-        self.kernel_3d = self.add_weight(
-            name="kernel_3d",
-            shape=(self.patch_size, self.patch_size, self.patch_size, channels, self.projection_dim),
-            initializer="glorot_uniform",
-            trainable=True
-        )
+        Args:
+            x: (B, 7, D, H, W) input tensor
+            
+        Returns:
+            policy: (B, 2, D, H, W)
+            value: (B, 1)
+        """
+        # Store original size
+        original_size = x.shape[2:]  # (D, H, W)
         
-        self.bias = self.add_weight(
-            name="bias",
-            shape=(self.projection_dim,),
-            initializer="zeros",
-            trainable=True
-        )
+        # Dynamic padding to make dimensions divisible by window_size
+        x_padded, pad_sizes = self._dynamic_pad(x)
         
-        # CLS Token
-        self.cls_token = self.add_weight(
-            name="cls_token",
-            shape=(1, 1, self.projection_dim),
-            initializer="zeros",
-            trainable=True
-        )
+        # Backbone
+        features = self.backbone(x_padded)
         
-        super().build(input_shape)
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "patch_size": self.patch_size,
-            "projection_dim": self.projection_dim,
-        })
-        return config
-
-    def _get_sinusoidal_embeddings_2d(self, height, width):
-        """Generate 2D sinusoidal embeddings."""
-        d_model = self.projection_dim
-        y_pos = tf.range(height, dtype=tf.float32)
-        x_pos = tf.range(width, dtype=tf.float32)
-        d_half = d_model // 2
+        # Crop features back to original size
+        features = self._dynamic_crop(features, original_size, pad_sizes)
         
-        def get_1d_embedding(pos, d):
-            i = tf.range(d, dtype=tf.float32)
-            angle_rates = 1 / tf.pow(10000.0, (2 * (i // 2)) / tf.cast(d, tf.float32))
-            angle_rads = pos[:, tf.newaxis] * angle_rates[tf.newaxis, :]
-            sines = tf.math.sin(angle_rads[:, 0::2])
-            cosines = tf.math.cos(angle_rads[:, 1::2])
-            return tf.concat([sines, cosines], axis=-1)
-
-        y_emb = get_1d_embedding(y_pos, d_half)
-        x_emb = get_1d_embedding(x_pos, d_half)
+        # Heads
+        policy = self.policy_head(features)
+        value = self.value_head(features)
         
-        y_emb_grid = tf.tile(y_emb[:, tf.newaxis, :], [1, width, 1])
-        x_emb_grid = tf.tile(x_emb[tf.newaxis, :, :], [height, 1, 1])
+        return policy, value
+    
+    def _dynamic_pad(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple]:
+        """Pad input to make dimensions divisible by window_size."""
+        B, C, D, H, W = x.shape
         
-        embeddings = tf.concat([y_emb_grid, x_emb_grid], axis=-1)
-        return tf.reshape(embeddings, [1, height * width, d_model])
-
-    def _get_sinusoidal_embeddings_3d(self, depth, height, width):
-        """Generate 3D sinusoidal embeddings."""
-        d_model = self.projection_dim
-        d_third = d_model // 3
+        # Calculate padding needed
+        pad_d = (self.window_size - D % self.window_size) % self.window_size
+        pad_h = (self.window_size - H % self.window_size) % self.window_size
+        pad_w = (self.window_size - W % self.window_size) % self.window_size
         
-        def get_1d_embedding(pos, d):
-            i = tf.range(d, dtype=tf.float32)
-            angle_rates = 1 / tf.pow(10000.0, (2 * (i // 2)) / tf.cast(d, tf.float32))
-            angle_rads = pos[:, tf.newaxis] * angle_rates[tf.newaxis, :]
-            sines = tf.math.sin(angle_rads[:, 0::2])
-            cosines = tf.math.cos(angle_rads[:, 1::2])
-            return tf.concat([sines, cosines], axis=-1)
-
-        z_emb = get_1d_embedding(tf.range(depth, dtype=tf.float32), d_third)
-        y_emb = get_1d_embedding(tf.range(height, dtype=tf.float32), d_third)
-        x_emb = get_1d_embedding(tf.range(width, dtype=tf.float32), d_model - 2*d_third)
+        # F.pad format: (W_left, W_right, H_left, H_right, D_left, D_right)
+        padding = (0, pad_w, 0, pad_h, 0, pad_d)
         
-        z_grid = tf.tile(z_emb[:, tf.newaxis, tf.newaxis, :], [1, height, width, 1])
-        y_grid = tf.tile(y_emb[tf.newaxis, :, tf.newaxis, :], [depth, 1, width, 1])
-        x_grid = tf.tile(x_emb[tf.newaxis, tf.newaxis, :, :], [depth, height, 1, 1])
+        x_padded = F.pad(x, padding, mode='constant', value=0)
         
-        embeddings = tf.concat([z_grid, y_grid, x_grid], axis=-1)
-        return tf.reshape(embeddings, [1, depth * height * width, d_model])
-
-    def call(self, images):
-        # Input is always 5D: (Batch, Depth, Height, Width, Channels)
-        input_shape = tf.shape(images)
-        batch_size = input_shape[0]
-        
-        # Use Conv3D with planar kernel (1, P, P) - works for both 2D and 3D
-        # For 2D (Depth=1): Acts like Conv2D
-        # For 3D (Depth>1): Extracts 2D slices along depth (can be upgraded later)
-        k_planar = tf.expand_dims(self.kernel_2d, axis=0)  # (1, P, P, C, Out)
-        
-        x = tf.nn.conv3d(
-            images, 
-            k_planar, 
-            strides=[1, 1, self.patch_size, self.patch_size, 1],  # No stride in depth
-            padding="VALID"
-        )
-        x = tf.nn.bias_add(x, self.bias)
-        
-        d_prime = tf.shape(x)[1]
-        h_prime = tf.shape(x)[2]
-        w_prime = tf.shape(x)[3]
-        
-        # Flatten patches
-        x = tf.reshape(x, [batch_size, d_prime * h_prime * w_prime, self.projection_dim])
-        
-        # Add 3D positional embeddings
-        pos_emb = self._get_sinusoidal_embeddings_3d(d_prime, h_prime, w_prime)
-        
-        encoded = x + pos_emb
-        
-        cls_broadcast = tf.tile(self.cls_token, [batch_size, 1, 1])
-        return tf.concat([cls_broadcast, encoded], axis=1)
+        return x_padded, (pad_d, pad_h, pad_w)
+    
+    def _dynamic_crop(
+        self, 
+        x: torch.Tensor, 
+        original_size: Tuple[int, int, int],
+        pad_sizes: Tuple[int, int, int]
+    ) -> torch.Tensor:
+        """Crop output back to original size."""
+        D, H, W = original_size
+        return x[:, :, :D, :H, :W]
 
 
-def create_vit_regressor(
-    input_shape=(None, None, 3), # Flexible shape
-    patch_size=4,
-    projection_dim=64,
-    num_heads=4,
-    transformer_layers=4,
-    mlp_head_units=[2048, 1024],
-):
+class SimpleBackbone(nn.Module):
     """
-    Creates a Universal ViT model (2D/3D, Variable Resolution).
+    Simple 3D CNN backbone (fallback when MONAI not available).
     """
-    inputs = layers.Input(shape=input_shape)
     
-    # Encode patches (Universal: handles 2D/3D and variable sizes)
-    encoded_patches = UniversalPatchEncoder(patch_size, projection_dim)(inputs)
-
-    # Transformer Blocks
-    for _ in range(transformer_layers):
-        # Layer Normalization 1
-        x1 = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
-        # Multi-Head Attention
-        attention_output = layers.MultiHeadAttention(
-            num_heads=num_heads, key_dim=projection_dim, dropout=0.1
-        )(x1, x1)
-        # Skip Connection 1
-        x2 = layers.Add()([attention_output, encoded_patches])
+    def __init__(self, in_channels: int, feature_size: int):
+        super().__init__()
         
-        # Layer Normalization 2
-        x3 = layers.LayerNormalization(epsilon=1e-6)(x2)
-        # MLP
-        x3 = layers.Dense(projection_dim * 2, activation=tf.nn.gelu)(x3)
-        x3 = layers.Dense(projection_dim)(x3)
-        x3 = layers.Dropout(0.1)(x3)
-        # Skip Connection 2
-        encoded_patches = layers.Add()([x3, x2])
-
-    # Aggregation: Use CLS Token (Index 0) (Crucial Context #3)
-    representation = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
-    cls_token_output = representation[:, 0, :] 
+        self.encoder = nn.Sequential(
+            # Block 1
+            nn.Conv3d(in_channels, feature_size, kernel_size=3, padding=1),
+            nn.InstanceNorm3d(feature_size),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(feature_size, feature_size, kernel_size=3, padding=1),
+            nn.InstanceNorm3d(feature_size),
+            nn.ReLU(inplace=True),
+            
+            # Block 2
+            nn.Conv3d(feature_size, feature_size * 2, kernel_size=3, padding=1),
+            nn.InstanceNorm3d(feature_size * 2),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(feature_size * 2, feature_size * 2, kernel_size=3, padding=1),
+            nn.InstanceNorm3d(feature_size * 2),
+            nn.ReLU(inplace=True),
+            
+            # Back to feature_size
+            nn.Conv3d(feature_size * 2, feature_size, kernel_size=1),
+            nn.InstanceNorm3d(feature_size),
+            nn.ReLU(inplace=True),
+        )
     
-    features = layers.Dropout(0.5)(cls_token_output)
+    def forward(self, x):
+        return self.encoder(x)
 
-    # MLP Head
-    for units in mlp_head_units:
-        features = layers.Dense(units, activation=tf.nn.gelu)(features)
-        features = layers.Dropout(0.5)(features)
-
-    # Output Layer: Max Displacement (Crucial Context #1)
-    # Using softplus to ensure positive output, as displacement is magnitude
-    outputs = layers.Dense(1, activation="softplus", name="max_displacement_output")(features)
-
-    model = models.Model(inputs=inputs, outputs=outputs)
-    return model
