@@ -1,4 +1,7 @@
-# **AlphaBuilder: Especificação Técnica de Sistema e Arquitetura Neural**
+> [!WARNING]
+> **DEPRECATED**: This document has been superseded by [AlphaBuilder v2.0 Spec](alphabuilder_v2_0_spec.md). Do not use this for new development.
+
+# AlphaBuilder v1.1: Especificação de Sistema e Estratégia de Treinamento
 
 | Metadado | Detalhe |
 | :---- | :---- |

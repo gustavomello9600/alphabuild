@@ -39,10 +39,16 @@ def initialize_cantilever_context(resolution=(64, 32, 32), props: PhysicalProper
     """
     Initialize a 3D FEM context for a Cantilever Beam.
     Resolution: (L, H, W) -> (x, y, z)
-    Physical Size: 2.0 x 1.0 x 1.0
+    Physical Size: Derived from resolution (Cubic Voxels)
     """
-    L, H, W = 2.0, 1.0, 1.0
     nx, ny, nz = resolution
+    
+    # Adaptive Physical Domain (Step 1 of Engineering Order)
+    # Ensure cubic voxels by deriving physical size from resolution.
+    voxel_size = 1.0
+    L = nx * voxel_size
+    H = ny * voxel_size
+    W = nz * voxel_size
     
     # 1. Create 3D Hexahedral Mesh
     domain = mesh.create_box(
@@ -86,7 +92,7 @@ def initialize_cantilever_context(resolution=(64, 32, 32), props: PhysicalProper
         props = PhysicalProperties()
         
     E_0 = props.E
-    E_min = 1e-3 # Increased from 1e-6 for CG stability
+    E_min = 1e-6 # Fixed to 1e-6 as per Engineering Order
     rho = material_field
     E = E_min + (E_0 - E_min) * rho # Linear for binary is fine, or rho**3 for SIMP
     nu = props.nu

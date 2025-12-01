@@ -38,10 +38,10 @@ def extract_discrete_actions(
         # History has 'density_map' (continuous) and 'binary_map' (0/1)
         # We should use the continuous density for the network input?
         # Spec says: "Canal 0 (rho): Matriz de densidade binária atual"
-        # So we use binary map.
-        
-        current_density = current_frame['binary_map']
-        future_density = future_frame['binary_map']
+        # 1. Input State (5-Channel Tensor)
+        # Use continuous density for better visualization and network information
+        current_density = current_frame['density_map']
+        # future_density = future_frame['density_map'] # Not used for policy
         
         # Build 5-channel tensor using utility (adds Mask and Forces)
         input_tensor = build_input_tensor(current_density, resolution)
@@ -50,8 +50,8 @@ def extract_discrete_actions(
         # Channel 0: Add (Not used in SIMP usually)
         # Channel 1: Remove
         
-        current_bin = (current_density > 0.5).astype(np.int8)
-        future_bin = (future_density > 0.5).astype(np.int8)
+        current_bin = (current_frame['binary_map'] > 0.5).astype(np.int8)
+        future_bin = (future_frame['binary_map'] > 0.5).astype(np.int8)
         
         # Removal: Existed (1) AND Removed (0)
         removal_mask = (current_bin == 1) & (future_bin == 0)
@@ -65,8 +65,9 @@ def extract_discrete_actions(
         target_policy[1] = removal_mask
         
         # If no change, skip
-        if np.sum(removal_mask) == 0 and np.sum(addition_mask) == 0:
-            continue
+        # DISABLED for visualization purposes: We want to see every step even if binary mask is static
+        # if np.sum(removal_mask) == 0 and np.sum(addition_mask) == 0:
+        #     continue
             
         training_samples.append({
             "step": current_frame['step'],

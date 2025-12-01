@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { motion } from 'framer-motion';
-import { Database, HardDrive, FileText, Download, RefreshCw } from 'lucide-react';
+import { Database, Download, RefreshCw } from 'lucide-react';
 
 interface Dataset {
     id: string;
@@ -21,7 +21,7 @@ const MOCK_DATASETS: Dataset[] = [
 ];
 
 export const DataLake = () => {
-    const [datasets, setDatasets] = useState(MOCK_DATASETS);
+    const [datasets] = useState(MOCK_DATASETS);
 
     return (
         <div className="max-w-7xl mx-auto">
@@ -73,8 +73,8 @@ export const DataLake = () => {
                                 <td className="p-6 font-mono text-white/60">{ds.episodes.toLocaleString()}</td>
                                 <td className="p-6">
                                     <span className={`text-xs font-bold px-2 py-1 rounded border ${ds.status === 'READY' ? 'bg-green-500/10 border-green-500/20 text-green-400' :
-                                            ds.status === 'PROCESSING' ? 'bg-cyan/10 border-cyan/20 text-cyan animate-pulse' :
-                                                'bg-white/5 border-white/10 text-white/40'
+                                        ds.status === 'PROCESSING' ? 'bg-cyan/10 border-cyan/20 text-cyan animate-pulse' :
+                                            'bg-white/5 border-white/10 text-white/40'
                                         }`}>
                                         {ds.status === 'READY' ? 'PRONTO' : ds.status === 'PROCESSING' ? 'PROCESSANDO' : 'ARQUIVADO'}
                                     </span>

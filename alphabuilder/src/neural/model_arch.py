@@ -44,7 +44,8 @@ class AlphaBuilderSwinUNETR(nn.Module):
             out_channels=out_channels,
             feature_size=feature_size,
             use_checkpoint=use_checkpoint,
-            spatial_dims=3
+            spatial_dims=3,
+            norm_name="instance"
         )
         
         # 2. Hook to capture Bottleneck Features (Block C)

@@ -19,7 +19,7 @@ export interface GameState {
     fitness_score: number;
     valid_fem: boolean;
     metadata: SimulationMetrics;
-    policy_heatmap?: Float32Array; // Optional: Flattened 3D array for visualization
+    policy_heatmap?: { add: Float32Array, remove: Float32Array }; // Optional: Flattened 3D arrays
     value_confidence?: number; // 0.0 - 1.0
 }
 

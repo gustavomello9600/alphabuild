@@ -1,4 +1,4 @@
-import { Save, Monitor, Globe, Server } from 'lucide-react';
+import { Save, Monitor, Server } from 'lucide-react';
 
 export const Settings = () => {
     return (

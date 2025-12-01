@@ -195,9 +195,8 @@ def thicken_backbone(
     for d, h, w in backbone_coords:
         grid[d, h, w] = True
         
-    # Randomize iterations for data augmentation (1 to 2)
-    # As per expert directive
-    iterations = np.random.randint(1, 3)
+    # Use provided thickness
+    iterations = thickness
     
     # Apply 3D binary dilation
     # structure=None uses default 3x3x3 connectivity

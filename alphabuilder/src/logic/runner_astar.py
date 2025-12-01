@@ -39,10 +39,12 @@ def run_episode_astar(
     tensor = np.zeros((5, D, H, W), dtype=np.float32)
     
     # Set BCs (Left Wall Support - entire left face)
-    tensor[1, :, :, 0] = 1.0
+    # Fix x=0 (d=0)
+    tensor[1, 0, :, :] = 1.0
     
     # Set Load (Tip - center of right edge)
-    tensor[3, D//2, H//2, W-1] = -1.0
+    # Load at x=L (d=D-1), y=mid, z=mid
+    tensor[3, D-1, H//2, W//2] = -1.0
     
     # PHASE 1: Build Connectivity Backbone with A*
     print("Phase 1: Building connectivity with A*...")
@@ -57,6 +59,8 @@ def run_episode_astar(
     support_coords = extract_support_points(tensor)
     
     print(f"  Found {len(load_coords)} load points, {len(support_coords)} support points")
+    print(f"  DEBUG: Load Points: {load_coords}")
+    print(f"  DEBUG: Support Points (first 5): {support_coords[:5]}")
     
     # Build backbone
     backbone_coords = build_connectivity_backbone(
@@ -65,7 +69,7 @@ def run_episode_astar(
     
     # Thicken the backbone for structural robustness
     from .astar_pathfinder import thicken_backbone
-    thickened_coords = thicken_backbone(backbone_coords, (D, H, W), thickness=2)
+    thickened_coords = thicken_backbone(backbone_coords, (D, H, W), thickness=4)
     
     # Apply to tensor
     for d, h, w in thickened_coords:
@@ -74,6 +78,13 @@ def run_episode_astar(
     volume_fraction = len(thickened_coords) / (D * H * W)
     print(f"  Built backbone with {len(backbone_coords)} voxels (thin)")
     print(f"  Thickened to {len(thickened_coords)} voxels ({volume_fraction:.2%} volume)")
+    
+    # DEBUG: Check backbone Z-alignment
+    zs = [c[2] for c in thickened_coords]
+    print(f"  DEBUG: Backbone Z mean: {np.mean(zs):.2f}, min: {np.min(zs)}, max: {np.max(zs)}")
+    if len(zs) > 0:
+        from collections import Counter
+        print(f"  DEBUG: Backbone Z distribution: {dict(Counter(zs))}")
     
     # Create final state (Phase 2 ready)
     state = GameState(tensor=tensor, phase='REFINEMENT', step_count=0)

@@ -46,7 +46,7 @@ export const Dashboard = () => {
     const [projects, setProjects] = useState<Project[]>([]);
 
     useEffect(() => {
-        setProjects(mockService.getProjects());
+        mockService.getProjects().then(setProjects);
     }, []);
 
     return (
