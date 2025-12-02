@@ -21,6 +21,7 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime
 import gc
+from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any
 import scipy.ndimage
 
@@ -32,10 +33,6 @@ from alphabuilder.src.core.physics_model import (
     initialize_cantilever_context,
     PhysicalProperties
 )
-from alphabuilder.src.logic.simp_generator import (
-    run_simp_optimization_3d, 
-    SIMPConfig
-)
 from alphabuilder.src.logic.storage import (
     initialize_database, 
     get_episode_count, 
@@ -46,7 +43,18 @@ from alphabuilder.src.logic.storage import (
     generate_episode_id
 )
 from alphabuilder.src.utils.logger import TrainingLogger
-from alphabuilder.src.core.tensor_utils import build_input_tensor
+
+
+# =========== SIMPConfig (moved from simp_generator) ===========
+@dataclass
+class SIMPConfig:
+    """Configuration for SIMP optimization via FEniTop."""
+    vol_frac: float = 0.15
+    max_iter: int = 120
+    r_min: float = 1.5
+    adaptive_penal: bool = True
+    load_config: Dict[str, Any] = None
+    debug_log_path: str = None
 
 # --- Constants for Value Normalization (Spec 4.2) ---
 # Estimated from typical compliance ranges (C ~ 10 to 10000)

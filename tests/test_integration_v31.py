@@ -548,8 +548,31 @@ class TestIntegrationV31:
         assert not torch.isinf(policy_pred).any(), "Policy contém Inf"
         
         print(f"✓ Inferência Fase 2: policy shape={policy_pred.shape}, value={value_pred.item():.4f}")
+    
+    # ==================== REPORT GENERATION ====================
+    
+    def test_16_generate_quality_report(self):
+        """Gera relatório completo de qualidade dos dados de treino."""
+        from tests.helpers.report_generator import generate_quality_report
+        
+        report_path = TEST_DB_PATH.parent / "quality_report.md"
+        
+        generated_path = generate_quality_report(
+            db_path=TEST_DB_PATH,
+            output_path=report_path
+        )
+        
+        assert Path(generated_path).exists(), f"Relatório deveria existir em {generated_path}"
+        
+        # Verifica conteúdo mínimo
+        content = Path(generated_path).read_text()
+        assert "# 📊 Relatório de Qualidade" in content, "Header do relatório não encontrado"
+        assert "Conformidade v3.1" in content, "Seção de conformidade não encontrada"
+        
+        print(f"\n✓ Relatório gerado: {generated_path}")
         print("\n" + "="*60)
         print("🎉 TODOS OS TESTES DE INTEGRAÇÃO v3.1 PASSARAM!")
+        print(f"📄 Relatório de qualidade salvo em: {report_path}")
         print("="*60)
 
 
