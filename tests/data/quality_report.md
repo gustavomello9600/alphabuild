@@ -1,6 +1,6 @@
 # 📊 Relatório de Qualidade de Dados de Treino
 
-**Gerado em:** 2025-12-02 01:46:03
+**Gerado em:** 2025-12-02 01:53:14
 **Banco de Dados:** `episodios_de_testes_de_integracao.db`
 
 ---
@@ -9,16 +9,17 @@
 
 | Métrica | Valor |
 |---------|-------|
-| Total de Registros | **50** |
-| Episódios Únicos | **1** |
+| Total de Registros | **106** |
+| Episódios Únicos | **2** |
 | Registros GROWTH (Fase 1) | 49 |
-| Registros REFINEMENT (Fase 2) | 1 |
+| Registros REFINEMENT (Fase 2) | 57 |
 
 ## 2. Análise por Episódio
 
 | Episode ID | Records | GROWTH | REFINEMENT | Avg Fitness | Min | Max |
 |------------|---------|--------|------------|-------------|-----|-----|
-| `ec5d6d12...` | 50 | 49 | 1 | -0.9720 | -0.9727 | -0.9385 |
+| `2b9f5ead...` | 80 | 49 | 31 | -0.9647 | -0.9919 | -0.9385 |
+| `2c322f9b...` | 26 | 0 | 26 | -0.9597 | -0.9836 | -0.9461 |
 
 ## 3. Análise de Tensores
 
@@ -54,19 +55,19 @@
 
 | Estatística | Valor |
 |-------------|-------|
-| Mínimo | -0.972712 |
+| Mínimo | -0.991854 |
 | Máximo | -0.938510 |
-| Média | -0.972028 |
-| Mediana | -0.972712 |
-| Desvio Padrão | 0.004788 |
-| Percentil 25 | -0.972712 |
-| Percentil 75 | -0.972712 |
+| Média | -0.963461 |
+| Mediana | -0.957936 |
+| Desvio Padrão | 0.010996 |
+| Percentil 25 | -0.972978 |
+| Percentil 75 | -0.957936 |
 
 ### 4.2 Distribuição por Faixa
 
 | Faixa | Contagem | Percentual |
 |-------|----------|------------|
-| [-1.1, -0.5) | 50 | 100.0% |
+| [-1.1, -0.5) | 106 | 100.0% |
 | [-0.5, 0.0) | 0 | 0.0% |
 | [0.0, 0.5) | 0 | 0.0% |
 | [0.5, 1.1) | 0 | 0.0% |
@@ -75,8 +76,8 @@
 
 | Fase | Count | Avg | Min | Max |
 |------|-------|-----|-----|-----|
-| GROWTH | 49 | -0.9727 | -0.9727 | -0.9727 |
-| REFINEMENT | 1 | -0.9385 | -0.9385 | -0.9385 |
+| GROWTH | 49 | -0.9579 | -0.9579 | -0.9579 |
+| REFINEMENT | 57 | -0.9682 | -0.9919 | -0.9385 |
 
 ## 5. Análise de Policy Targets
 
@@ -84,21 +85,21 @@
 
 | Métrica | Canal ADD | Canal REMOVE |
 |---------|-----------|--------------|
-| Média % Positivos | 14.29% | 1.21% |
-| Mediana % Positivos | 13.43% | 0.00% |
-| Max % Positivos | 32.91% | 60.55% |
+| Média % Positivos | 21.08% | 14.69% |
+| Mediana % Positivos | 24.10% | 8.86% |
+| Max % Positivos | 55.08% | 88.87% |
 
 ### 5.2 Recomendação de pos_weight (BCEWithLogitsLoss)
 
 | Canal | pos_weight Recomendado |
 |-------|------------------------|
-| ADD | **6.0** |
-| REMOVE | **15.0** |
+| ADD | **3.7** |
+| REMOVE | **5.8** |
 
 ### 5.3 Balanceamento por Fase
 
 **GROWTH (Fase 1):** ADD médio = 14.58%
-**REFINEMENT (Fase 2):** ADD médio = 0.00%
+**REFINEMENT (Fase 2):** ADD médio = 26.67%
 
 ## 6. Análise de Metadados
 
@@ -106,28 +107,29 @@
 
 | BC Type | Contagem | Percentual |
 |---------|----------|------------|
-| RAIL_XY | 50 | 100.0% |
+| RAIL_XY | 80 | 75.5% |
+| FULL_CLAMP | 26 | 24.5% |
 
 ### 6.2 Estratégias de Geração
 
 | Estratégia | Contagem | Percentual |
 |------------|----------|------------|
-| unknown | 50 | 100.0% |
+| unknown | 106 | 100.0% |
 
 ## 7. Amostras Aleatórias
 
 | # | Episode | Step | Phase | Fitness | BC Type |
 |---|---------|------|-------|---------|---------|
-| 1 | `ec5d6d12...` | 28 | GROWTH | -0.9727 | RAIL_XY |
-| 2 | `ec5d6d12...` | 27 | GROWTH | -0.9727 | RAIL_XY |
-| 3 | `ec5d6d12...` | 33 | GROWTH | -0.9727 | RAIL_XY |
-| 4 | `ec5d6d12...` | 10 | GROWTH | -0.9727 | RAIL_XY |
-| 5 | `ec5d6d12...` | 22 | GROWTH | -0.9727 | RAIL_XY |
-| 6 | `ec5d6d12...` | 34 | GROWTH | -0.9727 | RAIL_XY |
-| 7 | `ec5d6d12...` | 3 | GROWTH | -0.9727 | RAIL_XY |
-| 8 | `ec5d6d12...` | 26 | GROWTH | -0.9727 | RAIL_XY |
-| 9 | `ec5d6d12...` | 46 | GROWTH | -0.9727 | RAIL_XY |
-| 10 | `ec5d6d12...` | 31 | GROWTH | -0.9727 | RAIL_XY |
+| 1 | `2c322f9b...` | 24 | REFINEMENT | -0.9471 | FULL_CLAMP |
+| 2 | `2b9f5ead...` | 76 | REFINEMENT | -0.9890 | RAIL_XY |
+| 3 | `2b9f5ead...` | 70 | REFINEMENT | -0.9763 | RAIL_XY |
+| 4 | `2b9f5ead...` | 62 | REFINEMENT | -0.9820 | RAIL_XY |
+| 5 | `2b9f5ead...` | 71 | REFINEMENT | -0.9755 | RAIL_XY |
+| 6 | `2b9f5ead...` | 72 | REFINEMENT | -0.9746 | RAIL_XY |
+| 7 | `2b9f5ead...` | 53 | REFINEMENT | -0.9615 | RAIL_XY |
+| 8 | `2b9f5ead...` | 59 | REFINEMENT | -0.9841 | RAIL_XY |
+| 9 | `2b9f5ead...` | 21 | GROWTH | -0.9579 | RAIL_XY |
+| 10 | `2b9f5ead...` | 34 | GROWTH | -0.9579 | RAIL_XY |
 
 ## 8. Validação de Conformidade v3.1
 

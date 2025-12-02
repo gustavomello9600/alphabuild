@@ -16,7 +16,7 @@ def generate_test_episode(
     resolution: tuple,
     strategy: str,
     seed: int,
-    max_iter: int = 30  # Reduzido para testes rápidos
+    max_iter: int = 60  # Aumentado para ter dados de REFINEMENT suficientes
 ) -> str:
     """
     Gera um episódio de teste e salva no banco de dados.
