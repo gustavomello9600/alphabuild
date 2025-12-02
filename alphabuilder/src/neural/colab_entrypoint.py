@@ -42,26 +42,35 @@ def install_dependencies():
     )
     print("✓ Dependências Python instaladas")
     
-    # Instalação do FEniCSx via fem-on-colab
-    print("\n📦 Instalando FEniCSx via fem-on-colab...")
+    # Instalação do FEniCSx
+    print("\n📦 Verificando FEniCSx...")
     try:
         import dolfinx
         print(f"✓ FEniCSx já instalado: {dolfinx.__version__}")
     except ImportError:
-        try:
-            # Tenta instalar via fem-on-colab (para Google Colab)
-            subprocess.run(
-                'wget -q "https://fem-on-colab.github.io/releases/fenicsx-install-real.sh" '
-                '-O "/tmp/fenicsx-install.sh" && bash "/tmp/fenicsx-install.sh"',
-                shell=True, check=True
-            )
-            import dolfinx
-            print(f"✓ FEniCSx instalado: {dolfinx.__version__}")
-        except Exception as e:
-            print(f"⚠️  FEniCSx não instalado: {e}")
-            print("   Para geração de dados, instale manualmente:")
-            print("   - Colab: Use fem-on-colab")
-            print("   - Local: conda install -c conda-forge fenics-dolfinx")
+        print("⚠️  FEniCSx não encontrado.")
+        print("\n   Para instalar FEniCSx:")
+        print("   ─────────────────────────────────────────────")
+        print("   📌 Google Colab:")
+        print("      Execute em uma célula antes deste script:")
+        print("      ```")
+        print("      try:")
+        print("          import dolfinx")
+        print("      except ImportError:")
+        print("          !wget 'https://fem-on-colab.github.io/releases/fenicsx-install-real.sh' -O /tmp/fenicsx-install.sh")
+        print("          !bash /tmp/fenicsx-install.sh")
+        print("      ```")
+        print("")
+        print("   📌 Kaggle:")
+        print("      FEniCSx não é suportado nativamente no Kaggle.")
+        print("      Use apenas para treino (dados pré-gerados).")
+        print("")
+        print("   📌 Local (Conda):")
+        print("      conda install -c conda-forge fenics-dolfinx mpich mpi4py")
+        print("   ─────────────────────────────────────────────")
+        print("")
+        print("   ℹ️  FEniCSx é necessário APENAS para geração de dados.")
+        print("      O treino da rede neural funciona sem ele.")
 
 
 def check_gpu():
