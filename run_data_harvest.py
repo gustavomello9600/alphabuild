@@ -763,7 +763,7 @@ def main():
         
         bc_type_episode = load_config.get('bc_type', 'FULL_CLAMP')
         if is_main_rank:
-            print(f"Episode {i}: Strategy={strategy}, Target V={target_vol:.3f}, BC={bc_type_episode}")
+            print(f"Episode {i}: Strategy={strategy}, Target V={target_vol:.3f}, BC={bc_type_episode}", flush=True)
 
         simp_config = SIMPConfig(
             vol_frac=target_vol,
