@@ -48,29 +48,45 @@ def install_dependencies():
         import dolfinx
         print(f"✓ FEniCSx já instalado: {dolfinx.__version__}")
     except ImportError:
-        print("⚠️  FEniCSx não encontrado.")
-        print("\n   Para instalar FEniCSx:")
-        print("   ─────────────────────────────────────────────")
-        print("   📌 Google Colab:")
-        print("      Execute em uma célula antes deste script:")
-        print("      ```")
-        print("      try:")
-        print("          import dolfinx")
-        print("      except ImportError:")
-        print("          !wget 'https://fem-on-colab.github.io/releases/fenicsx-install-real.sh' -O /tmp/fenicsx-install.sh")
-        print("          !bash /tmp/fenicsx-install.sh")
-        print("      ```")
-        print("")
-        print("   📌 Kaggle:")
-        print("      FEniCSx não é suportado nativamente no Kaggle.")
-        print("      Use apenas para treino (dados pré-gerados).")
-        print("")
-        print("   📌 Local (Conda):")
-        print("      conda install -c conda-forge fenics-dolfinx mpich mpi4py")
-        print("   ─────────────────────────────────────────────")
-        print("")
-        print("   ℹ️  FEniCSx é necessário APENAS para geração de dados.")
-        print("      O treino da rede neural funciona sem ele.")
+        print("⚠️  FEniCSx não encontrado. Tentando instalar...")
+        
+        # Detecta se está no Colab
+        try:
+            import google.colab
+            is_colab = True
+        except ImportError:
+            is_colab = False
+        
+        if is_colab:
+            print("   Detectado: Google Colab")
+            print("   Instalando via fem-on-colab (pode levar alguns minutos)...")
+            try:
+                # URL correto do fem-on-colab
+                install_cmd = (
+                    'wget -q "https://fem-on-colab.github.io/releases/fenicsx-install-release-real.sh" '
+                    '-O "/tmp/fenicsx-install.sh" && bash "/tmp/fenicsx-install.sh"'
+                )
+                result = subprocess.run(install_cmd, shell=True, capture_output=True, text=True)
+                
+                if result.returncode == 0:
+                    # Recarrega módulos
+                    import importlib
+                    import dolfinx
+                    print(f"✓ FEniCSx instalado: {dolfinx.__version__}")
+                else:
+                    print(f"✗ Falha na instalação: {result.stderr[:200]}")
+                    print("   Tente reiniciar o runtime do Colab e executar novamente.")
+            except Exception as e:
+                print(f"✗ Erro: {e}")
+        else:
+            print("   Não está no Google Colab.")
+            print("\n   Para instalar FEniCSx:")
+            print("   ─────────────────────────────────────────────")
+            print("   📌 Kaggle: Não suportado (use dados pré-gerados)")
+            print("   📌 Local:  conda install -c conda-forge fenics-dolfinx mpich mpi4py")
+            print("   ─────────────────────────────────────────────")
+            print("\n   ℹ️  FEniCSx é necessário APENAS para geração de dados.")
+            print("      O treino da rede neural funciona sem ele.")
 
 
 def check_gpu():
