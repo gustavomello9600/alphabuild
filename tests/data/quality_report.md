@@ -1,6 +1,6 @@
 # 📊 Relatório de Qualidade de Dados de Treino
 
-**Gerado em:** 2025-12-02 01:53:14
+**Gerado em:** 2025-12-02 02:14:54
 **Banco de Dados:** `episodios_de_testes_de_integracao.db`
 
 ---
@@ -18,8 +18,8 @@
 
 | Episode ID | Records | GROWTH | REFINEMENT | Avg Fitness | Min | Max |
 |------------|---------|--------|------------|-------------|-----|-----|
-| `2b9f5ead...` | 80 | 49 | 31 | -0.9647 | -0.9919 | -0.9385 |
-| `2c322f9b...` | 26 | 0 | 26 | -0.9597 | -0.9836 | -0.9461 |
+| `49897627...` | 80 | 49 | 31 | -0.9647 | -0.9919 | -0.9385 |
+| `54e10628...` | 26 | 0 | 26 | -0.9597 | -0.9836 | -0.9461 |
 
 ## 3. Análise de Tensores
 
@@ -120,16 +120,16 @@
 
 | # | Episode | Step | Phase | Fitness | BC Type |
 |---|---------|------|-------|---------|---------|
-| 1 | `2c322f9b...` | 24 | REFINEMENT | -0.9471 | FULL_CLAMP |
-| 2 | `2b9f5ead...` | 76 | REFINEMENT | -0.9890 | RAIL_XY |
-| 3 | `2b9f5ead...` | 70 | REFINEMENT | -0.9763 | RAIL_XY |
-| 4 | `2b9f5ead...` | 62 | REFINEMENT | -0.9820 | RAIL_XY |
-| 5 | `2b9f5ead...` | 71 | REFINEMENT | -0.9755 | RAIL_XY |
-| 6 | `2b9f5ead...` | 72 | REFINEMENT | -0.9746 | RAIL_XY |
-| 7 | `2b9f5ead...` | 53 | REFINEMENT | -0.9615 | RAIL_XY |
-| 8 | `2b9f5ead...` | 59 | REFINEMENT | -0.9841 | RAIL_XY |
-| 9 | `2b9f5ead...` | 21 | GROWTH | -0.9579 | RAIL_XY |
-| 10 | `2b9f5ead...` | 34 | GROWTH | -0.9579 | RAIL_XY |
+| 1 | `54e10628...` | 11 | REFINEMENT | -0.9590 | FULL_CLAMP |
+| 2 | `54e10628...` | 2 | REFINEMENT | -0.9750 | FULL_CLAMP |
+| 3 | `49897627...` | 61 | REFINEMENT | -0.9827 | RAIL_XY |
+| 4 | `54e10628...` | 9 | REFINEMENT | -0.9613 | FULL_CLAMP |
+| 5 | `49897627...` | 40 | GROWTH | -0.9579 | RAIL_XY |
+| 6 | `49897627...` | 23 | GROWTH | -0.9579 | RAIL_XY |
+| 7 | `49897627...` | 29 | GROWTH | -0.9579 | RAIL_XY |
+| 8 | `49897627...` | 26 | GROWTH | -0.9579 | RAIL_XY |
+| 9 | `54e10628...` | 16 | REFINEMENT | -0.9547 | FULL_CLAMP |
+| 10 | `49897627...` | 2 | GROWTH | -0.9579 | RAIL_XY |
 
 ## 8. Validação de Conformidade v3.1
 

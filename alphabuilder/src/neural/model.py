@@ -70,8 +70,9 @@ class AlphaBuilderV31(nn.Module):
         
         # Bottleneck dimension (deepest representation)
         if self.use_swin:
-            # SwinUNETR: bottleneck is 8x feature_size after 4 stages
-            self.bottleneck_dim = feature_size * 8  # 192 for feature_size=24
+            # SwinUNETR: bottleneck is 16x feature_size after 4 stages (768 for feature_size=48)
+            # MONAI SwinTransformer returns hidden_states[4] with 16x embed_dim
+            self.bottleneck_dim = feature_size * 16  # 384 for feature_size=24
         else:
             # SimpleBackbone: bottleneck is 4x feature_size
             self.bottleneck_dim = feature_size * 4  # 96 for feature_size=24
@@ -121,6 +122,8 @@ class AlphaBuilderV31(nn.Module):
         else:
             x, pad_sizes = self._dynamic_pad(x, divisor=2)
         
+        padded_size = x.shape[2:]  # (D, H, W) after padding
+        
         # Encoder: extract hierarchical features + bottleneck
         skip_features, bottleneck = self.encoder(x)
         
@@ -128,7 +131,10 @@ class AlphaBuilderV31(nn.Module):
         value = self.value_head(bottleneck)
         
         # POLICY DECODER: from bottleneck with skip connections
-        policy = self.policy_decoder(bottleneck, skip_features)
+        if self.use_swin:
+            policy = self.policy_decoder(bottleneck, skip_features, padded_size)
+        else:
+            policy = self.policy_decoder(bottleneck, skip_features)
         
         # Crop back to original size
         policy = self._dynamic_crop(policy, original_size)
@@ -258,8 +264,15 @@ class SwinPolicyDecoder(nn.Module):
     def __init__(self, feature_size: int, out_channels: int):
         super().__init__()
         
+        # Projection layer: bottleneck 16C → 8C (to match decoder expectation)
+        self.bottleneck_proj = nn.Sequential(
+            nn.Conv3d(feature_size * 16, feature_size * 8, kernel_size=1),
+            nn.InstanceNorm3d(feature_size * 8),
+            nn.ReLU(inplace=True)
+        )
+        
         # Decoder blocks with upsampling
-        # bottleneck: 8C → 4C
+        # bottleneck (after proj): 8C → 4C
         self.decoder4 = DecoderBlock(feature_size * 8, feature_size * 4, feature_size * 8)
         # 4C → 2C
         self.decoder3 = DecoderBlock(feature_size * 4, feature_size * 2, feature_size * 4)
@@ -276,19 +289,35 @@ class SwinPolicyDecoder(nn.Module):
             nn.Conv3d(feature_size, out_channels, kernel_size=1)
         )
     
-    def forward(self, bottleneck: torch.Tensor, skip_features: List[torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self, 
+        bottleneck: torch.Tensor, 
+        skip_features: List[torch.Tensor],
+        original_padded_size: Tuple[int, int, int] = None
+    ) -> torch.Tensor:
         """
         Args:
-            bottleneck: (B, 8C, D/16, H/16, W/16)
+            bottleneck: (B, 16C, D/16, H/16, W/16) from SwinTransformer
             skip_features: [enc1, enc2, enc3, enc4] at different resolutions
+            original_padded_size: Target output size (D, H, W) before cropping
         """
         enc1, enc2, enc3, enc4 = skip_features
         
+        # Project bottleneck from 16C to 8C
+        x = self.bottleneck_proj(bottleneck)  # → (B, 8C, D/16, H/16, W/16)
+        
         # Upsample path with skip connections
-        x = self.decoder4(bottleneck, enc4)  # → (B, 4C, D/8, H/8, W/8)
-        x = self.decoder3(x, enc3)           # → (B, 2C, D/4, H/4, W/4)
-        x = self.decoder2(x, enc2)           # → (B, C, D/2, H/2, W/2)
-        x = self.decoder1(x, enc1)           # → (B, C, D, H, W)
+        x = self.decoder4(x, enc4)            # → (B, 4C, D/8, H/8, W/8)
+        x = self.decoder3(x, enc3)            # → (B, 2C, D/4, H/4, W/4)
+        x = self.decoder2(x, enc2)            # → (B, C, D/2, H/2, W/2)
+        x = self.decoder1(x, enc1)            # → (B, C, D/2, H/2, W/2) (enc1 is half res)
+        
+        # Final upsample to full resolution
+        if original_padded_size is not None:
+            x = F.interpolate(x, size=original_padded_size, mode='trilinear', align_corners=False)
+        else:
+            # Fallback: upsample 2x
+            x = F.interpolate(x, scale_factor=2, mode='trilinear', align_corners=False)
         
         # Final projection to policy logits
         policy = self.out(x)  # → (B, 2, D, H, W)
