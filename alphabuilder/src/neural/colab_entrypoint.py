@@ -27,6 +27,7 @@ def install_dependencies():
     print("📦 Instalando dependências para AlphaBuilder v3.1...")
     print("=" * 60)
     
+    # Dependências Python básicas
     packages = [
         "torch",
         "monai>=1.0.0",
@@ -40,6 +41,27 @@ def install_dependencies():
         [sys.executable, "-m", "pip", "install", "-q"] + packages
     )
     print("✓ Dependências Python instaladas")
+    
+    # Instalação do FEniCSx via fem-on-colab
+    print("\n📦 Instalando FEniCSx via fem-on-colab...")
+    try:
+        import dolfinx
+        print(f"✓ FEniCSx já instalado: {dolfinx.__version__}")
+    except ImportError:
+        try:
+            # Tenta instalar via fem-on-colab (para Google Colab)
+            subprocess.run(
+                'wget -q "https://fem-on-colab.github.io/releases/fenicsx-install-real.sh" '
+                '-O "/tmp/fenicsx-install.sh" && bash "/tmp/fenicsx-install.sh"',
+                shell=True, check=True
+            )
+            import dolfinx
+            print(f"✓ FEniCSx instalado: {dolfinx.__version__}")
+        except Exception as e:
+            print(f"⚠️  FEniCSx não instalado: {e}")
+            print("   Para geração de dados, instale manualmente:")
+            print("   - Colab: Use fem-on-colab")
+            print("   - Local: conda install -c conda-forge fenics-dolfinx")
 
 
 def check_gpu():
