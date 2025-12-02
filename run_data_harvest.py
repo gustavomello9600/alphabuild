@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Data Harvest Script for AlphaBuilder v2.0 (The Data Factory).
+Data Harvest Script for AlphaBuilder v3.1 (The Data Factory).
 
-Implements the v2.0 Specification:
+Implements the v3.1 Specification:
 1. Generator v2 (Bézier + Rectangular Sections) for Phase 1 Ground Truth.
 2. 50-Step Slicing for Phase 1 Training Data.
 3. SIMP Optimization for Phase 2 Ground Truth and Training Data.
 4. Instance Normalization compatible data structures.
+5. Log-Squash Value Normalization (Spec 4.2).
+6. Variable Boundary Conditions (full clamp, roller, rail).
+7. 7-Channel Input Tensor with separate BC masks.
 """
 
 import sys
@@ -44,6 +47,146 @@ from alphabuilder.src.logic.storage import (
 )
 from alphabuilder.src.utils.logger import TrainingLogger
 from alphabuilder.src.core.tensor_utils import build_input_tensor
+
+# --- Constants for Value Normalization (Spec 4.2) ---
+# Estimated from typical compliance ranges (C ~ 10 to 10000)
+# S_raw = -log(C + ε) - α·Vol, where α controls volume penalty
+LOG_SQUASH_ALPHA = 0.5   # Volume penalty coefficient
+LOG_SQUASH_MU = -4.0     # Estimated mean of log(C) distribution
+LOG_SQUASH_SIGMA = 2.0   # Estimated std of log(C) distribution
+LOG_SQUASH_EPSILON = 1e-9
+
+# --- Policy Quality Settings (v3.1 Quality Improvements) ---
+# These settings address identified issues with policy target quality
+
+# Window size for REFINEMENT phase (compare t with t+k)
+# Larger window creates more significant differences, clearer learning signal
+REFINEMENT_WINDOW_SIZE = 5  # Compare frames 5 steps apart
+
+# Sliding step (how much to advance the window each iteration)
+# 1 = sliding window (t→t+5, t+1→t+6, t+2→t+7, ...) - more records
+# 5 = jumping window (t→t+5, t+5→t+10, ...) - fewer records
+REFINEMENT_SLIDE_STEP = 1  # Default: 1 (sliding window for more data)
+
+# Binarization settings for REFINEMENT targets
+# Converts continuous density differences to binary masks
+BINARIZE_REFINEMENT_TARGETS = True
+BINARIZE_THRESHOLD = 0.005  # Absolute threshold for significant change
+BINARIZE_PERCENTILE = 90    # Alternative: use top N% of changes
+
+# Target normalization: scale ADD/REMOVE to comparable magnitudes
+NORMALIZE_TARGETS = True
+
+def compute_normalized_value(compliance: float, vol_frac: float) -> float:
+    """
+    Compute normalized value score using Log-Squash formula (Spec 4.2).
+    
+    Formula:
+        S_raw = -log(C + ε) - α·Vol
+        Target_Value = tanh((S_raw - μ) / σ)
+    
+    Maps:
+        - Bad structures (high C) → ~-1
+        - Good structures (low C, low V) → ~+1
+    """
+    s_raw = -np.log(compliance + LOG_SQUASH_EPSILON) - LOG_SQUASH_ALPHA * vol_frac
+    normalized = np.tanh((s_raw - LOG_SQUASH_MU) / LOG_SQUASH_SIGMA)
+    return float(normalized)
+
+# --- Boundary Condition Types (Spec 2.1) ---
+# Note: ROLLER_X removed - it's physically invalid for vertical loads
+# (no Y-constraint means the structure would fall under -Y load)
+BC_TYPES = ['FULL_CLAMP', 'RAIL_XY']
+
+def binarize_policy_target(target: np.ndarray, method: str = 'threshold') -> np.ndarray:
+    """
+    Convert continuous density difference to binary mask.
+    
+    Methods:
+        - 'threshold': Use fixed threshold (BINARIZE_THRESHOLD)
+        - 'percentile': Use top percentile of non-zero values
+        - 'adaptive': Combine threshold + ensure minimum signal
+    
+    Args:
+        target: Continuous target array (density differences)
+        method: Binarization method
+    
+    Returns:
+        Binary mask (0.0 or 1.0)
+    """
+    if not BINARIZE_REFINEMENT_TARGETS:
+        return target
+    
+    if method == 'threshold':
+        # Simple threshold: anything above threshold becomes 1
+        binary = (np.abs(target) > BINARIZE_THRESHOLD).astype(np.float32)
+        
+    elif method == 'percentile':
+        # Use top percentile of values
+        abs_target = np.abs(target)
+        nonzero = abs_target[abs_target > 1e-6]
+        if len(nonzero) > 0:
+            thresh = np.percentile(nonzero, BINARIZE_PERCENTILE)
+            binary = (abs_target >= thresh).astype(np.float32)
+        else:
+            binary = np.zeros_like(target)
+            
+    elif method == 'adaptive':
+        # Combine: threshold + ensure at least some signal
+        abs_target = np.abs(target)
+        
+        # First, apply threshold
+        binary = (abs_target > BINARIZE_THRESHOLD).astype(np.float32)
+        
+        # If too few voxels, lower threshold adaptively
+        if np.sum(binary) < 10:
+            nonzero = abs_target[abs_target > 1e-6]
+            if len(nonzero) > 0:
+                # Use 80th percentile of non-zero values
+                adaptive_thresh = np.percentile(nonzero, 80)
+                binary = (abs_target >= adaptive_thresh).astype(np.float32)
+    else:
+        binary = target
+    
+    # Apply sign from original target (for separate ADD/REMOVE)
+    return binary
+
+
+def generate_bc_masks(resolution: tuple, bc_type: str) -> tuple:
+    """
+    Generate support masks based on boundary condition type.
+    
+    BC Types:
+        - FULL_CLAMP: All DOFs fixed at X=0 (mask_x=1, mask_y=1, mask_z=1)
+        - ROLLER_X: Only X fixed at X=0 (mask_x=1, mask_y=0, mask_z=0)
+        - RAIL_XY: X and Y fixed at X=0 (mask_x=1, mask_y=1, mask_z=0)
+    
+    Returns:
+        (mask_x, mask_y, mask_z) - each shape (nx, ny, nz)
+    """
+    nx, ny, nz = resolution
+    mask_x = np.zeros(resolution, dtype=np.float32)
+    mask_y = np.zeros(resolution, dtype=np.float32)
+    mask_z = np.zeros(resolution, dtype=np.float32)
+    
+    if bc_type == 'FULL_CLAMP':
+        # All DOFs fixed at X=0 (full cantilever)
+        mask_x[0, :, :] = 1.0
+        mask_y[0, :, :] = 1.0
+        mask_z[0, :, :] = 1.0
+    elif bc_type == 'RAIL_XY':
+        # X and Y fixed at X=0 (allows Z sliding - "rail" constraint)
+        # Physically valid: resists vertical load, allows thermal expansion in Z
+        mask_x[0, :, :] = 1.0
+        mask_y[0, :, :] = 1.0
+        # mask_z remains zero
+    else:
+        # Default to full clamp
+        mask_x[0, :, :] = 1.0
+        mask_y[0, :, :] = 1.0
+        mask_z[0, :, :] = 1.0
+    
+    return mask_x, mask_y, mask_z
 
 # --- FEniTop Integration (Based on fenitop/scripts/beam_3d.py) ---
 from alphabuilder.src.logic.fenitop.topopt import topopt
@@ -498,11 +641,13 @@ def generate_phase1_slices(
 
 def generate_random_load_config(resolution):
     """
-    Generate load configuration for cantilever beam.
+    Generate load configuration for cantilever beam (v3.1).
     
     Load is applied as surface traction at X=nx (free end face),
     similar to beam_3d.py from FEniTop. The load region is a 
     centered patch on the free end face.
+    
+    Also generates a random BC type for dataset diversity (Spec 2.1).
     """
     nx, ny, nz = resolution
     
@@ -522,11 +667,21 @@ def generate_random_load_config(resolution):
     load_z_start = load_z_center - half_width
     load_z_end = load_z_center + half_width
     
+    # Random BC type for dataset diversity (Spec 2.1)
+    # Weighted distribution: 70% full clamp, 30% rail
+    # Note: ROLLER_X removed (physically invalid for vertical loads)
+    bc_roll = random.random()
+    if bc_roll < 0.70:
+        bc_type = 'FULL_CLAMP'
+    else:
+        bc_type = 'RAIL_XY'
+    
     return {
         'x': load_x,
         'y': load_y,
         'z_start': load_z_start,
         'z_end': load_z_end,
+        'bc_type': bc_type,
         # Magnitude now handled by FEniTop config (-2.0 as in beam_3d.py)
     }
 
@@ -598,8 +753,9 @@ def main():
         else:
             target_vol = 0.10
         
+        bc_type_episode = load_config.get('bc_type', 'FULL_CLAMP')
         if is_main_rank:
-            print(f"Episode {i}: Strategy={strategy}, Target V={target_vol:.3f}")
+            print(f"Episode {i}: Strategy={strategy}, Target V={target_vol:.3f}, BC={bc_type_episode}")
 
         simp_config = SIMPConfig(
             vol_frac=target_vol,
@@ -637,18 +793,10 @@ def main():
         # s_final_vol = np.mean(final_state['binary_map']) # FEniTop returns continuous density
         s_final_vol = final_state['vol_frac'] # Use the volume fraction from FEniTop
         
-        # Calculate Value Score (Tanh normalized)
-        # Formula: tanh( (-log(C) - alpha*V - mu) / sigma )
-        # We need constants. Let's use placeholders or raw compliance for now?
-        # The spec gives the formula but not the constants.
-        # Let's store raw compliance in metadata and a heuristic value in 'fitness_score'.
-        # Heuristic: 1 / (C * V + epsilon) normalized?
-        # Let's use a simple inversion for now: 10 / compliance (clamped)
-        # Or just use the formula with estimated constants.
-        # mu approx 2.0, sigma approx 1.0, alpha approx 0.0?
-        # Let's just use 1/Compliance for now as the 'fitness_score' field in DB expects float.
-        # The training loop can do the normalization.
-        s_final_value = 1.0 / (s_final_compliance + 1e-9)
+        # Calculate Value Score using Log-Squash normalization (Spec 4.2)
+        # Formula: S_raw = -log(C + ε) - α·Vol
+        #          Target_Value = tanh((S_raw - μ) / σ)
+        s_final_value = compute_normalized_value(s_final_compliance, s_final_vol)
         
         # 4. Check Connectivity of Final State
         # Helper for Connectivity Check
@@ -732,14 +880,21 @@ def main():
                 start_step = t
                 break
         
-        print(f"  Phase 2: Skipping first {start_step} steps (beta=1 phase), saving from step {start_step}")
+        # Use sliding window for REFINEMENT (v3.1 Quality)
+        # Compare t with t+window_size, advance by slide_step each iteration
+        window_size = REFINEMENT_WINDOW_SIZE
+        slide_step = REFINEMENT_SLIDE_STEP
         
-        for t in range(start_step, len(simp_history) - 1):
+        print(f"  Phase 2: Skipping first {start_step} steps (beta=1), window={window_size}, slide={slide_step}, binarize={BINARIZE_REFINEMENT_TARGETS}")
+        
+        # Generate records with sliding window (t → t+window_size)
+        record_idx = 0
+        for t in range(start_step, len(simp_history) - window_size, slide_step):
             current_frame = simp_history[t]
-            next_frame = simp_history[t+1]
+            future_frame = simp_history[t + window_size]  # Look window_size steps ahead
             
             curr_dens = current_frame['density_map']
-            next_dens = next_frame['density_map']
+            future_dens = future_frame['density_map']
             
             # Adaptive Thresholding (Smart Saving)
             # Find the highest threshold that maintains connectivity
@@ -761,24 +916,42 @@ def main():
             # Use the Connected Binary Mask as Input State
             input_state = best_binary
             
-            diff = curr_dens - next_dens
-            target_remove = np.maximum(0, diff)
-            target_add = np.maximum(0, -diff)
+            # Compute difference over window_size steps (larger signal!)
+            diff = curr_dens - future_dens
+            target_remove_raw = np.maximum(0, diff)
+            target_add_raw = np.maximum(0, -diff)
+            
+            # Apply binarization for cleaner learning signal (v3.1 Quality)
+            if BINARIZE_REFINEMENT_TARGETS:
+                target_add = binarize_policy_target(target_add_raw, method='adaptive')
+                target_remove = binarize_policy_target(target_remove_raw, method='adaptive')
+            else:
+                target_add = target_add_raw
+                target_remove = target_remove_raw
+            
+            # Compute normalized value using Log-Squash (Spec 4.2)
+            current_compliance = float(current_frame['compliance'])
+            current_vol = float(np.mean(curr_dens))
+            target_value = compute_normalized_value(current_compliance, current_vol)
             
             phase2_records.append({
                 "phase": Phase.REFINEMENT,
-                "step": len(phase1_records) + (t - start_step),  # Renumber from 0
+                "step": len(phase1_records) + record_idx,
                 "input_state": input_state,
                 "target_add": target_add,
                 "target_remove": target_remove,
-                "target_value": 1.0 / (float(current_frame['compliance']) + 1e-9),
+                "target_value": target_value,
                 "threshold": found_threshold,
                 "beta": current_frame.get('beta', 1),
-                "current_compliance": float(current_frame['compliance']),
-                "current_vol": float(np.mean(curr_dens))
+                "current_compliance": current_compliance,
+                "current_vol": current_vol
             })
+            record_idx += 1
             
         # 7. Save to DB
+        # Get BC type from load_config (v3.1)
+        bc_type = load_config.get('bc_type', 'FULL_CLAMP')
+        
         # Common function to save
         def save_batch(records, phase_enum, is_final_list=None):
             for idx, rec in enumerate(records):
@@ -791,13 +964,8 @@ def main():
                 # 5: Force Y
                 # 6: Force Z
                 
-                # Support Masks (full clamped wall at X=0)
-                mask_x = np.zeros(resolution, dtype=np.float32)
-                mask_y = np.zeros(resolution, dtype=np.float32)
-                mask_z = np.zeros(resolution, dtype=np.float32)
-                mask_x[0, :, :] = 1.0
-                mask_y[0, :, :] = 1.0
-                mask_z[0, :, :] = 1.0
+                # Support Masks based on BC type (v3.1)
+                mask_x, mask_y, mask_z = generate_bc_masks(resolution, bc_type)
                 
                 # Force Channels
                 fx = np.zeros(resolution, dtype=np.float32)
@@ -823,8 +991,12 @@ def main():
                 # Stack 7 channels
                 input_tensor = np.stack([density, mask_x, mask_y, mask_z, fx, fy, fz], axis=0)
                 
-                # Target Policy
-                policy_tensor = np.stack([rec['target_add'], rec['target_remove']], axis=0)
+                # Target Policy - use float32 for memory efficiency
+                # (float64 doubles VRAM usage unnecessarily for binary masks)
+                policy_tensor = np.stack([
+                    rec['target_add'].astype(np.float32), 
+                    rec['target_remove'].astype(np.float32)
+                ], axis=0)
                 
                 # Determine is_final_step and is_connected
                 is_final = is_final_list[idx] if is_final_list else False
@@ -846,6 +1018,7 @@ def main():
                         "compliance": rec.get('current_compliance', s_final_compliance),
                         "vol_frac": rec.get('current_vol', s_final_vol),
                         "load_config": load_config,
+                        "bc_type": bc_type,  # v3.1: BC type for augmentation
                         "phase": "GROWTH" if phase_enum == Phase.GROWTH else "REFINEMENT",
                         "is_final_step": is_final,
                         "is_connected": is_conn

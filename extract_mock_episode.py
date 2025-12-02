@@ -7,18 +7,27 @@ from pathlib import Path
 
 import argparse
 
-def extract_episode(db_path, output_path):
+def extract_episode(db_path, output_path, episode_id=None):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
-    # Get the latest episode ID
-    cursor.execute("SELECT DISTINCT episode_id FROM training_data ORDER BY rowid DESC LIMIT 1")
-    row = cursor.fetchone()
-    if not row:
-        print("No episodes found!")
-        return
+    if episode_id:
+        # Use provided episode_id (can be partial match)
+        cursor.execute("SELECT DISTINCT episode_id FROM training_data WHERE episode_id LIKE ? LIMIT 1", (f"{episode_id}%",))
+        row = cursor.fetchone()
+        if not row:
+            print(f"Episode {episode_id} not found!")
+            return
+        episode_id = row[0]
+    else:
+        # Get the latest episode ID
+        cursor.execute("SELECT DISTINCT episode_id FROM training_data ORDER BY rowid DESC LIMIT 1")
+        row = cursor.fetchone()
+        if not row:
+            print("No episodes found!")
+            return
+        episode_id = row[0]
     
-    episode_id = row[0]
     print(f"Extracting episode: {episode_id}")
 
     # Get all steps
@@ -103,9 +112,10 @@ def main():
     parser = argparse.ArgumentParser(description="Extract mock episode from DB")
     parser.add_argument("--db-path", type=str, default="data/training_data.db", help="Path to database")
     parser.add_argument("--output", type=str, default="alphabuilder/web/public/mock_episode.json", help="Output JSON path")
+    parser.add_argument("--episode-id", type=str, default=None, help="Specific episode ID (or prefix) to extract")
     args = parser.parse_args()
 
-    extract_episode(args.db_path, args.output)
+    extract_episode(args.db_path, args.output, args.episode_id)
 
 if __name__ == "__main__":
     main()

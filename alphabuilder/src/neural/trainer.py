@@ -2,7 +2,7 @@
 Training Loop for AlphaBuilder v3.1.
 
 Implements weighted loss as per spec:
-- Policy Loss with phase-aware masking
+- Policy Loss with pos_weight to handle class imbalance
 - Value Loss with negative sample weighting (w_neg = 5.0)
 """
 import torch
@@ -12,11 +12,17 @@ from typing import Dict, Any
 from torch.utils.data import DataLoader
 
 
-# Negative sample weight
+# Negative sample weight for value loss
 W_NEG = 5.0
 
 # Policy weight in total loss
 LAMBDA_POLICY = 1.0
+
+# Class imbalance weights for policy (positive:negative ratio compensation)
+# These are CRITICAL to prevent "predict all zeros" collapse
+# Based on class distribution: GROWTH ~1:10, REFINEMENT ADD ~1:6, REFINEMENT REM ~1:4
+POS_WEIGHT_ADD = 8.0   # Compensate for ~9-16% positive class
+POS_WEIGHT_REM = 5.0   # Compensate for ~20% positive class
 
 
 def weighted_value_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -47,7 +53,11 @@ def policy_loss(
     phase: str = None
 ) -> torch.Tensor:
     """
-    Binary cross-entropy loss for policy prediction.
+    Binary cross-entropy loss for policy prediction with class imbalance handling.
+    
+    CRITICAL: Uses pos_weight to prevent "predict all zeros" collapse.
+    Without this, the network would learn to predict 0 everywhere
+    and still achieve ~90% accuracy due to class imbalance.
     
     Phase-aware:
     - GROWTH: Focus on Add channel, mask Remove
@@ -61,12 +71,18 @@ def policy_loss(
     Returns:
         Policy loss
     """
-    # Apply sigmoid to get probabilities
-    pred_prob = torch.sigmoid(pred)
+    B, C, D, H, W = pred.shape
     
-    # Binary cross-entropy with logits
+    # Create per-channel pos_weight tensor
+    # Channel 0: ADD, Channel 1: REMOVE
+    pos_weight = torch.tensor([POS_WEIGHT_ADD, POS_WEIGHT_REM], device=pred.device)
+    pos_weight = pos_weight.view(1, 2, 1, 1, 1).expand(B, 2, D, H, W)
+    
+    # Binary cross-entropy with logits and pos_weight
+    # pos_weight increases loss for false negatives (missing positives)
     loss = F.binary_cross_entropy_with_logits(
         pred, target, 
+        pos_weight=pos_weight,
         reduction='none'
     )
     
