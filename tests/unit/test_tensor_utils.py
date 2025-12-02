@@ -3,10 +3,7 @@ Unit tests for tensor_utils module.
 """
 import pytest
 import numpy as np
-from alphabuilder.src.core.tensor_utils import (
-    build_input_tensor_v31,
-    build_input_tensor
-)
+from alphabuilder.src.core.tensor_utils import build_input_tensor_v31
 
 
 class TestBuildInputTensorV31:
@@ -67,6 +64,17 @@ class TestBuildInputTensorV31:
         assert tensor[2, 0, :, :].sum() == 32 * 8  # Mask Y = 1
         assert tensor[3, 0, :, :].sum() == 0      # Mask Z = 0
     
+    def test_roller_z_masks(self):
+        """Roller Z should only set mask_z at X=0."""
+        density = np.zeros((64, 32, 8))
+        load_config = {'x': 63, 'y': 16, 'z_start': 3, 'z_end': 5}
+        
+        tensor = build_input_tensor_v31(density, (64, 32, 8), load_config, 'roller_z')
+        
+        assert tensor[1, 0, :, :].sum() == 0      # Mask X = 0
+        assert tensor[2, 0, :, :].sum() == 0      # Mask Y = 0
+        assert tensor[3, 0, :, :].sum() == 32 * 8  # Mask Z = 1
+    
     def test_force_channel_location(self):
         """Force should be applied at correct location."""
         density = np.zeros((64, 32, 8))
@@ -104,33 +112,4 @@ class TestBuildInputTensorV31:
         
         assert tensor.shape == (7, 64, 32, 8)
         assert tensor[0, 0, 0, 0] == 1.0
-
-
-class TestBuildInputTensorLegacy:
-    """Tests for legacy 5-channel tensor (backwards compatibility)."""
-    
-    def test_output_shape(self):
-        """Output should have shape (5, D, H, W)."""
-        density = np.zeros((64, 32, 8))
-        
-        tensor = build_input_tensor(density, (64, 32, 8))
-        
-        assert tensor.shape == (5, 64, 32, 8)
-    
-    def test_default_support(self):
-        """Default support should be at X=0."""
-        density = np.zeros((64, 32, 8))
-        
-        tensor = build_input_tensor(density, (64, 32, 8))
-        
-        assert tensor[1, 0, :, :].sum() == 32 * 8
-    
-    def test_default_load_position(self):
-        """Default load should be at center of far end."""
-        density = np.zeros((64, 32, 8))
-        
-        tensor = build_input_tensor(density, (64, 32, 8))
-        
-        # Force Y (channel 3) at D-1, H//2, W//2
-        assert tensor[3, 63, 16, 4] == -1.0
 

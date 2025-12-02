@@ -4,7 +4,7 @@ Tensor utilities for AlphaBuilder v3.1.
 Builds 7-channel input tensors for the neural network.
 """
 import numpy as np
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Dict, Any
 
 
 def build_input_tensor_v31(
@@ -73,44 +73,5 @@ def build_input_tensor_v31(
     
     # Force in -Y direction (normalized to -1.0)
     tensor[5, lx, y_min:y_max, z_min:z_max] = -1.0
-        
-    return tensor
-
-
-# Legacy function for backwards compatibility
-def build_input_tensor(
-    density: np.ndarray,
-    resolution: Tuple[int, int, int],
-    load_position: Optional[Tuple[int, int, int]] = None,
-    support_mask: Optional[np.ndarray] = None
-) -> np.ndarray:
-    """
-    Legacy 5-channel input tensor (deprecated, use build_input_tensor_v31).
-    
-    Channels:
-    0: Density (0 or 1)
-    1: Support Mask (1 where fixed)
-    2: Force X (Normalized)
-    3: Force Y (Normalized)
-    4: Force Z (Normalized)
-    """
-    D, H, W = resolution
-    
-    if density.ndim == 1:
-        density = density.reshape((D, H, W))
-    
-    tensor = np.zeros((5, D, H, W), dtype=np.float32)
-    tensor[0] = density
-    
-    if support_mask is not None:
-        tensor[1] = support_mask
-    else:
-        tensor[1, 0, :, :] = 1.0
-        
-    if load_position is not None:
-        ld, lh, lw = load_position
-        tensor[3, ld, lh, lw] = -1.0
-    else:
-        tensor[3, D-1, H//2, W//2] = -1.0
         
     return tensor
