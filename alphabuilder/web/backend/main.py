@@ -367,7 +367,19 @@ def load_episode_data_v1(db_path: Path, episode_id: str) -> EpisodeData:
     for row in rows:
         step, phase, state_blob, fitness_score, metadata_json, policy_blob = row
         
-        state_tensor = pickle.loads(state_blob)
+        # Try to deserialize state_blob (may be compressed or not)
+        try:
+            # First try decompressing (for zlib-compressed data)
+            state_tensor = pickle.loads(zlib.decompress(state_blob))
+        except (zlib.error, TypeError):
+            # If decompression fails, try direct unpickling
+            try:
+                state_tensor = pickle.loads(state_blob)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"Failed to deserialize state data: {str(e)}"
+                )
         
         compliance = None
         volume_fraction = None
@@ -383,11 +395,19 @@ def load_episode_data_v1(db_path: Path, episode_id: str) -> EpisodeData:
         policy_remove = None
         if policy_blob:
             try:
-                policy = pickle.loads(policy_blob)
+                # Try decompressing first (for zlib-compressed data)
+                try:
+                    policy = pickle.loads(zlib.decompress(policy_blob))
+                except (zlib.error, TypeError):
+                    # If decompression fails, try direct unpickling
+                    policy = pickle.loads(policy_blob)
+                
                 if isinstance(policy, np.ndarray) and policy.ndim == 4 and policy.shape[0] == 2:
                     policy_add = policy[0].flatten().tolist()
                     policy_remove = policy[1].flatten().tolist()
-            except Exception:
+            except Exception as e:
+                # Log but don't fail the entire request
+                print(f"Warning: Failed to deserialize policy: {e}")
                 pass
         
         frames.append(Frame(
