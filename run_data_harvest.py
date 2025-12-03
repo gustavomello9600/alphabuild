@@ -24,12 +24,7 @@ import gc
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any
 import scipy.ndimage
-
-try:
-    from tqdm import tqdm
-    HAS_TQDM = True
-except ImportError:
-    HAS_TQDM = False
+from tqdm import tqdm
 
 # Add project root to path
 project_root = Path(__file__).parent
@@ -42,14 +37,11 @@ from alphabuilder.src.core.physics_model import (
 from alphabuilder.src.logic.storage import (
     initialize_database, 
     get_episode_count, 
+    TrainingRecord, 
     Phase, 
-    generate_episode_id,
-    # New schema
-    EpisodeInfo,
-    StepRecord,
-    save_episode,
-    save_step,
-    update_episode_final
+    serialize_state, 
+    save_record, 
+    generate_episode_id
 )
 from alphabuilder.src.utils.logger import TrainingLogger
 
@@ -68,26 +60,32 @@ class SIMPConfig:
 # --- Constants for Value Normalization (Spec 4.2) ---
 # Estimated from typical compliance ranges (C ~ 10 to 10000)
 # S_raw = -log(C + ε) - α·Vol, where α controls volume penalty
-LOG_SQUASH_ALPHA = 0.5   # Volume penalty coefficient
-LOG_SQUASH_MU = -4.0     # Estimated mean of log(C) distribution
+# Calibrated to give volume 20% more impact than compliance
+LOG_SQUASH_ALPHA = 12.0  # Volume penalty coefficient (increased from 0.5 to give volume more weight)
+LOG_SQUASH_MU = -6.65    # Estimated mean of log(C) distribution (adjusted to compensate for higher α)
 LOG_SQUASH_SIGMA = 2.0   # Estimated std of log(C) distribution
 LOG_SQUASH_EPSILON = 1e-9
 
 # --- Policy Quality Settings (v3.1 Quality Improvements) ---
 # These settings address identified issues with policy target quality
 
-# Sliding step for REFINEMENT phase (how much to advance each iteration)
-# 1 = every frame, 2 = every other frame, etc.
-REFINEMENT_SLIDE_STEP = 1  # Default: 1 for maximum data
+# Window size for REFINEMENT phase (compare t with t+k)
+# Larger window creates more significant differences, clearer learning signal
+REFINEMENT_WINDOW_SIZE = 5  # Compare frames 5 steps apart
 
-# Policy target generation uses:
-# - Consecutive frame differences (t vs t+1)
-# - Border mask for ADD (only voxels at solid/void interface)
-# - Solid mask for REMOVE (only where material exists)
-# - Max normalization to keep values in [0, 1] for BCE loss
+# Sliding step (how much to advance the window each iteration)
+# 1 = sliding window (t→t+5, t+1→t+6, t+2→t+7, ...) - more records
+# 5 = jumping window (t→t+5, t+5→t+10, ...) - fewer records
+REFINEMENT_SLIDE_STEP = 1  # Default: 1 (sliding window for more data)
 
-# Epsilon for numerical stability in normalization
-POLICY_NORM_EPS = 1e-8
+# Binarization settings for REFINEMENT targets
+# Converts continuous density differences to binary masks
+BINARIZE_REFINEMENT_TARGETS = True
+BINARIZE_THRESHOLD = 0.005  # Absolute threshold for significant change
+BINARIZE_PERCENTILE = 90    # Alternative: use top N% of changes
+
+# Target normalization: scale ADD/REMOVE to comparable magnitudes
+NORMALIZE_TARGETS = True
 
 def compute_normalized_value(compliance: float, vol_frac: float) -> float:
     """
@@ -110,55 +108,58 @@ def compute_normalized_value(compliance: float, vol_frac: float) -> float:
 # (no Y-constraint means the structure would fall under -Y load)
 BC_TYPES = ['FULL_CLAMP', 'RAIL_XY']
 
-def compute_border_mask(density: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+def binarize_policy_target(target: np.ndarray, method: str = 'threshold') -> np.ndarray:
     """
-    Compute border mask: voxels that are void but have at least one solid neighbor.
+    Convert continuous density difference to binary mask.
     
-    This identifies the interface where material can be added.
-    Uses 6-connectivity (face neighbors only) for efficiency.
+    Methods:
+        - 'threshold': Use fixed threshold (BINARIZE_THRESHOLD)
+        - 'percentile': Use top percentile of non-zero values
+        - 'adaptive': Combine threshold + ensure minimum signal
     
     Args:
-        density: 3D density array
-        threshold: Threshold for solid/void classification
-        
+        target: Continuous target array (density differences)
+        method: Binarization method
+    
     Returns:
-        Boolean mask of border voxels (void with solid neighbor)
+        Binary mask (0.0 or 1.0)
     """
-    solid = density > threshold
+    if not BINARIZE_REFINEMENT_TARGETS:
+        return target
     
-    # Pad with zeros to handle boundaries
-    padded = np.pad(solid.astype(np.float32), 1, mode='constant', constant_values=0)
-    
-    # Count solid neighbors using shifts (6-connectivity)
-    neighbor_count = (
-        padded[:-2, 1:-1, 1:-1] +  # x-1
-        padded[2:, 1:-1, 1:-1] +   # x+1
-        padded[1:-1, :-2, 1:-1] +  # y-1
-        padded[1:-1, 2:, 1:-1] +   # y+1
-        padded[1:-1, 1:-1, :-2] +  # z-1
-        padded[1:-1, 1:-1, 2:]     # z+1
-    )
-    
-    # Border = void AND has at least one solid neighbor
-    border_mask = (~solid) & (neighbor_count > 0)
-    
-    return border_mask
-
-
-def compute_solid_mask(density: np.ndarray, threshold: float = 0.5) -> np.ndarray:
-    """
-    Compute solid mask: voxels that currently have material.
-    
-    This identifies where material can be removed.
-    
-    Args:
-        density: 3D density array
-        threshold: Threshold for solid classification
+    if method == 'threshold':
+        # Simple threshold: anything above threshold becomes 1
+        binary = (np.abs(target) > BINARIZE_THRESHOLD).astype(np.float32)
         
-    Returns:
-        Boolean mask of solid voxels
-    """
-    return density > threshold
+    elif method == 'percentile':
+        # Use top percentile of values
+        abs_target = np.abs(target)
+        nonzero = abs_target[abs_target > 1e-6]
+        if len(nonzero) > 0:
+            thresh = np.percentile(nonzero, BINARIZE_PERCENTILE)
+            binary = (abs_target >= thresh).astype(np.float32)
+        else:
+            binary = np.zeros_like(target)
+            
+    elif method == 'adaptive':
+        # Combine: threshold + ensure at least some signal
+        abs_target = np.abs(target)
+        
+        # First, apply threshold
+        binary = (abs_target > BINARIZE_THRESHOLD).astype(np.float32)
+        
+        # If too few voxels, lower threshold adaptively
+        if np.sum(binary) < 10:
+            nonzero = abs_target[abs_target > 1e-6]
+            if len(nonzero) > 0:
+                # Use 80th percentile of non-zero values
+                adaptive_thresh = np.percentile(nonzero, 80)
+                binary = (abs_target >= adaptive_thresh).astype(np.float32)
+    else:
+        binary = target
+    
+    # Apply sign from original target (for separate ADD/REMOVE)
+    return binary
 
 
 def generate_bc_masks(resolution: tuple, bc_type: str) -> tuple:
@@ -246,6 +247,9 @@ def run_fenitop_optimization(
     else:
         mesh_serial = None
     
+    # Synchronize all ranks before proceeding (critical for Communicator initialization)
+    comm.Barrier()
+    
     # --- Grid Mapper for DOF -> Voxel conversion ---
     grid_mapper = None
     if comm.rank == 0 and mesh_serial is not None:
@@ -296,6 +300,12 @@ def run_fenitop_optimization(
         "petsc_options": {
             "ksp_type": "cg",
             "pc_type": "gamg",
+            "ksp_rtol": 1e-4, # Optimized tolerance
+            "ksp_max_it": 1000,
+            "pc_gamg_type": "agg",
+            "pc_gamg_agg_nsmooths": 1,
+            "pc_gamg_threshold": 0.01, # Optimized coarsening
+            # "ksp_monitor": None, # Disabled for production
         },
     }
     
@@ -330,76 +340,55 @@ def run_fenitop_optimization(
     
     # --- History Recording ---
     history = []
+    
+    # Initialize tqdm progress bar on rank 0
     pbar = None
-    start_time_simp = None
+    if comm.rank == 0:
+        pbar = tqdm(total=max_iter, desc="SIMP", leave=False, unit="it")
     
     def record_step(data):
         if comm.rank == 0:
-            nonlocal pbar, start_time_simp
-            
-            # Inicializa tqdm na primeira iteração
-            if pbar is None and HAS_TQDM:
-                start_time_simp = time.time()
-                pbar = tqdm(
-                    total=max_iter,
-                    desc=f"  SIMP {strategy}",
-                    unit="iter",
-                    ncols=100,
-                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, C={postfix}]'
-                )
-            
             rho_flat = data['density']
-            iter_num = data['iter']
             
             # Reconstruct 3D voxel grid from flat DOF array
             if grid_mapper is None:
                 rho_3d = np.full((nx, ny, nz), simp_config.vol_frac, dtype=np.float32)
             elif len(rho_flat) != len(grid_mapper[0]):
-                if pbar is None or not HAS_TQDM:
-                    print(f"  WARNING: Size mismatch in record_step")
+                print(f"  WARNING: Size mismatch in record_step")
                 rho_3d = np.full((nx, ny, nz), simp_config.vol_frac, dtype=np.float32)
             else:
                 rho_nodal = np.zeros((nx+1, ny+1, nz+1), dtype=np.float32)
                 rho_nodal[grid_mapper[0], grid_mapper[1], grid_mapper[2]] = rho_flat
                 rho_3d = rho_nodal[:-1, :-1, :-1]
 
-            compliance = float(data['compliance'])
-            vol_frac = float(data['vol_frac'])
-            beta = data.get('beta', 1)
-            
             history.append({
-                'step': iter_num,
+                'step': data['iter'],
                 'density_map': rho_3d,
-                'compliance': compliance,
-                'vol_frac': vol_frac,
-                'beta': beta
+                'compliance': float(data['compliance']),
+                'vol_frac': float(data['vol_frac']),
+                'beta': data.get('beta', 1)  # Track beta for filtering later
             })
             
-            # Atualiza tqdm
-            if pbar is not None:
-                pbar.set_postfix_str(f"{compliance:.2f}, V={vol_frac:.3f}, β={beta}")
+            if data['iter'] % 10 == 0:
+                # Update progress bar description with current stats
+                if pbar:
+                    pbar.set_postfix({
+                        'C': f"{data['compliance']:.2f}", 
+                        'V': f"{data['vol_frac']:.2f}",
+                        'B': f"{data.get('beta', 1)}"
+                    })
+            
+            # Update progress bar
+            if pbar:
                 pbar.update(1)
-            elif iter_num % 10 == 0 or iter_num < 5:
-                print(f"  Step {iter_num:3d}: C={compliance:.4f} V={vol_frac:.4f} β={beta}", flush=True)
 
     # --- Run Optimization ---
     if comm.rank == 0:
-        if HAS_TQDM:
-            print(f"  FEniTop: iter={max_iter}, V={simp_config.vol_frac:.2f}, r={filter_r:.1f}, strategy={strategy}", flush=True)
-        else:
-            print(f"  FEniTop: iter={max_iter}, V={simp_config.vol_frac:.2f}, r={filter_r:.1f}, strategy={strategy}", flush=True)
-            print(f"  (Instale tqdm para ver progresso: pip install tqdm)")
+        print(f"  FEniTop: iter={max_iter}, V={simp_config.vol_frac:.2f}, r={filter_r:.1f}, strategy={strategy}")
+    topopt(fem, opt, initial_density=initial_density, callback=record_step)
     
-    try:
-        topopt(fem, opt, initial_density=initial_density, callback=record_step)
-    finally:
-        if comm.rank == 0 and pbar is not None:
-            pbar.close()
-            if start_time_simp:
-                elapsed = time.time() - start_time_simp
-                print(f"  FEniTop concluído: {len(history)} iterações em {elapsed:.1f}s", flush=True)
-        elif comm.rank == 0:
-            print(f"  FEniTop concluído: {len(history)} iterações coletadas", flush=True)
+    if comm.rank == 0 and pbar:
+        pbar.close()
     
     return history
 
@@ -770,22 +759,11 @@ def main():
     
     if is_main_rank:
         print(f"Starting Harvest: {args.episodes} episodes")
-        if HAS_TQDM:
-            episode_pbar = tqdm(
-                total=args.episodes,
-                desc="Episodes",
-                unit="ep",
-                ncols=100,
-                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
-            )
-        else:
-            episode_pbar = None
+        episode_iterator = tqdm(range(args.episodes), desc="Episodes", unit="ep")
     else:
-        episode_pbar = None
+        episode_iterator = range(args.episodes)
     
-    episode_start_time = time.time()
-    
-    for i in range(args.episodes):
+    for i in episode_iterator:
         start_time = time.time()
         
         # Set seed (all ranks must use same seed for consistency)
@@ -944,18 +922,19 @@ def main():
         
         # Use sliding window for REFINEMENT (v3.1 Quality)
         # Compare t with t+window_size, advance by slide_step each iteration
+        window_size = REFINEMENT_WINDOW_SIZE
         slide_step = REFINEMENT_SLIDE_STEP
         
-        print(f"  Phase 2: Skipping first {start_step} steps (beta=1), slide={slide_step}, using border/solid masks")
+        print(f"  Phase 2: Skipping first {start_step} steps (beta=1), window={window_size}, slide={slide_step}, binarize={BINARIZE_REFINEMENT_TARGETS}")
         
-        # Generate records with consecutive frame differences (t vs t+1)
+        # Generate records with sliding window (t → t+window_size)
         record_idx = 0
-        for t in range(start_step, len(simp_history) - 1, slide_step):
+        for t in range(start_step, len(simp_history) - window_size, slide_step):
             current_frame = simp_history[t]
-            next_frame = simp_history[t + 1]  # Consecutive frame
+            future_frame = simp_history[t + window_size]  # Look window_size steps ahead
             
             curr_dens = current_frame['density_map']
-            next_dens = next_frame['density_map']
+            future_dens = future_frame['density_map']
             
             # Adaptive Thresholding (Smart Saving)
             # Find the highest threshold that maintains connectivity
@@ -977,32 +956,18 @@ def main():
             # Use the Connected Binary Mask as Input State
             input_state = best_binary
             
-            # Compute density difference (next - current)
-            delta = next_dens - curr_dens
+            # Compute difference over window_size steps (larger signal!)
+            diff = curr_dens - future_dens
+            target_remove_raw = np.maximum(0, diff)
+            target_add_raw = np.maximum(0, -diff)
             
-            # Raw targets from delta
-            target_add_raw = np.maximum(0, delta).astype(np.float32)   # Where density increased
-            target_remove_raw = np.maximum(0, -delta).astype(np.float32)  # Where density decreased
-            
-            # Apply action masks:
-            # ADD: Only at border (void voxels with solid neighbors)
-            border_mask = compute_border_mask(curr_dens, threshold=found_threshold)
-            target_add_masked = target_add_raw * border_mask.astype(np.float32)
-            
-            # REMOVE: Only where material exists (solid voxels)
-            solid_mask = compute_solid_mask(curr_dens, threshold=found_threshold)
-            target_remove_masked = target_remove_raw * solid_mask.astype(np.float32)
-            
-            # Normalize by max (keeps values in [0, 1] for BCE loss)
-            add_max = target_add_masked.max()
-            remove_max = target_remove_masked.max()
-            
-            target_add = target_add_masked / (add_max + POLICY_NORM_EPS) if add_max > POLICY_NORM_EPS else target_add_masked
-            target_remove = target_remove_masked / (remove_max + POLICY_NORM_EPS) if remove_max > POLICY_NORM_EPS else target_remove_masked
-            
-            # Skip if no meaningful signal (both channels empty)
-            if target_add.sum() < POLICY_NORM_EPS and target_remove.sum() < POLICY_NORM_EPS:
-                continue
+            # Apply binarization for cleaner learning signal (v3.1 Quality)
+            if BINARIZE_REFINEMENT_TARGETS:
+                target_add = binarize_policy_target(target_add_raw, method='adaptive')
+                target_remove = binarize_policy_target(target_remove_raw, method='adaptive')
+            else:
+                target_add = target_add_raw
+                target_remove = target_remove_raw
             
             # Compute normalized value using Log-Squash (Spec 4.2)
             current_compliance = float(current_frame['compliance'])
@@ -1023,81 +988,93 @@ def main():
             })
             record_idx += 1
             
-        # 7. Save to DB (New optimized schema v2)
-        # BC masks and forces saved ONCE per episode, steps saved with sparse policy
-        
+        # 7. Save to DB
+        # Get BC type from load_config (v3.1)
         bc_type = load_config.get('bc_type', 'FULL_CLAMP')
         
-        # Generate BC masks and forces (same for all steps in episode)
-        mask_x, mask_y, mask_z = generate_bc_masks(resolution, bc_type)
-        bc_masks = np.stack([mask_x, mask_y, mask_z], axis=0).astype(np.float32)
-        
-        # Force channels
-        fx = np.zeros(resolution, dtype=np.float32)
-        fy = np.zeros(resolution, dtype=np.float32)
-        fz = np.zeros(resolution, dtype=np.float32)
-        
-        # Apply load to force channels
-        ly = load_config['y']
-        lz_center = (load_config['z_start'] + load_config['z_end']) / 2.0
-        load_half_width = 1.0
-        
-        y_min = max(0, int(ly - load_half_width))
-        y_max = min(ny, int(ly + load_half_width) + 1)
-        z_min = max(0, int(lz_center - load_half_width))
-        z_max = min(nz, int(lz_center + load_half_width) + 1)
-        
-        # Force is -Y direction
-        fy[nx-1, y_min:y_max, z_min:z_max] = -1.0
-        forces = np.stack([fx, fy, fz], axis=0).astype(np.float32)
-        
-        # Save episode info ONCE
-        episode_info = EpisodeInfo(
-            episode_id=episode_id,
-            bc_masks=bc_masks,
-            forces=forces,
-            load_config=load_config,
-            bc_type=bc_type,
-            strategy=strategy,
-            resolution=resolution,
-            final_compliance=s_final_compliance,
-            final_volume=s_final_vol
-        )
-        save_episode(db_path, episode_info)
-        
-        # Save steps with sparse policy
-        def save_steps_batch(records, phase_enum, is_final_list=None):
+        # Common function to save
+        def save_batch(records, phase_enum, is_final_list=None):
             for idx, rec in enumerate(records):
+                # Build Input Tensor v3.1 (7 Channels)
+                # 0: Density
+                # 1: Mask X (support)
+                # 2: Mask Y (support)
+                # 3: Mask Z (support)
+                # 4: Force X
+                # 5: Force Y
+                # 6: Force Z
+                
+                # Support Masks based on BC type (v3.1)
+                mask_x, mask_y, mask_z = generate_bc_masks(resolution, bc_type)
+                
+                # Force Channels
+                fx = np.zeros(resolution, dtype=np.float32)
+                fy = np.zeros(resolution, dtype=np.float32)
+                fz = np.zeros(resolution, dtype=np.float32)
+                
+                # Apply Load to Force Channels
+                ly = load_config['y']
+                lz_center = (load_config['z_start'] + load_config['z_end']) / 2.0
+                load_half_width = 1.0
+                
+                y_min = max(0, int(ly - load_half_width))
+                y_max = min(ny, int(ly + load_half_width) + 1)
+                z_min = max(0, int(lz_center - load_half_width))
+                z_max = min(nz, int(lz_center + load_half_width) + 1)
+                
+                # Force is -Y direction
+                fy[nx-1, y_min:y_max, z_min:z_max] = -1.0
+                
+                # Input State (density)
+                density = rec['input_state']
+                
+                # Stack 7 channels
+                input_tensor = np.stack([density, mask_x, mask_y, mask_z, fx, fy, fz], axis=0)
+                
+                # Target Policy - use float32 for memory efficiency
+                # (float64 doubles VRAM usage unnecessarily for binary masks)
+                policy_tensor = np.stack([
+                    rec['target_add'].astype(np.float32), 
+                    rec['target_remove'].astype(np.float32)
+                ], axis=0)
+                
+                # Determine is_final_step and is_connected
                 is_final = is_final_list[idx] if is_final_list else False
                 
-                # Check connectivity for Phase 2
+                # Check connectivity (for Phase 2 records)
                 is_conn = False
-                density = rec['input_state'].astype(np.float32)
                 if phase_enum == Phase.REFINEMENT:
                     is_conn, _ = check_connectivity(density, 0.5, load_config)
                 
-                step_record = StepRecord(
+                db_record = TrainingRecord(
                     episode_id=episode_id,
                     step=rec['step'],
                     phase=phase_enum,
-                    density=density,
-                    policy_add=rec['target_add'].astype(np.float32),
-                    policy_remove=rec['target_remove'].astype(np.float32),
+                    state_blob=serialize_state(input_tensor),
+                    policy_blob=serialize_state(policy_tensor),
                     fitness_score=rec['target_value'],
-                    is_final_step=is_final,
-                    is_connected=is_conn
+                    valid_fem=True,
+                    metadata={
+                        "compliance": rec.get('current_compliance', s_final_compliance),
+                        "vol_frac": rec.get('current_vol', s_final_vol),
+                        "load_config": load_config,
+                        "bc_type": bc_type,  # v3.1: BC type for augmentation
+                        "phase": "GROWTH" if phase_enum == Phase.GROWTH else "REFINEMENT",
+                        "is_final_step": is_final,
+                        "is_connected": is_conn
+                    }
                 )
-                save_step(db_path, step_record)
-        
+                save_record(db_path, db_record)
+
         # Phase 1: None are final steps
         phase1_final = [False] * len(phase1_records)
-        save_steps_batch(phase1_records, Phase.GROWTH, phase1_final)
+        save_batch(phase1_records, Phase.GROWTH, phase1_final)
         
         # Phase 2: Last record is final step
         phase2_final = [False] * len(phase2_records)
         if phase2_final:
-            phase2_final[-1] = True
-        save_steps_batch(phase2_records, Phase.REFINEMENT, phase2_final)
+            phase2_final[-1] = True  # Mark last as final
+        save_batch(phase2_records, Phase.REFINEMENT, phase2_final)
         
         duration = time.time() - start_time
         logger.log({
@@ -1110,20 +1087,9 @@ def main():
             "status": "SUCCESS"
         })
         
-        # Atualiza tqdm do episódio
-        if is_main_rank and episode_pbar is not None:
-            episode_pbar.set_postfix_str(f"C={s_final_compliance:.1f}, V={s_final_vol:.2f}, {len(phase1_records)+len(phase2_records)} samples")
-            episode_pbar.update(1)
-        elif is_main_rank:
-            print(f"Ep {i+1}/{args.episodes}: C={s_final_compliance:.2f}, V={s_final_vol:.2f}, Samples={len(phase1_records)+len(phase2_records)}, Time={duration:.1f}s")
+        print(f"Ep {i+1}/{args.episodes}: C={s_final_compliance:.2f}, V={s_final_vol:.2f}, Samples={len(phase1_records)+len(phase2_records)}, Time={duration:.1f}s")
         
         gc.collect()
-    
-    # Fecha tqdm do episódio
-    if is_main_rank and episode_pbar is not None:
-        episode_pbar.close()
-        total_time = time.time() - episode_start_time
-        print(f"\nHarvest concluído: {args.episodes} episódios em {total_time:.1f}s ({total_time/args.episodes:.1f}s/ep)")
 
 if __name__ == "__main__":
     main()

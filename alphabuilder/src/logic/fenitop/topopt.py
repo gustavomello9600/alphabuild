@@ -140,10 +140,6 @@ def topopt(fem, opt, initial_density=None, callback=None):
 
         # Output the histories
         opt_time = time.perf_counter() - opt_start_time
-        if comm.rank == 0:
-            print(f"opt_iter: {opt_iter}, opt_time: {opt_time:.3g} (s), "
-                  f"beta: {beta}, C: {C_value:.3f}, V: {V_value:.3f}, "
-                  f"U: {U_value:.3f}, change: {change:.3f}", flush=True)
         
         # Callback / History Recording
         # NOTE: gather is a collective MPI operation - ALL processes must call it
