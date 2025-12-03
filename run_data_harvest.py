@@ -36,11 +36,14 @@ from alphabuilder.src.core.physics_model import (
 from alphabuilder.src.logic.storage import (
     initialize_database, 
     get_episode_count, 
-    TrainingRecord, 
     Phase, 
-    serialize_state, 
-    save_record, 
-    generate_episode_id
+    generate_episode_id,
+    # New schema
+    EpisodeInfo,
+    StepRecord,
+    save_episode,
+    save_step,
+    update_episode_final
 )
 from alphabuilder.src.utils.logger import TrainingLogger
 
@@ -961,93 +964,81 @@ def main():
             })
             record_idx += 1
             
-        # 7. Save to DB
-        # Get BC type from load_config (v3.1)
+        # 7. Save to DB (New optimized schema v2)
+        # BC masks and forces saved ONCE per episode, steps saved with sparse policy
+        
         bc_type = load_config.get('bc_type', 'FULL_CLAMP')
         
-        # Common function to save
-        def save_batch(records, phase_enum, is_final_list=None):
+        # Generate BC masks and forces (same for all steps in episode)
+        mask_x, mask_y, mask_z = generate_bc_masks(resolution, bc_type)
+        bc_masks = np.stack([mask_x, mask_y, mask_z], axis=0).astype(np.float32)
+        
+        # Force channels
+        fx = np.zeros(resolution, dtype=np.float32)
+        fy = np.zeros(resolution, dtype=np.float32)
+        fz = np.zeros(resolution, dtype=np.float32)
+        
+        # Apply load to force channels
+        ly = load_config['y']
+        lz_center = (load_config['z_start'] + load_config['z_end']) / 2.0
+        load_half_width = 1.0
+        
+        y_min = max(0, int(ly - load_half_width))
+        y_max = min(ny, int(ly + load_half_width) + 1)
+        z_min = max(0, int(lz_center - load_half_width))
+        z_max = min(nz, int(lz_center + load_half_width) + 1)
+        
+        # Force is -Y direction
+        fy[nx-1, y_min:y_max, z_min:z_max] = -1.0
+        forces = np.stack([fx, fy, fz], axis=0).astype(np.float32)
+        
+        # Save episode info ONCE
+        episode_info = EpisodeInfo(
+            episode_id=episode_id,
+            bc_masks=bc_masks,
+            forces=forces,
+            load_config=load_config,
+            bc_type=bc_type,
+            strategy=strategy,
+            resolution=resolution,
+            final_compliance=s_final_compliance,
+            final_volume=s_final_vol
+        )
+        save_episode(db_path, episode_info)
+        
+        # Save steps with sparse policy
+        def save_steps_batch(records, phase_enum, is_final_list=None):
             for idx, rec in enumerate(records):
-                # Build Input Tensor v3.1 (7 Channels)
-                # 0: Density
-                # 1: Mask X (support)
-                # 2: Mask Y (support)
-                # 3: Mask Z (support)
-                # 4: Force X
-                # 5: Force Y
-                # 6: Force Z
-                
-                # Support Masks based on BC type (v3.1)
-                mask_x, mask_y, mask_z = generate_bc_masks(resolution, bc_type)
-                
-                # Force Channels
-                fx = np.zeros(resolution, dtype=np.float32)
-                fy = np.zeros(resolution, dtype=np.float32)
-                fz = np.zeros(resolution, dtype=np.float32)
-                
-                # Apply Load to Force Channels
-                ly = load_config['y']
-                lz_center = (load_config['z_start'] + load_config['z_end']) / 2.0
-                load_half_width = 1.0
-                
-                y_min = max(0, int(ly - load_half_width))
-                y_max = min(ny, int(ly + load_half_width) + 1)
-                z_min = max(0, int(lz_center - load_half_width))
-                z_max = min(nz, int(lz_center + load_half_width) + 1)
-                
-                # Force is -Y direction
-                fy[nx-1, y_min:y_max, z_min:z_max] = -1.0
-                
-                # Input State (density)
-                density = rec['input_state']
-                
-                # Stack 7 channels
-                input_tensor = np.stack([density, mask_x, mask_y, mask_z, fx, fy, fz], axis=0)
-                
-                # Target Policy - use float32 for memory efficiency
-                # (float64 doubles VRAM usage unnecessarily for binary masks)
-                policy_tensor = np.stack([
-                    rec['target_add'].astype(np.float32), 
-                    rec['target_remove'].astype(np.float32)
-                ], axis=0)
-                
-                # Determine is_final_step and is_connected
                 is_final = is_final_list[idx] if is_final_list else False
                 
-                # Check connectivity (for Phase 2 records)
+                # Check connectivity for Phase 2
                 is_conn = False
+                density = rec['input_state'].astype(np.float32)
                 if phase_enum == Phase.REFINEMENT:
                     is_conn, _ = check_connectivity(density, 0.5, load_config)
                 
-                db_record = TrainingRecord(
+                step_record = StepRecord(
                     episode_id=episode_id,
                     step=rec['step'],
                     phase=phase_enum,
-                    state_blob=serialize_state(input_tensor),
-                    policy_blob=serialize_state(policy_tensor),
+                    density=density,
+                    policy_add=rec['target_add'].astype(np.float32),
+                    policy_remove=rec['target_remove'].astype(np.float32),
                     fitness_score=rec['target_value'],
-                    valid_fem=True,
-                    metadata={
-                        "compliance": rec.get('current_compliance', s_final_compliance),
-                        "vol_frac": rec.get('current_vol', s_final_vol),
-                        "load_config": load_config,
-                        "bc_type": bc_type,  # v3.1: BC type for augmentation
-                        "phase": "GROWTH" if phase_enum == Phase.GROWTH else "REFINEMENT",
-                        "is_final_step": is_final,
-                        "is_connected": is_conn
-                    }
+                    is_final_step=is_final,
+                    is_connected=is_conn
                 )
-                save_record(db_path, db_record)
-
+                save_step(db_path, step_record)
+        
         # Phase 1: None are final steps
         phase1_final = [False] * len(phase1_records)
-        save_batch(phase1_records, Phase.GROWTH, phase1_final)
+        save_steps_batch(phase1_records, Phase.GROWTH, phase1_final)
         
         # Phase 2: Last record is final step
         phase2_final = [False] * len(phase2_records)
         if phase2_final:
-            phase2_final[-1] = True  # Mark last as final
-        save_batch(phase2_records, Phase.REFINEMENT, phase2_final)
+            phase2_final[-1] = True
+        save_steps_batch(phase2_records, Phase.REFINEMENT, phase2_final)
         
         duration = time.time() - start_time
         logger.log({
