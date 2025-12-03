@@ -81,35 +81,51 @@ def generate_test_episode(
 
 
 def _count_episodes(db_path: Path) -> int:
-    """Conta episódios únicos no DB."""
+    """Conta episódios únicos no DB (suporta v1 e v2)."""
     if not db_path.exists():
         return 0
     
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(DISTINCT episode_id) FROM training_data")
-    count = cursor.fetchone()[0]
+    
+    # Tenta schema v2 primeiro
+    try:
+        cursor.execute("SELECT COUNT(*) FROM episodes")
+        count = cursor.fetchone()[0]
+    except sqlite3.OperationalError:
+        # Fallback para v1
+        cursor.execute("SELECT COUNT(DISTINCT episode_id) FROM training_data")
+        count = cursor.fetchone()[0]
+    
     conn.close()
     return count
 
 
 def _get_latest_episode_id(db_path: Path, episodes_before: int) -> str:
-    """Retorna o ID do episódio mais recente."""
+    """Retorna o ID do episódio mais recente (suporta v1 e v2)."""
     if not db_path.exists():
         return None
     
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
-    # Pega o episódio mais recente
-    cursor.execute("""
-        SELECT DISTINCT episode_id 
-        FROM training_data 
-        ORDER BY id DESC 
-        LIMIT 1
-    """)
+    # Tenta schema v2 primeiro
+    try:
+        cursor.execute("""
+            SELECT episode_id FROM episodes 
+            ORDER BY created_at DESC LIMIT 1
+        """)
+        row = cursor.fetchone()
+    except sqlite3.OperationalError:
+        # Fallback para v1
+        cursor.execute("""
+            SELECT DISTINCT episode_id 
+            FROM training_data 
+            ORDER BY id DESC 
+            LIMIT 1
+        """)
+        row = cursor.fetchone()
     
-    row = cursor.fetchone()
     conn.close()
     
     if row:

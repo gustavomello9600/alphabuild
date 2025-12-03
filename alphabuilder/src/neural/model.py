@@ -382,7 +382,7 @@ class SimpleEncoder(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.pool1 = nn.MaxPool3d(2)
-        
+            
         # Stage 2: half res → quarter res
         self.stage2 = nn.Sequential(
             nn.Conv3d(feature_size, feature_size * 2, kernel_size=3, padding=1),
@@ -445,7 +445,7 @@ class SimplePolicyDecoder(nn.Module):
             nn.InstanceNorm3d(feature_size),
             nn.ReLU(inplace=True),
         )
-        
+    
         # Final output
         self.out = nn.Sequential(
             nn.Conv3d(feature_size, feature_size, kernel_size=3, padding=1),

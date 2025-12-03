@@ -348,13 +348,15 @@ def run_fenitop_optimization(
                 'beta': data.get('beta', 1)  # Track beta for filtering later
             })
             
-            if data['iter'] % 10 == 0:
-                print(f"  Step {data['iter']:3d}: C={data['compliance']:.4f} V={data['vol_frac']:.4f} β={data.get('beta', 1)}")
+            if data['iter'] % 10 == 0 or data['iter'] < 5:
+                print(f"  Step {data['iter']:3d}: C={data['compliance']:.4f} V={data['vol_frac']:.4f} β={data.get('beta', 1)}", flush=True)
 
     # --- Run Optimization ---
     if comm.rank == 0:
-        print(f"  FEniTop: iter={max_iter}, V={simp_config.vol_frac:.2f}, r={filter_r:.1f}, strategy={strategy}")
+        print(f"  FEniTop: iter={max_iter}, V={simp_config.vol_frac:.2f}, r={filter_r:.1f}, strategy={strategy}", flush=True)
     topopt(fem, opt, initial_density=initial_density, callback=record_step)
+    if comm.rank == 0:
+        print(f"  FEniTop concluído: {len(history)} iterações coletadas", flush=True)
     
     return history
 

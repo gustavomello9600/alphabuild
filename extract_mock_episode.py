@@ -20,12 +20,12 @@ def extract_episode(db_path, output_path, episode_id=None):
             return
         episode_id = row[0]
     else:
-        # Get the latest episode ID
-        cursor.execute("SELECT DISTINCT episode_id FROM training_data ORDER BY rowid DESC LIMIT 1")
-        row = cursor.fetchone()
-        if not row:
-            print("No episodes found!")
-            return
+    # Get the latest episode ID
+    cursor.execute("SELECT DISTINCT episode_id FROM training_data ORDER BY rowid DESC LIMIT 1")
+    row = cursor.fetchone()
+    if not row:
+        print("No episodes found!")
+        return
         episode_id = row[0]
     
     print(f"Extracting episode: {episode_id}")
