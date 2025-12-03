@@ -60,11 +60,19 @@ export async function fetchDatabases(): Promise<DatabaseInfo[]> {
  * Fetch all episodes in a database
  */
 export async function fetchEpisodes(dbId: string): Promise<EpisodeSummary[]> {
-    const response = await fetch(`${API_BASE}/databases/${dbId}/episodes`);
-    if (!response.ok) {
-        throw new Error(`Failed to fetch episodes for database ${dbId}`);
+    try {
+        const response = await fetch(`${API_BASE}/databases/${dbId}/episodes`);
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`HTTP ${response.status}: ${errorText || `Failed to fetch episodes for database ${dbId}`}`);
+        }
+        const data = await response.json();
+        console.log(`[fetchEpisodes] Received ${data.length} episodes for ${dbId}`);
+        return data;
+    } catch (err) {
+        console.error(`[fetchEpisodes] Error fetching episodes for ${dbId}:`, err);
+        throw err;
     }
-    return response.json();
 }
 
 /**
@@ -258,6 +266,13 @@ export class TrainingDataReplayService {
             isPlaying: this.isPlaying,
             maxCompliance: this.maxCompliance,
         };
+    }
+
+    /**
+     * Get all frames (for building complete history)
+     */
+    getAllFrames(): ReplayState[] {
+        return [...this.frames];
     }
 }
 

@@ -29,11 +29,6 @@ def optimality_criteria(rho, rho_min, rho_max, V, dCdrho, dVdrho, move=0.05):
     lb, ub = 0.0, 1e6
     comm = MPI.COMM_WORLD
     
-    # Debug: Check sensitivity signs
-    dC_min, dC_max = comm.allreduce(np.min(dCdrho), op=MPI.MIN), comm.allreduce(np.max(dCdrho), op=MPI.MAX)
-    if comm.rank == 0:
-        print(f"DEBUG OC: dCdrho range: [{dC_min:.4e}, {dC_max:.4e}]")
-    
     iter_oc = 0
     while ub-lb > 1e-4:
         iter_oc += 1
@@ -50,17 +45,12 @@ def optimality_criteria(rho, rho_min, rho_max, V, dCdrho, dVdrho, move=0.05):
             
         dV = comm.allreduce(dVdrho@(rho_new-rho), op=MPI.SUM)
         
-        if iter_oc % 50 == 0 and comm.rank == 0:
-             print(f"DEBUG OC: iter={iter_oc} lb={lb:.4e} ub={ub:.4e} mid={mid:.4e} V+dV={V+dV:.4e}")
-             
         if V + dV > 0:
             lb = mid
         else:
             ub = mid
             
         if iter_oc > 1000:
-            if comm.rank == 0:
-                print("DEBUG OC: Max iterations reached in bisection!")
             break
             
     change = comm.allreduce(np.max(np.abs(rho_new-rho), initial=0), op=MPI.MAX)

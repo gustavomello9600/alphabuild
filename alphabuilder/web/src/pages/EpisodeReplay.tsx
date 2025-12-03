@@ -522,6 +522,30 @@ const NeuralHUD = ({
 }) => {
     const [isOpen, setIsOpen] = useState(true);
 
+    // Calculate scale that handles negative values
+    const getScale = (values: number[]) => {
+        if (values.length === 0) return { min: -1, max: 1, range: 2 };
+        const min = Math.min(...values);
+        const max = Math.max(...values);
+        const range = max - min;
+        // Add padding to avoid edge cases
+        const padding = range * 0.1 || 0.2;
+        return {
+            min: min - padding,
+            max: max + padding,
+            range: range + padding * 2,
+        };
+    };
+
+    // Get color for value (positive = cyan, negative = magenta)
+    const getValueColor = (value: number) => {
+        if (value >= 0) {
+            return 'from-cyan/30 to-cyan/80';
+        } else {
+            return 'from-magenta/30 to-magenta/80';
+        }
+    };
+
     return (
         <div className="absolute bottom-8 left-8 flex flex-col gap-2 pointer-events-none">
             <button
@@ -539,41 +563,81 @@ const NeuralHUD = ({
                         exit={{ opacity: 0, y: 20 }}
                         className="flex gap-4 items-end"
                     >
-                        {/* Value History Graph */}
+                        {/* Quality Estimate Graph */}
                         <div className="bg-black/60 backdrop-blur border border-white/10 p-4 rounded-xl w-64 pointer-events-auto">
                             <div className="flex items-center gap-2 mb-3 text-cyan">
                                 <Brain size={16} />
                                 <span className="text-xs font-bold uppercase tracking-wider">
-                                    Value Confidence
+                                    Estimativa de Qualidade
                                 </span>
                             </div>
                             <div className="h-20 flex items-end gap-0.5 border-b border-white/10 pb-1 relative">
                                 {(() => {
                                     const windowSize = 20;
-                                    const visibleHistory = history.slice(-windowSize);
-                                    const maxVal = Math.max(...visibleHistory, 0.1);
+                                    // Get last windowSize values (most recent at the end)
+                                    const visibleHistory = history.length > 0 
+                                        ? history.slice(-windowSize)
+                                        : [];
+                                    
+                                    if (visibleHistory.length === 0) {
+                                        return Array.from({ length: windowSize }).map((_, i) => (
+                                            <div key={i} className="flex-1" />
+                                        ));
+                                    }
 
-                                    return Array.from({ length: windowSize }).map((_, i) => {
-                                        const dataIndex = history.length - windowSize + i;
-                                        const value = dataIndex >= 0 ? history[dataIndex] : 0;
-                                        const percentage = (value / maxVal) * 100;
+                                    const scale = getScale(visibleHistory);
+                                    const zeroLine = scale.min < 0 && scale.max > 0 
+                                        ? (-scale.min / scale.range) * 100 
+                                        : null;
 
-                                        return (
-                                            <div
-                                                key={i}
-                                                className="flex-1 bg-gradient-to-t from-cyan/30 to-cyan/80 rounded-t-sm transition-all duration-300"
-                                                style={{ height: `${Math.min(100, percentage)}%` }}
-                                                title={`Value: ${value.toFixed(4)}`}
-                                            />
-                                        );
-                                    });
+                                    return (
+                                        <>
+                                            {/* Zero line indicator */}
+                                            {zeroLine !== null && (
+                                                <div
+                                                    className="absolute left-0 right-0 h-px bg-white/20 pointer-events-none"
+                                                    style={{ bottom: `${zeroLine}%` }}
+                                                />
+                                            )}
+                                            {visibleHistory.map((value, i) => {
+                                                // Normalize value to 0-100% based on scale
+                                                const normalized = ((value - scale.min) / scale.range) * 100;
+                                                const height = Math.max(2, Math.min(100, normalized)); // Min 2px for visibility
+                                                const isPositive = value >= 0;
+
+                                                return (
+                                                    <div
+                                                        key={i}
+                                                        className={`flex-1 bg-gradient-to-t ${getValueColor(value)} rounded-t-sm transition-all duration-300`}
+                                                        style={{ height: `${height}%` }}
+                                                        title={`Step ${history.length - visibleHistory.length + i + 1}: ${value.toFixed(4)}`}
+                                                    />
+                                                );
+                                            })}
+                                            {/* Pad with empty slots if needed */}
+                                            {Array.from({ length: windowSize - visibleHistory.length }).map((_, i) => (
+                                                <div key={`pad-${i}`} className="flex-1" />
+                                            ))}
+                                        </>
+                                    );
                                 })()}
                             </div>
                             <div className="mt-2 flex justify-between font-mono text-xs">
-                                <span className="text-white/30">
-                                    Max: {Math.max(...history.slice(-20), 0.1).toFixed(3)}
-                                </span>
-                                <span className="text-cyan">{(state?.value_confidence || 0).toFixed(4)}</span>
+                                {history.length > 0 ? (
+                                    <>
+                                        <span className="text-white/30">
+                                            {(() => {
+                                                const scale = getScale(history.slice(-20));
+                                                return `${scale.min.toFixed(2)} - ${scale.max.toFixed(2)}`;
+                                            })()}
+                                        </span>
+                                        <span className={state?.value_confidence && state.value_confidence >= 0 ? 'text-cyan' : 'text-magenta'}>
+                                            {(state?.value_confidence || 0).toFixed(4)}
+                                        </span>
+                                    </>
+                                ) : (
+                                    <span className="text-white/30">Carregando...</span>
+                                )}
                             </div>
                         </div>
 
@@ -660,6 +724,25 @@ export const EpisodeReplay = () => {
         };
     }, [dbId, episodeId]);
 
+    // Update history when step changes - ensure order by step index
+    useEffect(() => {
+        const allFramesData = trainingDataReplayService.getAllFrames();
+        if (allFramesData.length > 0 && simState.currentStep >= 0 && simState.currentStep < allFramesData.length) {
+            // Get current frame's step number
+            const currentFrame = allFramesData[simState.currentStep];
+            const currentStepNumber = currentFrame.step;
+            
+            // Get all frames up to current step, sorted by step number (ascending)
+            // This ensures we show frames in order: oldest (left) to current (right)
+            const framesUpToCurrent = allFramesData
+                .filter(f => f.step <= currentStepNumber)
+                .sort((a, b) => a.step - b.step);
+            
+            const historyValues = framesUpToCurrent.map(f => f.value_confidence || 0);
+            setHistory(historyValues);
+        }
+    }, [simState.currentStep, simState.stepsLoaded, replayState]);
+
     const loadEpisode = async () => {
         if (!dbId || !episodeId) return;
 
@@ -671,11 +754,23 @@ export const EpisodeReplay = () => {
             const unsubscribe = trainingDataReplayService.subscribe((state) => {
                 setReplayState(state);
                 setSimState(trainingDataReplayService.getState());
-                setHistory((prev) => [...prev, state.value_confidence || 0]);
             });
 
             await trainingDataReplayService.loadEpisode(dbId, episodeId);
-            setSimState(trainingDataReplayService.getState());
+            const serviceState = trainingDataReplayService.getState();
+            setSimState(serviceState);
+            
+            // Build initial history from all loaded frames
+            const allFramesData = trainingDataReplayService.getAllFrames();
+            if (allFramesData.length > 0) {
+                const currentFrame = allFramesData[serviceState.currentStep];
+                const framesUpToCurrent = allFramesData
+                    .filter(f => f.step <= currentFrame.step)
+                    .sort((a, b) => a.step - b.step);
+                const historyValues = framesUpToCurrent.map(f => f.value_confidence || 0);
+                setHistory(historyValues);
+            }
+            
             setLoading(false);
 
             return unsubscribe;

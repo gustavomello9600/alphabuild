@@ -42,8 +42,14 @@ def generate_test_episode(
     # Monta comando
     resolution_str = f"{resolution[0]}x{resolution[1]}x{resolution[2]}"
     
+    # Use absolute path for mpirun from the same environment as python
+    mpirun_path = Path(sys.executable).parent / "mpirun"
+    if not mpirun_path.exists():
+        # Fallback to system mpirun if not found in env (though it should be there)
+        mpirun_path = "mpirun"
+    
     cmd = [
-        "mpirun", "-np", "2",  # 2 processos para testes
+        str(mpirun_path), "-np", "2",  # 2 processos para testes
         sys.executable,
         str(PROJECT_ROOT / "run_data_harvest.py"),
         "--episodes", "1",
@@ -117,14 +123,20 @@ def _get_latest_episode_id(db_path: Path, episodes_before: int) -> str:
         """)
         row = cursor.fetchone()
     except sqlite3.OperationalError:
-        # Fallback para v1
-        cursor.execute("""
-            SELECT DISTINCT episode_id 
-            FROM training_data 
-            ORDER BY id DESC 
-            LIMIT 1
-        """)
-        row = cursor.fetchone()
+        row = None
+
+    # Se não encontrou em episodes (ou tabela não existe), tenta training_data
+    if row is None:
+        try:
+            cursor.execute("""
+                SELECT episode_id 
+                FROM training_data 
+                ORDER BY id DESC 
+                LIMIT 1
+            """)
+            row = cursor.fetchone()
+        except sqlite3.OperationalError:
+            pass
     
     conn.close()
     

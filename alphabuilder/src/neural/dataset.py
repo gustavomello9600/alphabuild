@@ -43,8 +43,8 @@ def deserialize_array(blob: bytes) -> np.ndarray:
 
 
 def deserialize_state_legacy(blob: bytes) -> np.ndarray:
-    """Legacy: deserialize from pickle without compression."""
-    return pickle.loads(blob)
+    """Legacy: deserialize from pickle with compression."""
+    return pickle.loads(zlib.decompress(blob))
 
 
 def detect_schema_version(db_path: Path) -> str:

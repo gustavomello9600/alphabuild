@@ -1,6 +1,6 @@
 # 📊 Relatório de Qualidade de Dados de Treino
 
-**Gerado em:** 2025-12-02 02:14:54
+**Gerado em:** 2025-12-03 06:07:05
 **Banco de Dados:** `episodios_de_testes_de_integracao.db`
 
 ---
@@ -18,8 +18,8 @@
 
 | Episode ID | Records | GROWTH | REFINEMENT | Avg Fitness | Min | Max |
 |------------|---------|--------|------------|-------------|-----|-----|
-| `49897627...` | 80 | 49 | 31 | -0.9647 | -0.9919 | -0.9385 |
-| `54e10628...` | 26 | 0 | 26 | -0.9597 | -0.9836 | -0.9461 |
+| `1d18456f...` | 80 | 49 | 31 | -0.8615 | -0.9532 | -0.8244 |
+| `ff7d1232...` | 26 | 0 | 26 | -0.9041 | -0.9492 | -0.8743 |
 
 ## 3. Análise de Tensores
 
@@ -55,13 +55,13 @@
 
 | Estatística | Valor |
 |-------------|-------|
-| Mínimo | -0.991854 |
-| Máximo | -0.938510 |
-| Média | -0.963461 |
-| Mediana | -0.957936 |
-| Desvio Padrão | 0.010996 |
-| Percentil 25 | -0.972978 |
-| Percentil 75 | -0.957936 |
+| Mínimo | -0.953204 |
+| Máximo | -0.824384 |
+| Média | -0.871944 |
+| Mediana | -0.882072 |
+| Desvio Padrão | 0.046378 |
+| Percentil 25 | -0.914150 |
+| Percentil 75 | -0.824384 |
 
 ### 4.2 Distribuição por Faixa
 
@@ -76,8 +76,8 @@
 
 | Fase | Count | Avg | Min | Max |
 |------|-------|-----|-----|-----|
-| GROWTH | 49 | -0.9579 | -0.9579 | -0.9579 |
-| REFINEMENT | 57 | -0.9682 | -0.9919 | -0.9385 |
+| GROWTH | 49 | -0.8244 | -0.8244 | -0.8244 |
+| REFINEMENT | 57 | -0.9128 | -0.9532 | -0.8743 |
 
 ## 5. Análise de Policy Targets
 
@@ -120,16 +120,16 @@
 
 | # | Episode | Step | Phase | Fitness | BC Type |
 |---|---------|------|-------|---------|---------|
-| 1 | `54e10628...` | 11 | REFINEMENT | -0.9590 | FULL_CLAMP |
-| 2 | `54e10628...` | 2 | REFINEMENT | -0.9750 | FULL_CLAMP |
-| 3 | `49897627...` | 61 | REFINEMENT | -0.9827 | RAIL_XY |
-| 4 | `54e10628...` | 9 | REFINEMENT | -0.9613 | FULL_CLAMP |
-| 5 | `49897627...` | 40 | GROWTH | -0.9579 | RAIL_XY |
-| 6 | `49897627...` | 23 | GROWTH | -0.9579 | RAIL_XY |
-| 7 | `49897627...` | 29 | GROWTH | -0.9579 | RAIL_XY |
-| 8 | `49897627...` | 26 | GROWTH | -0.9579 | RAIL_XY |
-| 9 | `54e10628...` | 16 | REFINEMENT | -0.9547 | FULL_CLAMP |
-| 10 | `49897627...` | 2 | GROWTH | -0.9579 | RAIL_XY |
+| 1 | `1d18456f...` | 30 | GROWTH | -0.8244 | RAIL_XY |
+| 2 | `1d18456f...` | 8 | GROWTH | -0.8244 | RAIL_XY |
+| 3 | `1d18456f...` | 25 | GROWTH | -0.8244 | RAIL_XY |
+| 4 | `1d18456f...` | 55 | REFINEMENT | -0.9207 | RAIL_XY |
+| 5 | `1d18456f...` | 40 | GROWTH | -0.8244 | RAIL_XY |
+| 6 | `1d18456f...` | 42 | GROWTH | -0.8244 | RAIL_XY |
+| 7 | `1d18456f...` | 60 | REFINEMENT | -0.9354 | RAIL_XY |
+| 8 | `1d18456f...` | 10 | GROWTH | -0.8244 | RAIL_XY |
+| 9 | `1d18456f...` | 61 | REFINEMENT | -0.9332 | RAIL_XY |
+| 10 | `ff7d1232...` | 25 | REFINEMENT | -0.8743 | FULL_CLAMP |
 
 ## 8. Validação de Conformidade v3.1
 

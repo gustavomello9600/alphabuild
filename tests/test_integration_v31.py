@@ -71,11 +71,26 @@ class TestIntegrationV31:
         
         assert episode_id is not None, "Episode ID não deveria ser None"
         
-        # Verifica se dados foram salvos
+        # Verifica se dados foram salvos (suporta schema v1 e v2)
         conn = sqlite3.connect(TEST_DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM training_data WHERE episode_id = ?", (episode_id,))
-        count = cursor.fetchone()[0]
+        
+        # Tenta schema v2 primeiro
+        # Tenta schema v2 primeiro
+        try:
+            cursor.execute("SELECT COUNT(*) FROM records WHERE episode_id = ?", (episode_id,))
+            count = cursor.fetchone()[0]
+        except sqlite3.OperationalError:
+            count = 0
+            
+        # Se não achou em records, tenta training_data
+        if count == 0:
+            try:
+                cursor.execute("SELECT COUNT(*) FROM training_data WHERE episode_id = ?", (episode_id,))
+                count = cursor.fetchone()[0]
+            except sqlite3.OperationalError:
+                pass
+        
         conn.close()
         
         assert count > 0, f"Deveria ter registros para episódio Bezier, encontrou {count}"
@@ -95,11 +110,26 @@ class TestIntegrationV31:
         
         assert episode_id is not None, "Episode ID não deveria ser None"
         
-        # Verifica se dados foram salvos
+        # Verifica se dados foram salvos (suporta schema v1 e v2)
         conn = sqlite3.connect(TEST_DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM training_data WHERE episode_id = ?", (episode_id,))
-        count = cursor.fetchone()[0]
+        
+        # Tenta schema v2 primeiro
+        # Tenta schema v2 primeiro
+        try:
+            cursor.execute("SELECT COUNT(*) FROM records WHERE episode_id = ?", (episode_id,))
+            count = cursor.fetchone()[0]
+        except sqlite3.OperationalError:
+            count = 0
+            
+        # Se não achou em records, tenta training_data
+        if count == 0:
+            try:
+                cursor.execute("SELECT COUNT(*) FROM training_data WHERE episode_id = ?", (episode_id,))
+                count = cursor.fetchone()[0]
+            except sqlite3.OperationalError:
+                pass
+        
         conn.close()
         
         assert count > 0, f"Deveria ter registros para episódio Full Domain, encontrou {count}"
@@ -108,41 +138,56 @@ class TestIntegrationV31:
     # ==================== DB VALIDATION ====================
     
     def test_03_validate_db_schema(self):
-        """Verifica se o schema do banco está correto para v3.1."""
+        """Verifica se o schema do banco está correto para v3.1 (suporta v1 e v2)."""
+        from alphabuilder.src.logic.storage import has_new_schema
+        
         conn = sqlite3.connect(TEST_DB_PATH)
         cursor = conn.cursor()
         
-        # Verifica colunas da tabela
-        cursor.execute("PRAGMA table_info(training_data)")
-        columns = {row[1] for row in cursor.fetchall()}
+        # Detecta schema
+        is_v2 = has_new_schema(TEST_DB_PATH)
         
-        required_columns = {
-            'id', 'episode_id', 'step', 'phase',
-            'state_blob', 'policy_blob', 'fitness_score',
-            'valid_fem', 'metadata'
-        }
-        
-        missing = required_columns - columns
-        assert len(missing) == 0, f"Colunas faltando no schema: {missing}"
+        if is_v2:
+            # Schema v2: verifica tabelas episodes e records
+            cursor.execute("PRAGMA table_info(episodes)")
+            ep_columns = {row[1] for row in cursor.fetchall()}
+            cursor.execute("PRAGMA table_info(records)")
+            rec_columns = {row[1] for row in cursor.fetchall()}
+            
+            required_ep_columns = {'episode_id', 'bc_masks_blob', 'forces_blob', 'load_config', 'bc_type', 'strategy', 'resolution'}
+            required_rec_columns = {'episode_id', 'step', 'phase', 'density_blob', 'policy_add_blob', 'policy_remove_blob', 'fitness_score', 'is_final_step', 'is_connected'}
+            
+            missing_ep = required_ep_columns - ep_columns
+            missing_rec = required_rec_columns - rec_columns
+            assert len(missing_ep) == 0, f"Colunas faltando em episodes: {missing_ep}"
+            assert len(missing_rec) == 0, f"Colunas faltando em records: {missing_rec}"
+            print("✓ Schema v2 válido (episodes + records)")
+        else:
+            # Schema v1: verifica tabela training_data
+            cursor.execute("PRAGMA table_info(training_data)")
+            columns = {row[1] for row in cursor.fetchall()}
+            
+            required_columns = {
+                'id', 'episode_id', 'step', 'phase',
+                'state_blob', 'policy_blob', 'fitness_score',
+                'valid_fem', 'metadata'
+            }
+            
+            missing = required_columns - columns
+            assert len(missing) == 0, f"Colunas faltando no schema: {missing}"
+            print("✓ Schema v1 válido (training_data)")
         
         conn.close()
-        print("✓ Schema do banco válido")
     
     def test_04_validate_tensor_dimensions(self):
         """Verifica se os tensores armazenados têm 7 canais (v3.1)."""
-        from alphabuilder.src.logic.storage import deserialize_state
+        from alphabuilder.src.neural.dataset import TopologyDatasetV31
         
-        conn = sqlite3.connect(TEST_DB_PATH)
-        cursor = conn.cursor()
+        dataset = TopologyDatasetV31(TEST_DB_PATH, augment=False)
+        assert len(dataset) > 0, "Deveria ter pelo menos um registro"
         
-        # Pega um registro aleatório
-        cursor.execute("SELECT state_blob FROM training_data LIMIT 1")
-        row = cursor.fetchone()
-        conn.close()
-        
-        assert row is not None, "Deveria ter pelo menos um registro"
-        
-        state = deserialize_state(row[0])
+        sample = dataset[0]
+        state = sample['state'].numpy()
         
         # v3.1: 7 canais (density, mask_x, mask_y, mask_z, fx, fy, fz)
         assert state.shape[0] == 7, f"Estado deveria ter 7 canais, tem {state.shape[0]}"
@@ -152,44 +197,39 @@ class TestIntegrationV31:
     
     def test_05_validate_metadata_fields(self):
         """Verifica se metadados is_final_step e is_connected estão presentes."""
-        import json
+        from alphabuilder.src.neural.dataset import TopologyDatasetV31
         
-        conn = sqlite3.connect(TEST_DB_PATH)
-        cursor = conn.cursor()
+        dataset = TopologyDatasetV31(TEST_DB_PATH, augment=False)
+        assert len(dataset) > 0, "Deveria ter pelo menos um registro"
         
-        # Verifica se existem registros com is_final_step
-        cursor.execute("SELECT metadata FROM training_data WHERE metadata LIKE '%is_final_step%' LIMIT 1")
-        row = cursor.fetchone()
+        # Procura um registro com is_final_step
+        found_final = False
+        found_connected = False
         
-        assert row is not None, "Deveria ter registros com metadado is_final_step"
+        for i in range(min(100, len(dataset))):  # Verifica até 100 amostras
+            sample = dataset[i]
+            if sample.get('is_final', False):  # Dataset retorna 'is_final', não 'is_final_step'
+                found_final = True
+            if sample.get('phase') == 'REFINEMENT' and sample.get('is_connected', False):
+                found_connected = True
+            if found_final and found_connected:
+                break
         
-        metadata = json.loads(row[0])
-        assert 'is_final_step' in metadata, "Metadado is_final_step não encontrado"
+        assert found_final, "Deveria ter registros com is_final=True"
+        assert found_connected, "Deveria ter registros REFINEMENT com is_connected=True"
         
-        # Verifica is_connected em registros de Phase 2
-        cursor.execute("""
-            SELECT metadata FROM training_data 
-            WHERE phase = 'REFINEMENT' AND metadata LIKE '%is_connected%' 
-            LIMIT 1
-        """)
-        row = cursor.fetchone()
-        
-        assert row is not None, "Deveria ter registros REFINEMENT com is_connected"
-        
-        metadata = json.loads(row[0])
-        assert 'is_connected' in metadata, "Metadado is_connected não encontrado"
-        
-        conn.close()
         print("✓ Metadados is_final_step e is_connected presentes")
     
     def test_06_validate_phase_distribution(self):
         """Verifica distribuição de fases (GROWTH vs REFINEMENT)."""
-        conn = sqlite3.connect(TEST_DB_PATH)
-        cursor = conn.cursor()
+        from alphabuilder.src.neural.dataset import TopologyDatasetV31
+        from collections import Counter
         
-        cursor.execute("SELECT phase, COUNT(*) FROM training_data GROUP BY phase")
-        phase_counts = dict(cursor.fetchall())
-        conn.close()
+        dataset = TopologyDatasetV31(TEST_DB_PATH, augment=False)
+        assert len(dataset) > 0, "Deveria ter pelo menos um registro"
+        
+        phases = [dataset[i]['phase'] for i in range(len(dataset))]
+        phase_counts = dict(Counter(phases))
         
         assert 'GROWTH' in phase_counts, "Deveria ter registros GROWTH (Fase 1)"
         assert 'REFINEMENT' in phase_counts, "Deveria ter registros REFINEMENT (Fase 2)"
@@ -201,16 +241,14 @@ class TestIntegrationV31:
     def test_07_augmentation_rotation_90(self):
         """Testa augmentation de rotação 90° com inversão de forças."""
         from alphabuilder.src.neural.augmentation import rotate_90_z
-        from alphabuilder.src.logic.storage import deserialize_state
+        from alphabuilder.src.neural.dataset import TopologyDatasetV31
         
-        conn = sqlite3.connect(TEST_DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT state_blob, policy_blob FROM training_data LIMIT 1")
-        row = cursor.fetchone()
-        conn.close()
+        dataset = TopologyDatasetV31(TEST_DB_PATH, augment=False)
+        assert len(dataset) > 0, "Deveria ter pelo menos um registro"
         
-        state = deserialize_state(row[0])
-        policy = deserialize_state(row[1])
+        sample = dataset[0]
+        state = sample['state'].numpy()
+        policy = sample['policy'].numpy()
         
         # Aplica rotação
         state_rot, policy_rot = rotate_90_z(state, policy)
@@ -234,16 +272,14 @@ class TestIntegrationV31:
     def test_08_augmentation_flip(self):
         """Testa augmentation de flip com inversão de forças."""
         from alphabuilder.src.neural.augmentation import flip_y
-        from alphabuilder.src.logic.storage import deserialize_state
+        from alphabuilder.src.neural.dataset import TopologyDatasetV31
         
-        conn = sqlite3.connect(TEST_DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT state_blob, policy_blob FROM training_data LIMIT 1")
-        row = cursor.fetchone()
-        conn.close()
+        dataset = TopologyDatasetV31(TEST_DB_PATH, augment=False)
+        assert len(dataset) > 0, "Deveria ter pelo menos um registro"
         
-        state = deserialize_state(row[0])
-        policy = deserialize_state(row[1])
+        sample = dataset[0]
+        state = sample['state'].numpy()
+        policy = sample['policy'].numpy()
         
         # Aplica flip
         state_flip, policy_flip = flip_y(state, policy)
@@ -260,26 +296,24 @@ class TestIntegrationV31:
     def test_09_augmentation_erosion_attack(self):
         """Testa Erosion Attack em estados finais."""
         from alphabuilder.src.neural.augmentation import erosion_attack
-        from alphabuilder.src.logic.storage import deserialize_state
-        import json
+        from alphabuilder.src.neural.dataset import TopologyDatasetV31
         
-        conn = sqlite3.connect(TEST_DB_PATH)
-        cursor = conn.cursor()
-        # Busca um estado final
-        cursor.execute("""
-            SELECT state_blob, policy_blob, fitness_score, metadata 
-            FROM training_data 
-            WHERE metadata LIKE '%"is_final_step": true%'
-            LIMIT 1
-        """)
-        row = cursor.fetchone()
-        conn.close()
+        dataset = TopologyDatasetV31(TEST_DB_PATH, augment=False)
+        assert len(dataset) > 0, "Deveria ter pelo menos um registro"
         
-        assert row is not None, "Deveria ter um estado final para testar erosion"
+        # Procura um estado final
+        sample = None
+        for i in range(min(100, len(dataset))):
+            s = dataset[i]
+            if s.get('is_final', False):  # Dataset retorna 'is_final', não 'is_final_step'
+                sample = s
+                break
         
-        state = deserialize_state(row[0])
-        policy = deserialize_state(row[1])
-        original_value = row[2]
+        assert sample is not None, "Deveria ter um estado final para testar erosion"
+        
+        state = sample['state'].numpy()
+        policy = sample['policy'].numpy()
+        original_value = sample['value'].item()  # Dataset retorna 'value', não 'fitness_score'
         
         # Aplica erosion attack
         state_eroded, policy_eroded, new_value = erosion_attack(state, policy, original_value)
@@ -300,28 +334,24 @@ class TestIntegrationV31:
     def test_10_augmentation_load_multiplier(self):
         """Testa Load Multiplier em estados conectados."""
         from alphabuilder.src.neural.augmentation import load_multiplier
-        from alphabuilder.src.logic.storage import deserialize_state
+        from alphabuilder.src.neural.dataset import TopologyDatasetV31
         
-        conn = sqlite3.connect(TEST_DB_PATH)
-        cursor = conn.cursor()
-        # Busca um estado conectado (não final)
-        cursor.execute("""
-            SELECT state_blob, policy_blob, fitness_score
-            FROM training_data 
-            WHERE phase = 'REFINEMENT' 
-            AND metadata LIKE '%"is_connected": true%'
-            AND metadata NOT LIKE '%"is_final_step": true%'
-            LIMIT 1
-        """)
-        row = cursor.fetchone()
-        conn.close()
+        # Busca um estado conectado (não final) usando dataset
+        dataset = TopologyDatasetV31(TEST_DB_PATH, augment=False, phase_filter='REFINEMENT')
         
-        if row is None:
+        sample = None
+        for i in range(min(100, len(dataset))):
+            s = dataset[i]
+            if s.get('is_connected', False) and not s.get('is_final', False):
+                sample = s
+                break
+        
+        if sample is None:
             pytest.skip("Nenhum estado conectado não-final encontrado")
         
-        state = deserialize_state(row[0])
-        policy = deserialize_state(row[1])
-        original_value = row[2]
+        state = sample['state'].numpy()
+        policy = sample['policy'].numpy()
+        original_value = sample['value'].item()
         
         # Aplica load multiplier (K=3.0)
         state_stressed, policy_stressed, new_value = load_multiplier(state, policy, original_value, k=3.0)
@@ -342,17 +372,15 @@ class TestIntegrationV31:
     def test_11_augmentation_sabotage(self):
         """Testa Sabotage (remoção de voxels em nós críticos)."""
         from alphabuilder.src.neural.augmentation import sabotage
-        from alphabuilder.src.logic.storage import deserialize_state
+        from alphabuilder.src.neural.dataset import TopologyDatasetV31
         
-        conn = sqlite3.connect(TEST_DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT state_blob, policy_blob, fitness_score FROM training_data LIMIT 1")
-        row = cursor.fetchone()
-        conn.close()
+        dataset = TopologyDatasetV31(TEST_DB_PATH, augment=False)
+        assert len(dataset) > 0, "Deveria ter pelo menos um registro"
         
-        state = deserialize_state(row[0])
-        policy = deserialize_state(row[1])
-        original_value = row[2]
+        sample = dataset[0]
+        state = sample['state'].numpy()
+        policy = sample['policy'].numpy()
+        original_value = sample['value'].item()  # Dataset retorna 'value', não 'fitness_score'
         
         # Aplica sabotage
         state_sab, policy_sab, new_value = sabotage(state, policy, original_value)
@@ -370,17 +398,15 @@ class TestIntegrationV31:
     def test_12_augmentation_saboteur(self):
         """Testa Saboteur (remoção de cubo aleatório)."""
         from alphabuilder.src.neural.augmentation import saboteur
-        from alphabuilder.src.logic.storage import deserialize_state
+        from alphabuilder.src.neural.dataset import TopologyDatasetV31
         
-        conn = sqlite3.connect(TEST_DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT state_blob, policy_blob, fitness_score FROM training_data LIMIT 1")
-        row = cursor.fetchone()
-        conn.close()
+        dataset = TopologyDatasetV31(TEST_DB_PATH, augment=False)
+        assert len(dataset) > 0, "Deveria ter pelo menos um registro"
         
-        state = deserialize_state(row[0])
-        policy = deserialize_state(row[1])
-        original_value = row[2]
+        sample = dataset[0]
+        state = sample['state'].numpy()
+        policy = sample['policy'].numpy()
+        original_value = sample['value'].item()  # Dataset retorna 'value', não 'fitness_score'
         
         # Aplica saboteur
         state_sab, policy_sab, new_value = saboteur(state, policy, original_value)
@@ -448,27 +474,18 @@ class TestIntegrationV31:
     def test_14_inference_phase1(self):
         """Testa inferência em um ponto de dados da Fase 1 (GROWTH)."""
         from alphabuilder.src.neural.model import AlphaBuilderV31
-        from alphabuilder.src.logic.storage import deserialize_state
+        from alphabuilder.src.neural.dataset import TopologyDatasetV31
         
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Carrega um ponto de Fase 1
-        conn = sqlite3.connect(TEST_DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT state_blob, policy_blob, fitness_score 
-            FROM training_data 
-            WHERE phase = 'GROWTH' 
-            LIMIT 1
-        """)
-        row = cursor.fetchone()
-        conn.close()
+        # Carrega um ponto de Fase 1 usando dataset
+        dataset = TopologyDatasetV31(TEST_DB_PATH, augment=False, phase_filter='GROWTH')
+        assert len(dataset) > 0, "Deveria ter um ponto de Fase 1"
         
-        assert row is not None, "Deveria ter um ponto de Fase 1"
-        
-        state = deserialize_state(row[0])
-        target_policy = deserialize_state(row[1])
-        target_value = row[2]
+        sample = dataset[0]
+        state = sample['state'].numpy()
+        target_policy = sample['policy'].numpy()
+        target_value = sample['value'].item()
         
         # Modelo (use_swin=False para resoluções pequenas de teste)
         model = AlphaBuilderV31(
@@ -501,25 +518,16 @@ class TestIntegrationV31:
     def test_15_inference_phase2(self):
         """Testa inferência em um ponto de dados da Fase 2 (REFINEMENT)."""
         from alphabuilder.src.neural.model import AlphaBuilderV31
-        from alphabuilder.src.logic.storage import deserialize_state
+        from alphabuilder.src.neural.dataset import TopologyDatasetV31
         
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Carrega um ponto de Fase 2
-        conn = sqlite3.connect(TEST_DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT state_blob, policy_blob, fitness_score 
-            FROM training_data 
-            WHERE phase = 'REFINEMENT' 
-            LIMIT 1
-        """)
-        row = cursor.fetchone()
-        conn.close()
+        # Carrega um ponto de Fase 2 usando dataset
+        dataset = TopologyDatasetV31(TEST_DB_PATH, augment=False, phase_filter='REFINEMENT')
+        assert len(dataset) > 0, "Deveria ter um ponto de Fase 2"
         
-        assert row is not None, "Deveria ter um ponto de Fase 2"
-        
-        state = deserialize_state(row[0])
+        sample = dataset[0]
+        state = sample['state'].numpy()
         
         # Modelo (use_swin=False para resoluções pequenas de teste)
         model = AlphaBuilderV31(

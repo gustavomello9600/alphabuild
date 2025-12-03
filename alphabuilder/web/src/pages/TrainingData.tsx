@@ -1,5 +1,5 @@
-import { useEffect, useState, useMemo } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useEffect, useState, useMemo, useRef } from 'react';
+import { useNavigate, useParams, useLocation } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
     Database,
@@ -331,6 +331,7 @@ const EmptyState = ({ message, icon: Icon }: { message: string; icon: typeof Dat
 // --- Main Component ---
 export const TrainingData = () => {
     const navigate = useNavigate();
+    const location = useLocation();
     const { dbId } = useParams<{ dbId?: string }>();
 
     const [databases, setDatabases] = useState<DatabaseInfo[]>([]);
@@ -342,6 +343,10 @@ export const TrainingData = () => {
     // Pagination state
     const [currentPage, setCurrentPage] = useState(1);
     const [searchQuery, setSearchQuery] = useState('');
+    
+    // Track previous location to detect back navigation
+    const previousPathRef = useRef<string>('');
+    const loadedDbIdRef = useRef<string | null>(null);
 
     // Filter and paginate episodes
     const filteredEpisodes = useMemo(() => {
@@ -369,15 +374,59 @@ export const TrainingData = () => {
         loadDatabases();
     }, []);
 
-    // Load episodes when dbId changes (from URL)
+    // Detect navigation changes and force reload when coming back from replay
     useEffect(() => {
+        const currentPath = location.pathname;
+        const previousPath = previousPathRef.current;
+        
+        // Check if we're navigating back from a replay page to episode list
+        const wasOnReplay = previousPath.includes('/episode/');
+        const isOnEpisodeList = currentPath.match(/^\/data\/[^/]+$/);
+        
+        console.log(`[TrainingData] Navigation: ${previousPath} -> ${currentPath}`);
+        console.log(`[TrainingData] Was on replay: ${wasOnReplay}, Is on episode list: ${isOnEpisodeList}, dbId: ${dbId}`);
+        
+        // If we came back from replay to episode list, force reload
+        if (wasOnReplay && isOnEpisodeList && dbId) {
+            console.log(`[TrainingData] Detected back navigation from replay, forcing reload for: ${dbId}`);
+            // Reset the loaded ref to force reload
+            loadedDbIdRef.current = null;
+            // Clear episodes first to trigger UI update
+            setEpisodes([]);
+            // Force reload episodes
+            setTimeout(() => {
+                loadEpisodes(dbId);
+            }, 50);
+        }
+        
+        previousPathRef.current = currentPath;
+    }, [location.pathname, dbId]);
+
+    // Load episodes when dbId changes (from URL) or on mount
+    useEffect(() => {
+        console.log(`[TrainingData] dbId effect: ${dbId}, location: ${location.pathname}, loadedDbId: ${loadedDbIdRef.current}`);
+        
         if (dbId) {
-            loadEpisodes(dbId);
+            // Always reload if dbId changed or if we haven't loaded it yet
+            if (loadedDbIdRef.current !== dbId) {
+                console.log(`[TrainingData] Loading episodes for dbId: ${dbId}`);
+                loadedDbIdRef.current = dbId;
+                loadEpisodes(dbId);
+            } else {
+                console.log(`[TrainingData] Already loaded episodes for dbId: ${dbId}`);
+                // Even if already loaded, check if episodes array is empty (might have been cleared)
+                if (episodes.length === 0 && !loadingEpisodes) {
+                    console.log(`[TrainingData] Episodes array is empty, reloading...`);
+                    loadEpisodes(dbId);
+                }
+            }
         } else {
             setEpisodes([]);
             setCurrentPage(1);
             setSearchQuery('');
+            loadedDbIdRef.current = null;
         }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [dbId]);
 
     const loadDatabases = async () => {
@@ -400,11 +449,14 @@ export const TrainingData = () => {
         setCurrentPage(1);
         setSearchQuery('');
         try {
+            console.log(`[TrainingData] Loading episodes for database: ${databaseId}`);
             const data = await fetchEpisodes(databaseId);
+            console.log(`[TrainingData] Loaded ${data.length} episodes`);
             setEpisodes(data);
         } catch (err) {
-            console.error('Failed to fetch episodes:', err);
-            setError('Erro ao carregar episódios. Verifique se o backend está rodando.');
+            console.error('[TrainingData] Failed to fetch episodes:', err);
+            const errorMessage = err instanceof Error ? err.message : 'Erro desconhecido';
+            setError(`Erro ao carregar episódios: ${errorMessage}. Verifique se o backend está rodando.`);
             setEpisodes([]);
         } finally {
             setLoadingEpisodes(false);
@@ -412,6 +464,8 @@ export const TrainingData = () => {
     };
 
     const handleSelectDb = (databaseId: string) => {
+        // Reset state when selecting a new database
+        loadedDbIdRef.current = null;
         navigate(`/data/${databaseId}`);
     };
 
@@ -430,6 +484,16 @@ export const TrainingData = () => {
         // Scroll to top of table
         window.scrollTo({ top: 200, behavior: 'smooth' });
     };
+
+    // Safety check: if we're on episode list route but episodes are empty, reload
+    useEffect(() => {
+        const isOnEpisodeList = location.pathname.match(/^\/data\/[^/]+$/);
+        if (isOnEpisodeList && dbId && episodes.length === 0 && !loadingEpisodes && !loadingDbs) {
+            console.log(`[TrainingData] Safety check: episodes empty on episode list route, reloading for: ${dbId}`);
+            loadedDbIdRef.current = null;
+            loadEpisodes(dbId);
+        }
+    }, [location.pathname, dbId, episodes.length, loadingEpisodes, loadingDbs]);
 
     // Stats calculations
     const stats = useMemo(() => {

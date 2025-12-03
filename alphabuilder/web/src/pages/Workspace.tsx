@@ -184,7 +184,7 @@ const VoxelGrid = ({
                         supportColor = getSupportColor(maskX, maskY, maskZ);
                     } else {
                         // Legacy 5-channel: Channel 1 is support (treat as full clamp)
-                        const isSupport = tensor.data[1 * (D * H * W) + flatIdx] > 0.5;
+                    const isSupport = tensor.data[1 * (D * H * W) + flatIdx] > 0.5;
                         if (isSupport) supportColor = SUPPORT_COLORS.FULL_CLAMP;
                     }
                     
@@ -222,10 +222,10 @@ const VoxelGrid = ({
                         } else if (hasLoad) {
                             // Magenta for loads (from design system)
                             meshRef.current.setColorAt(count, new THREE.Color('#FF0055'));
-                        } else {
-                            const val = Math.max(0.2, density);
-                            const color = new THREE.Color().setHSL(0, 0, val * 0.95);
-                            meshRef.current.setColorAt(count, color);
+                            } else {
+                                const val = Math.max(0.2, density);
+                                const color = new THREE.Color().setHSL(0, 0, val * 0.95);
+                                meshRef.current.setColorAt(count, color);
                         }
 
                         count++;
@@ -453,41 +453,97 @@ const NeuralHUD = ({
                     animate={{ opacity: 1, y: 0 }}
                     className="flex gap-4 items-end"
                 >
-                    {/* Confidence Graph (Real) */}
+                    {/* Quality Estimate Graph */}
                     <div className="bg-black/60 backdrop-blur border border-white/10 p-4 rounded-lg w-64 pointer-events-auto">
                         <div className="flex items-center gap-2 mb-2 text-cyan">
                             <Brain size={16} />
-                            <span className="text-xs font-bold uppercase">Estimativa de Qualidade (Value Head)</span>
+                            <span className="text-xs font-bold uppercase tracking-wider">
+                                Estimativa de Qualidade
+                            </span>
                         </div>
                         <div className="h-24 flex items-end gap-1 border-b border-white/10 pb-1 relative">
-                            {/* Render last 20 points or pad with empty */}
                             {(() => {
                                 const windowSize = 20;
-                                const startIndex = Math.max(0, history.length - windowSize);
-                                const visibleHistory = history.slice(startIndex);
-                                // Auto-scale: Find max value in visible window, default to 1.0 if empty/zero
-                                const maxVal = Math.max(...visibleHistory, 1.0);
+                                // Get last windowSize values (most recent at the end)
+                                const visibleHistory = history.length > 0 
+                                    ? history.slice(-windowSize)
+                                    : [];
+                                
+                                if (visibleHistory.length === 0) {
+                                    return Array.from({ length: windowSize }).map((_, i) => (
+                                        <div key={i} className="flex-1" />
+                                    ));
+                                }
 
-                                return Array.from({ length: windowSize }).map((_, i) => {
-                                    const dataIndex = history.length - windowSize + i;
-                                    const value = dataIndex >= 0 ? history[dataIndex] : 0;
-                                    // Normalize height to fit container (max 100%)
-                                    const percentage = (value / maxVal) * 100;
+                                // Calculate scale that handles negative values
+                                const min = Math.min(...visibleHistory);
+                                const max = Math.max(...visibleHistory);
+                                const range = max - min;
+                                const padding = range * 0.1 || 0.2;
+                                const scale = {
+                                    min: min - padding,
+                                    max: max + padding,
+                                    range: range + padding * 2,
+                                };
+                                
+                                const zeroLine = scale.min < 0 && scale.max > 0 
+                                    ? (-scale.min / scale.range) * 100 
+                                    : null;
 
-                                    return (
-                                        <div
-                                            key={i}
-                                            className="flex-1 bg-cyan/50 rounded-t-sm transition-all duration-300"
-                                            style={{ height: `${Math.min(100, percentage)}%` }}
-                                            title={`Value: ${value.toFixed(4)}`}
-                                        />
-                                    );
-                                });
+                                return (
+                                    <>
+                                        {/* Zero line indicator */}
+                                        {zeroLine !== null && (
+                                            <div
+                                                className="absolute left-0 right-0 h-px bg-white/20 pointer-events-none"
+                                                style={{ bottom: `${zeroLine}%` }}
+                                            />
+                                        )}
+                                        {visibleHistory.map((value, i) => {
+                                            // Normalize value to 0-100% based on scale
+                                            const normalized = ((value - scale.min) / scale.range) * 100;
+                                            const height = Math.max(2, Math.min(100, normalized));
+                                            const isPositive = value >= 0;
+                                            const colorClass = isPositive 
+                                                ? 'bg-gradient-to-t from-cyan/30 to-cyan/80'
+                                                : 'bg-gradient-to-t from-magenta/30 to-magenta/80';
+
+                                            return (
+                                                <div
+                                                    key={i}
+                                                    className={`flex-1 ${colorClass} rounded-t-sm transition-all duration-300`}
+                                                    style={{ height: `${height}%` }}
+                                                    title={`Step ${history.length - visibleHistory.length + i + 1}: ${value.toFixed(4)}`}
+                                                />
+                                            );
+                                        })}
+                                        {/* Pad with empty slots if needed */}
+                                        {Array.from({ length: windowSize - visibleHistory.length }).map((_, i) => (
+                                            <div key={`pad-${i}`} className="flex-1" />
+                                        ))}
+                                    </>
+                                );
                             })()}
                         </div>
-                        <div className="mt-2 flex justify-between font-mono text-xs text-cyan">
-                            <span className="text-white/30">Scale: 0 - {Math.max(...history.slice(-20), 1.0).toFixed(2)}</span>
-                            <span>{(state?.value_confidence || 0).toFixed(4)}</span>
+                        <div className="mt-2 flex justify-between font-mono text-xs">
+                            {history.length > 0 ? (
+                                <>
+                                    <span className="text-white/30">
+                                        {(() => {
+                                            const visibleHistory = history.slice(-20);
+                                            const min = Math.min(...visibleHistory);
+                                            const max = Math.max(...visibleHistory);
+                                            const padding = (max - min) * 0.1 || 0.2;
+                                            return `${(min - padding).toFixed(2)} - ${(max + padding).toFixed(2)}`;
+                                        })()}
+                                    </span>
+                                    <span className={state?.value_confidence && state.value_confidence >= 0 ? 'text-cyan' : 'text-magenta'}>
+                                        {(state?.value_confidence || 0).toFixed(4)}
+                                    </span>
+                                </>
+                            ) : (
+                                <span className="text-white/30">Carregando...</span>
+                            )}
                         </div>
                     </div>
 
@@ -521,7 +577,24 @@ export const Workspace = () => {
             setHistory([]); // Reset history on new episode
             const unsubscribe = mockService.subscribe((state) => {
                 setGameState(state);
-                setHistory(prev => [...prev, state.value_confidence || 0]);
+                // Build history from all frames up to current step, sorted by step
+                const simState = mockService.getSimulationState();
+                if (simState.stepsLoaded > 0) {
+                    const allFrames = mockService.getAllFrames();
+                    if (allFrames.length > 0 && simState.currentStep < allFrames.length) {
+                        // Get current frame's step number
+                        const currentFrame = allFrames[simState.currentStep];
+                        const currentStepNumber = currentFrame.step;
+                        
+                        // Get all frames up to current step, sorted by step (ascending)
+                        const framesUpToCurrent = allFrames
+                            .filter(f => f.step <= currentStepNumber)
+                            .sort((a, b) => a.step - b.step);
+                        
+                        const historyValues = framesUpToCurrent.map(f => f.value_confidence || 0);
+                        setHistory(historyValues);
+                    }
+                }
             });
             mockService.startSimulation(id);
             return () => {

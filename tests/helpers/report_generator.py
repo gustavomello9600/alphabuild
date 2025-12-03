@@ -11,7 +11,8 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Tuple
 
-from alphabuilder.src.logic.storage import deserialize_state
+from alphabuilder.src.logic.storage import deserialize_state, sparse_decode
+from alphabuilder.src.neural.dataset import deserialize_sparse, deserialize_array
 
 
 def generate_quality_report(db_path: Path, output_path: Path) -> str:
@@ -152,9 +153,22 @@ def generate_quality_report(db_path: Path, output_path: Path) -> str:
     report_lines.append("## 4. Análise de Fitness Score (Value Target)")
     report_lines.append("")
     
-    cursor.execute("SELECT fitness_score FROM training_data")
+    # Detecta schema e busca scores
+    from alphabuilder.src.logic.storage import has_new_schema
+    is_v2 = has_new_schema(db_path)
+    
+    if is_v2:
+        cursor.execute("SELECT fitness_score FROM records")
+    else:
+        cursor.execute("SELECT fitness_score FROM training_data")
+    
     all_scores = [row[0] for row in cursor.fetchall()]
-    scores_array = np.array(all_scores)
+    scores_array = np.array(all_scores) if all_scores else np.array([])
+    
+    if len(scores_array) == 0:
+        report_lines.append("⚠️ Nenhum score encontrado no banco de dados.")
+        report_lines.append("")
+        return "\n".join(report_lines)
     
     report_lines.append(f"### 4.1 Estatísticas Gerais")
     report_lines.append("")
@@ -213,33 +227,78 @@ def generate_quality_report(db_path: Path, output_path: Path) -> str:
     report_lines.append(f"### 5.1 Balanceamento de Classes")
     report_lines.append("")
     
-    # Amostra mais registros
-    cursor.execute("SELECT policy_blob, phase FROM training_data")
-    policy_samples = cursor.fetchall()
+    # Amostra mais registros (suporta schema v1 e v2)
+    from alphabuilder.src.logic.storage import has_new_schema, sparse_decode, deserialize_array
+    is_v2 = has_new_schema(db_path)
     
-    add_ratios = []
-    rem_ratios = []
-    growth_add_ratios = []
-    refinement_add_ratios = []
+    if is_v2:
+        cursor.execute("""
+            SELECT r.policy_add_blob, r.policy_remove_blob, r.phase, e.resolution
+            FROM records r
+            JOIN episodes e ON r.episode_id = e.episode_id
+            LIMIT 1000
+        """)
+        policy_samples = cursor.fetchall()
+        
+        add_ratios = []
+        rem_ratios = []
+        growth_add_ratios = []
+        refinement_add_ratios = []
+        
+        for policy_add_blob, policy_remove_blob, phase, resolution_json in policy_samples:
+            if policy_add_blob and policy_remove_blob:
+                # Schema v2: policy está em formato esparso
+                resolution = tuple(json.loads(resolution_json))
+                
+                # Deserializa esparso
+                add_idx, add_val = deserialize_sparse(policy_add_blob)
+                rem_idx, rem_val = deserialize_sparse(policy_remove_blob)
+                
+                add_ch = sparse_decode(add_idx, add_val, resolution)
+                rem_ch = sparse_decode(rem_idx, rem_val, resolution)
+                
+                add_ratio = (add_ch > 0.5).sum() / add_ch.size
+                rem_ratio = (rem_ch > 0.5).sum() / rem_ch.size
+                
+                add_ratios.append(add_ratio)
+                rem_ratios.append(rem_ratio)
+                
+                if phase == 'GROWTH':
+                    growth_add_ratios.append(add_ratio)
+                else:
+                    refinement_add_ratios.append(add_ratio)
+    else:
+        cursor.execute("SELECT policy_blob, phase FROM training_data LIMIT 1000")
+        policy_samples = cursor.fetchall()
+        
+        add_ratios = []
+        rem_ratios = []
+        growth_add_ratios = []
+        refinement_add_ratios = []
+        
+        for policy_blob, phase in policy_samples:
+            policy = deserialize_state(policy_blob)
+            add_ch = policy[0]
+            rem_ch = policy[1]
+            
+            add_ratio = (add_ch > 0.5).sum() / add_ch.size
+            rem_ratio = (rem_ch > 0.5).sum() / rem_ch.size
+            
+            add_ratios.append(add_ratio)
+            rem_ratios.append(rem_ratio)
+            
+            if phase == 'GROWTH':
+                growth_add_ratios.append(add_ratio)
+            else:
+                refinement_add_ratios.append(add_ratio)
     
-    for policy_blob, phase in policy_samples:
-        policy = deserialize_state(policy_blob)
-        add_ch = policy[0]
-        rem_ch = policy[1]
-        
-        add_ratio = (add_ch > 0.5).sum() / add_ch.size
-        rem_ratio = (rem_ch > 0.5).sum() / rem_ch.size
-        
-        add_ratios.append(add_ratio)
-        rem_ratios.append(rem_ratio)
-        
-        if phase == 'GROWTH':
-            growth_add_ratios.append(add_ratio)
-        else:
-            refinement_add_ratios.append(add_ratio)
+    add_ratios = np.array(add_ratios) if add_ratios else np.array([])
+    rem_ratios = np.array(rem_ratios) if rem_ratios else np.array([])
     
-    add_ratios = np.array(add_ratios)
-    rem_ratios = np.array(rem_ratios)
+    if len(add_ratios) == 0:
+        report_lines.append("⚠️ Nenhuma policy encontrada no banco de dados.")
+        report_lines.append("")
+        return "\n".join(report_lines)
     
     report_lines.append(f"| Métrica | Canal ADD | Canal REMOVE |")
     report_lines.append(f"|---------|-----------|--------------|")

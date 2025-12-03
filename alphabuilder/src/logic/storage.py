@@ -434,9 +434,16 @@ def get_episode_count(db_path: Path) -> int:
         cursor.execute("SELECT COUNT(*) FROM episodes")
         count = cursor.fetchone()[0]
     except sqlite3.OperationalError:
-        # Fallback to legacy schema
-        cursor.execute("SELECT COUNT(DISTINCT episode_id) FROM training_data")
-        count = cursor.fetchone()[0]
+        count = 0
+        
+    # If no episodes found in new schema (or table empty), check legacy
+    if count == 0:
+        try:
+            cursor.execute("SELECT COUNT(DISTINCT episode_id) FROM training_data")
+            legacy_count = cursor.fetchone()[0]
+            count += legacy_count
+        except sqlite3.OperationalError:
+            pass
     
     conn.close()
     return count

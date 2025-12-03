@@ -338,6 +338,13 @@ export class MockService {
         };
     }
 
+    /**
+     * Get all frames (for building complete history)
+     */
+    getAllFrames(): GameState[] {
+        return [...this.mockEpisode];
+    }
+
     // Deprecated alias for backward compatibility if needed, but we should use getSimulationState
     getDebugInfo() {
         return this.getSimulationState();
