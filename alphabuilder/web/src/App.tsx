@@ -3,7 +3,8 @@ import DesignSystem from './design-system/DesignSystem';
 import { MainLayout } from './components/layout/MainLayout';
 import { Dashboard } from './pages/Dashboard';
 import { Workspace } from './pages/Workspace';
-import { DataLake } from './pages/DataLake';
+import { TrainingData } from './pages/TrainingData';
+import { EpisodeReplay } from './pages/EpisodeReplay';
 import { NeuralNet } from './pages/NeuralNet';
 import { Settings } from './pages/Settings';
 
@@ -27,9 +28,22 @@ function App() {
           </MainLayout>
         } />
 
+        {/* Training Data Routes */}
         <Route path="/data" element={
           <MainLayout>
-            <DataLake />
+            <TrainingData />
+          </MainLayout>
+        } />
+
+        <Route path="/data/:dbId" element={
+          <MainLayout>
+            <TrainingData />
+          </MainLayout>
+        } />
+
+        <Route path="/data/:dbId/episode/:episodeId" element={
+          <MainLayout>
+            <EpisodeReplay />
           </MainLayout>
         } />
 

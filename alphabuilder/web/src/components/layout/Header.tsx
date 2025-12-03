@@ -1,13 +1,80 @@
-import { Bell, Search, Command } from 'lucide-react';
+import { useLocation, useParams } from 'react-router-dom';
+import { Bell, Search, Command, Home, Database, Box, Cpu, Settings, Play, ChevronRight } from 'lucide-react';
+
+// Route configuration for breadcrumbs
+const routeConfig: Record<string, { label: string; icon: typeof Home }> = {
+    '/': { label: 'Painel', icon: Home },
+    '/data': { label: 'Dados de Treino', icon: Database },
+    '/workspace': { label: 'Laboratório', icon: Box },
+    '/neural': { label: 'Rede Neural', icon: Cpu },
+    '/settings': { label: 'Configurações', icon: Settings },
+};
 
 export const Header = () => {
+    const location = useLocation();
+    const params = useParams<{ id?: string; dbId?: string; episodeId?: string }>();
+
+    // Build breadcrumbs based on current route
+    const getBreadcrumbs = () => {
+        const path = location.pathname;
+        const crumbs: { label: string; icon?: typeof Home; isActive?: boolean }[] = [];
+
+        // Always start with "AlphaBuilder"
+        crumbs.push({ label: 'AlphaBuilder', icon: Home });
+
+        if (path === '/') {
+            crumbs.push({ label: 'Painel', isActive: true });
+        } else if (path.startsWith('/data')) {
+            crumbs.push({ label: 'Dados de Treino', icon: Database });
+            
+            if (params.dbId) {
+                crumbs.push({ label: params.dbId, isActive: !params.episodeId });
+                
+                if (params.episodeId) {
+                    crumbs.push({
+                        label: `Replay`,
+                        icon: Play,
+                        isActive: true,
+                    });
+                }
+            } else {
+                crumbs[crumbs.length - 1].isActive = true;
+            }
+        } else if (path.startsWith('/workspace')) {
+            crumbs.push({ label: 'Laboratório', icon: Box });
+            if (params.id) {
+                crumbs.push({ label: params.id.slice(0, 12) + '...', isActive: true });
+            }
+        } else if (path === '/neural') {
+            crumbs.push({ label: 'Rede Neural', icon: Cpu, isActive: true });
+        } else if (path === '/settings') {
+            crumbs.push({ label: 'Configurações', icon: Settings, isActive: true });
+        }
+
+        return crumbs;
+    };
+
+    const breadcrumbs = getBreadcrumbs();
+
     return (
         <header className="h-16 border-b border-white/5 bg-void/50 backdrop-blur-sm flex items-center justify-between px-8 fixed top-0 right-0 left-0 z-40 ml-[80px] lg:ml-[260px] transition-all">
             {/* Breadcrumbs / Context */}
-            <div className="flex items-center gap-4">
-                <div className="text-white/40 text-sm font-mono">
-                    Início <span className="mx-2">/</span> Projeto Alpha <span className="mx-2">/</span> <span className="text-white">Estudo #001</span>
-                </div>
+            <div className="flex items-center gap-1">
+                {breadcrumbs.map((crumb, index) => (
+                    <div key={index} className="flex items-center">
+                        {index > 0 && (
+                            <ChevronRight size={14} className="mx-2 text-white/20" />
+                        )}
+                        <span
+                            className={`text-sm font-mono flex items-center gap-1.5 ${
+                                crumb.isActive ? 'text-white' : 'text-white/40'
+                            }`}
+                        >
+                            {crumb.icon && <crumb.icon size={14} className={crumb.isActive ? 'text-cyan' : ''} />}
+                            {crumb.label}
+                        </span>
+                    </div>
+                ))}
             </div>
 
             {/* Actions */}

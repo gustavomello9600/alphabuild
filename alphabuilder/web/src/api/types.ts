@@ -1,8 +1,23 @@
 export type Phase = 'GROWTH' | 'REFINEMENT';
 
+/**
+ * Tensor for 3D voxel representation.
+ * 
+ * v3.1 Channel Layout (7 channels):
+ * - 0: Density (ρ) - Material state (0.0 to 1.0)
+ * - 1: Mask X - 1.0 if displacement u_x is fixed (support)
+ * - 2: Mask Y - 1.0 if displacement u_y is fixed (support)
+ * - 3: Mask Z - 1.0 if displacement u_z is fixed (support)
+ * - 4: Force X (Fx) - Normalized force component
+ * - 5: Force Y (Fy) - Normalized force component
+ * - 6: Force Z (Fz) - Normalized force component
+ * 
+ * Legacy (5 channels):
+ * - 0: Density, 1: Support, 2: (unused), 3: Fy, 4: (unused)
+ */
 export interface Tensor5D {
     shape: [number, number, number, number]; // [Channels, Depth, Height, Width]
-    data: Float32Array; // Flattened data
+    data: Float32Array; // Flattened data in C-order (Channel-major)
 }
 
 export interface SimulationMetrics {

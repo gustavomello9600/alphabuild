@@ -89,7 +89,7 @@ export const Sidebar = () => {
                     {!collapsed && <h3 className="text-xs font-mono text-white/30 mb-4 px-2 uppercase">Principal</h3>}
                     <NavItem icon={LayoutDashboard} label="Painel" path="/" collapsed={collapsed} active={location.pathname === '/'} />
                     <NavItem icon={Box} label="Laboratório" path="/workspace" collapsed={collapsed} active={location.pathname.includes('/workspace')} />
-                    <NavItem icon={Database} label="Data Lake" path="/data" collapsed={collapsed} active={location.pathname === '/data'} />
+                    <NavItem icon={Database} label="Dados de Treino" path="/data" collapsed={collapsed} active={location.pathname.startsWith('/data')} />
                 </div>
 
                 <div>

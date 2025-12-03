@@ -67,23 +67,18 @@ LOG_SQUASH_EPSILON = 1e-9
 # --- Policy Quality Settings (v3.1 Quality Improvements) ---
 # These settings address identified issues with policy target quality
 
-# Window size for REFINEMENT phase (compare t with t+k)
-# Larger window creates more significant differences, clearer learning signal
-REFINEMENT_WINDOW_SIZE = 5  # Compare frames 5 steps apart
+# Sliding step for REFINEMENT phase (how much to advance each iteration)
+# 1 = every frame, 2 = every other frame, etc.
+REFINEMENT_SLIDE_STEP = 1  # Default: 1 for maximum data
 
-# Sliding step (how much to advance the window each iteration)
-# 1 = sliding window (t→t+5, t+1→t+6, t+2→t+7, ...) - more records
-# 5 = jumping window (t→t+5, t+5→t+10, ...) - fewer records
-REFINEMENT_SLIDE_STEP = 1  # Default: 1 (sliding window for more data)
+# Policy target generation uses:
+# - Consecutive frame differences (t vs t+1)
+# - Border mask for ADD (only voxels at solid/void interface)
+# - Solid mask for REMOVE (only where material exists)
+# - Max normalization to keep values in [0, 1] for BCE loss
 
-# Binarization settings for REFINEMENT targets
-# Converts continuous density differences to binary masks
-BINARIZE_REFINEMENT_TARGETS = True
-BINARIZE_THRESHOLD = 0.005  # Absolute threshold for significant change
-BINARIZE_PERCENTILE = 90    # Alternative: use top N% of changes
-
-# Target normalization: scale ADD/REMOVE to comparable magnitudes
-NORMALIZE_TARGETS = True
+# Epsilon for numerical stability in normalization
+POLICY_NORM_EPS = 1e-8
 
 def compute_normalized_value(compliance: float, vol_frac: float) -> float:
     """
@@ -106,58 +101,55 @@ def compute_normalized_value(compliance: float, vol_frac: float) -> float:
 # (no Y-constraint means the structure would fall under -Y load)
 BC_TYPES = ['FULL_CLAMP', 'RAIL_XY']
 
-def binarize_policy_target(target: np.ndarray, method: str = 'threshold') -> np.ndarray:
+def compute_border_mask(density: np.ndarray, threshold: float = 0.5) -> np.ndarray:
     """
-    Convert continuous density difference to binary mask.
+    Compute border mask: voxels that are void but have at least one solid neighbor.
     
-    Methods:
-        - 'threshold': Use fixed threshold (BINARIZE_THRESHOLD)
-        - 'percentile': Use top percentile of non-zero values
-        - 'adaptive': Combine threshold + ensure minimum signal
+    This identifies the interface where material can be added.
+    Uses 6-connectivity (face neighbors only) for efficiency.
     
     Args:
-        target: Continuous target array (density differences)
-        method: Binarization method
-    
+        density: 3D density array
+        threshold: Threshold for solid/void classification
+        
     Returns:
-        Binary mask (0.0 or 1.0)
+        Boolean mask of border voxels (void with solid neighbor)
     """
-    if not BINARIZE_REFINEMENT_TARGETS:
-        return target
+    solid = density > threshold
     
-    if method == 'threshold':
-        # Simple threshold: anything above threshold becomes 1
-        binary = (np.abs(target) > BINARIZE_THRESHOLD).astype(np.float32)
-        
-    elif method == 'percentile':
-        # Use top percentile of values
-        abs_target = np.abs(target)
-        nonzero = abs_target[abs_target > 1e-6]
-        if len(nonzero) > 0:
-            thresh = np.percentile(nonzero, BINARIZE_PERCENTILE)
-            binary = (abs_target >= thresh).astype(np.float32)
-        else:
-            binary = np.zeros_like(target)
-            
-    elif method == 'adaptive':
-        # Combine: threshold + ensure at least some signal
-        abs_target = np.abs(target)
-        
-        # First, apply threshold
-        binary = (abs_target > BINARIZE_THRESHOLD).astype(np.float32)
-        
-        # If too few voxels, lower threshold adaptively
-        if np.sum(binary) < 10:
-            nonzero = abs_target[abs_target > 1e-6]
-            if len(nonzero) > 0:
-                # Use 80th percentile of non-zero values
-                adaptive_thresh = np.percentile(nonzero, 80)
-                binary = (abs_target >= adaptive_thresh).astype(np.float32)
-    else:
-        binary = target
+    # Pad with zeros to handle boundaries
+    padded = np.pad(solid.astype(np.float32), 1, mode='constant', constant_values=0)
     
-    # Apply sign from original target (for separate ADD/REMOVE)
-    return binary
+    # Count solid neighbors using shifts (6-connectivity)
+    neighbor_count = (
+        padded[:-2, 1:-1, 1:-1] +  # x-1
+        padded[2:, 1:-1, 1:-1] +   # x+1
+        padded[1:-1, :-2, 1:-1] +  # y-1
+        padded[1:-1, 2:, 1:-1] +   # y+1
+        padded[1:-1, 1:-1, :-2] +  # z-1
+        padded[1:-1, 1:-1, 2:]     # z+1
+    )
+    
+    # Border = void AND has at least one solid neighbor
+    border_mask = (~solid) & (neighbor_count > 0)
+    
+    return border_mask
+
+
+def compute_solid_mask(density: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+    """
+    Compute solid mask: voxels that currently have material.
+    
+    This identifies where material can be removed.
+    
+    Args:
+        density: 3D density array
+        threshold: Threshold for solid classification
+        
+    Returns:
+        Boolean mask of solid voxels
+    """
+    return density > threshold
 
 
 def generate_bc_masks(resolution: tuple, bc_type: str) -> tuple:
@@ -890,19 +882,18 @@ def main():
         
         # Use sliding window for REFINEMENT (v3.1 Quality)
         # Compare t with t+window_size, advance by slide_step each iteration
-        window_size = REFINEMENT_WINDOW_SIZE
         slide_step = REFINEMENT_SLIDE_STEP
         
-        print(f"  Phase 2: Skipping first {start_step} steps (beta=1), window={window_size}, slide={slide_step}, binarize={BINARIZE_REFINEMENT_TARGETS}")
+        print(f"  Phase 2: Skipping first {start_step} steps (beta=1), slide={slide_step}, using border/solid masks")
         
-        # Generate records with sliding window (t → t+window_size)
+        # Generate records with consecutive frame differences (t vs t+1)
         record_idx = 0
-        for t in range(start_step, len(simp_history) - window_size, slide_step):
+        for t in range(start_step, len(simp_history) - 1, slide_step):
             current_frame = simp_history[t]
-            future_frame = simp_history[t + window_size]  # Look window_size steps ahead
+            next_frame = simp_history[t + 1]  # Consecutive frame
             
             curr_dens = current_frame['density_map']
-            future_dens = future_frame['density_map']
+            next_dens = next_frame['density_map']
             
             # Adaptive Thresholding (Smart Saving)
             # Find the highest threshold that maintains connectivity
@@ -924,18 +915,32 @@ def main():
             # Use the Connected Binary Mask as Input State
             input_state = best_binary
             
-            # Compute difference over window_size steps (larger signal!)
-            diff = curr_dens - future_dens
-            target_remove_raw = np.maximum(0, diff)
-            target_add_raw = np.maximum(0, -diff)
+            # Compute density difference (next - current)
+            delta = next_dens - curr_dens
             
-            # Apply binarization for cleaner learning signal (v3.1 Quality)
-            if BINARIZE_REFINEMENT_TARGETS:
-                target_add = binarize_policy_target(target_add_raw, method='adaptive')
-                target_remove = binarize_policy_target(target_remove_raw, method='adaptive')
-            else:
-                target_add = target_add_raw
-                target_remove = target_remove_raw
+            # Raw targets from delta
+            target_add_raw = np.maximum(0, delta).astype(np.float32)   # Where density increased
+            target_remove_raw = np.maximum(0, -delta).astype(np.float32)  # Where density decreased
+            
+            # Apply action masks:
+            # ADD: Only at border (void voxels with solid neighbors)
+            border_mask = compute_border_mask(curr_dens, threshold=found_threshold)
+            target_add_masked = target_add_raw * border_mask.astype(np.float32)
+            
+            # REMOVE: Only where material exists (solid voxels)
+            solid_mask = compute_solid_mask(curr_dens, threshold=found_threshold)
+            target_remove_masked = target_remove_raw * solid_mask.astype(np.float32)
+            
+            # Normalize by max (keeps values in [0, 1] for BCE loss)
+            add_max = target_add_masked.max()
+            remove_max = target_remove_masked.max()
+            
+            target_add = target_add_masked / (add_max + POLICY_NORM_EPS) if add_max > POLICY_NORM_EPS else target_add_masked
+            target_remove = target_remove_masked / (remove_max + POLICY_NORM_EPS) if remove_max > POLICY_NORM_EPS else target_remove_masked
+            
+            # Skip if no meaningful signal (both channels empty)
+            if target_add.sum() < POLICY_NORM_EPS and target_remove.sum() < POLICY_NORM_EPS:
+                continue
             
             # Compute normalized value using Log-Squash (Spec 4.2)
             current_compliance = float(current_frame['compliance'])

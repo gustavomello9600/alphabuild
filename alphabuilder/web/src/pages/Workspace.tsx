@@ -9,29 +9,90 @@ import type { GameState, Tensor5D } from '../api/types';
 import * as THREE from 'three';
 
 // --- 3D Components ---
+// 
+// Tensor v3.1 Channel Layout (7 channels):
+// 0: Density (ρ) - Material state (0.0 to 1.0)
+// 1: Mask X - 1.0 if displacement u_x is fixed (support)
+// 2: Mask Y - 1.0 if displacement u_y is fixed (support)
+// 3: Mask Z - 1.0 if displacement u_z is fixed (support)
+// 4: Force X (Fx) - Normalized force component
+// 5: Force Y (Fy) - Normalized force component
+// 6: Force Z (Fz) - Normalized force component
 
-// --- 3D Components ---
+const CHANNEL = {
+    DENSITY: 0,
+    MASK_X: 1,
+    MASK_Y: 2,
+    MASK_Z: 3,
+    FORCE_X: 4,
+    FORCE_Y: 5,
+    FORCE_Z: 6,
+};
+
+// Support type colors based on constraint combination
+// Following design system colors for semantic meaning
+const SUPPORT_COLORS = {
+    FULL_CLAMP: '#00F0FF',  // Cyan - Fully fixed (XYZ)
+    RAIL_XY: '#7000FF',     // Purple - Rail constraint (XY fixed, Z free)
+    ROLLER_Y: '#00FF9D',    // Green - Roller (only Y fixed)
+    PARTIAL: '#3B82F6',     // Blue - Other partial constraints
+};
+
+/**
+ * Determine support type and color based on active masks
+ */
+function getSupportColor(maskX: number, maskY: number, maskZ: number): string | null {
+    const hasX = maskX > 0.5;
+    const hasY = maskY > 0.5;
+    const hasZ = maskZ > 0.5;
+    
+    if (!hasX && !hasY && !hasZ) return null; // Not a support
+    
+    if (hasX && hasY && hasZ) {
+        return SUPPORT_COLORS.FULL_CLAMP; // Full clamp (XYZ)
+    } else if (hasX && hasY && !hasZ) {
+        return SUPPORT_COLORS.RAIL_XY; // Rail XY (Z free)
+    } else if (!hasX && hasY && !hasZ) {
+        return SUPPORT_COLORS.ROLLER_Y; // Roller Y only
+    } else {
+        return SUPPORT_COLORS.PARTIAL; // Other combinations
+    }
+}
 
 const LoadVector = ({ tensor }: { tensor: Tensor5D | null }) => {
     if (!tensor) return null;
 
+    const numChannels = tensor.shape[0];
     const [, D, H, W] = tensor.shape;
-    const loadPoints: { pos: THREE.Vector3, dir: THREE.Vector3 }[] = [];
+    const loadPoints: { pos: THREE.Vector3; dir: THREE.Vector3; magnitude: number }[] = [];
 
-    // Find load positions (Channel 3)
+    // For 7-channel tensor: Forces are in channels 4, 5, 6
+    // For 5-channel tensor (legacy): Force Y is in channel 3
+    const is7Channel = numChannels >= 7;
+
     for (let d = 0; d < D; d++) {
         for (let h = 0; h < H; h++) {
             for (let w = 0; w < W; w++) {
-                const idx = 3 * (D * H * W) + d * (H * W) + h * W + w;
-                const val = tensor.data[idx];
-                if (val !== 0) {
-                    // Found load!
-                    // Position centered in voxel
-                    // Match VoxelGrid: X=d-D/2, Y=h+0.5, Z=w-W/2
+                const flatIdx = d * (H * W) + h * W + w;
+                
+                let fx = 0, fy = 0, fz = 0;
+                
+                if (is7Channel) {
+                    // v3.1: Channels 4, 5, 6 are Fx, Fy, Fz
+                    fx = tensor.data[CHANNEL.FORCE_X * (D * H * W) + flatIdx];
+                    fy = tensor.data[CHANNEL.FORCE_Y * (D * H * W) + flatIdx];
+                    fz = tensor.data[CHANNEL.FORCE_Z * (D * H * W) + flatIdx];
+                } else {
+                    // Legacy 5-channel: Channel 3 is Fy only
+                    fy = tensor.data[3 * (D * H * W) + flatIdx];
+                }
+
+                const magnitude = Math.sqrt(fx * fx + fy * fy + fz * fz);
+                
+                if (magnitude > 0.01) {
                     const pos = new THREE.Vector3(d - D / 2, h + 0.5, w - W / 2);
-                    // Direction: Channel 3 is Fy usually. If val < 0, it's down.
-                    const dir = new THREE.Vector3(0, Math.sign(val), 0).normalize();
-                    loadPoints.push({ pos, dir });
+                    const dir = new THREE.Vector3(fx, fy, fz).normalize();
+                    loadPoints.push({ pos, dir, magnitude });
                 }
             }
         }
@@ -47,10 +108,10 @@ const LoadVector = ({ tensor }: { tensor: Tensor5D | null }) => {
                 const origin = lp.pos.clone().sub(lp.dir.clone().multiplyScalar(arrowLength));
                 return (
                     <group key={i}>
-                        <arrowHelper args={[lp.dir, origin, arrowLength, 0xff0000, 1, 0.5]} />
+                        <arrowHelper args={[lp.dir, origin, arrowLength, 0xff0055, 1, 0.5]} />
                         <mesh position={lp.pos}>
                             <sphereGeometry args={[0.2, 8, 8]} />
-                            <meshBasicMaterial color="red" />
+                            <meshBasicMaterial color="#ff0055" />
                         </mesh>
                     </group>
                 );
@@ -74,7 +135,9 @@ const VoxelGrid = ({
     useEffect(() => {
         if (!meshRef.current || !tensor) return;
 
+        const numChannels = tensor.shape[0];
         const [, D, H, W] = tensor.shape;
+        const is7Channel = numChannels >= 7;
         let count = 0;
 
         // Helper for heatmap color
@@ -107,24 +170,45 @@ const VoxelGrid = ({
                 for (let w = 0; w < W; w++) {
                     const flatIdx = d * (H * W) + h * W + w;
 
-                    // Tensor Channels
-                    const density = tensor.data[0 * (D * H * W) + flatIdx];
-                    const isSupport = tensor.data[1 * (D * H * W) + flatIdx] > 0.5;
-                    const isLoad = tensor.data[3 * (D * H * W) + flatIdx] !== 0;
+                    // Channel 0: Density
+                    const density = tensor.data[CHANNEL.DENSITY * (D * H * W) + flatIdx];
+                    
+                    // Support detection and color based on constraint type
+                    let supportColor: string | null = null;
+                    let maskX = 0, maskY = 0, maskZ = 0;
+                    
+                    if (is7Channel) {
+                        maskX = tensor.data[CHANNEL.MASK_X * (D * H * W) + flatIdx];
+                        maskY = tensor.data[CHANNEL.MASK_Y * (D * H * W) + flatIdx];
+                        maskZ = tensor.data[CHANNEL.MASK_Z * (D * H * W) + flatIdx];
+                        supportColor = getSupportColor(maskX, maskY, maskZ);
+                    } else {
+                        // Legacy 5-channel: Channel 1 is support (treat as full clamp)
+                        const isSupport = tensor.data[1 * (D * H * W) + flatIdx] > 0.5;
+                        if (isSupport) supportColor = SUPPORT_COLORS.FULL_CLAMP;
+                    }
+                    
+                    const isSupport = supportColor !== null;
+                    
+                    // Load: Force magnitude > 0 (channels 4, 5, 6 for 7-channel, channel 3 for 5-channel)
+                    let hasLoad = false;
+                    if (is7Channel) {
+                        const fx = tensor.data[CHANNEL.FORCE_X * (D * H * W) + flatIdx];
+                        const fy = tensor.data[CHANNEL.FORCE_Y * (D * H * W) + flatIdx];
+                        const fz = tensor.data[CHANNEL.FORCE_Z * (D * H * W) + flatIdx];
+                        hasLoad = Math.abs(fx) > 0.01 || Math.abs(fy) > 0.01 || Math.abs(fz) > 0.01;
+                    } else {
+                        // Legacy: Channel 3 is Fy
+                        hasLoad = Math.abs(tensor.data[3 * (D * H * W) + flatIdx]) > 0.01;
+                    }
 
                     const heatmapColor = getHeatmapColor(flatIdx);
 
                     // Visibility Logic
-                    const isVisibleStandard = density > 0.1 || isSupport || isLoad;
+                    const isVisibleStandard = density > 0.1 || isSupport || hasLoad;
                     const isVisibleHeatmap = !!heatmapColor;
 
                     if (isVisibleStandard || isVisibleHeatmap) {
-                        // Position: Shift Y up by H/2 to sit on grid
-                        // Original: h - H/2. New: h (so 0 is at 0)
-                        // Actually, to center X and Z but keep Y >= 0:
-                        // X: d - D/2
-                        // Y: h + 0.5 (center of voxel 0 is at 0.5)
-                        // Z: w - W/2
                         dummy.position.set(d - D / 2, h + 0.5, w - W / 2);
                         dummy.updateMatrix();
                         meshRef.current.setMatrixAt(count, dummy.matrix);
@@ -132,16 +216,16 @@ const VoxelGrid = ({
                         // Color Logic
                         if (heatmapColor) {
                             meshRef.current.setColorAt(count, heatmapColor);
+                        } else if (supportColor) {
+                            // Color based on support constraint type
+                            meshRef.current.setColorAt(count, new THREE.Color(supportColor));
+                        } else if (hasLoad) {
+                            // Magenta for loads (from design system)
+                            meshRef.current.setColorAt(count, new THREE.Color('#FF0055'));
                         } else {
-                            if (isSupport) {
-                                meshRef.current.setColorAt(count, new THREE.Color('#3B82F6'));
-                            } else if (isLoad) {
-                                meshRef.current.setColorAt(count, new THREE.Color('#EF4444'));
-                            } else {
-                                const val = Math.max(0.2, density);
-                                const color = new THREE.Color().setHSL(0, 0, val * 0.95);
-                                meshRef.current.setColorAt(count, color);
-                            }
+                            const val = Math.max(0.2, density);
+                            const color = new THREE.Color().setHSL(0, 0, val * 0.95);
+                            meshRef.current.setColorAt(count, color);
                         }
 
                         count++;
