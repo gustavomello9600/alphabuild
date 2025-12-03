@@ -144,24 +144,25 @@ def topopt(fem, opt, initial_density=None, callback=None):
             print(f"opt_iter: {opt_iter}, opt_time: {opt_time:.3g} (s), "
                   f"beta: {beta}, C: {C_value:.3f}, V: {V_value:.3f}, "
                   f"U: {U_value:.3f}, change: {change:.3f}", flush=True)
-            
-            # Callback / History Recording
+        
+        # Callback / History Recording
         # NOTE: gather is a collective MPI operation - ALL processes must call it
-            if callback:
+        if callback:
             # Gather physical density for saving (collective operation)
-                rho_phys_global = S_comm.gather(rho_phys_field)
-                
+            # ALL ranks must participate in gather, not just rank 0
+            rho_phys_global = S_comm.gather(rho_phys_field)
+            
             # Only rank 0 executes the callback
             if comm.rank == 0 and rho_phys_global is not None:
-                    step_data = {
-                        "iter": opt_iter,
-                        "compliance": C_value,
-                        "vol_frac": V_value,
-                        "change": change,
+                step_data = {
+                    "iter": opt_iter,
+                    "compliance": C_value,
+                    "vol_frac": V_value,
+                    "change": change,
                     "density": rho_phys_global,
-                        "beta": beta
-                    }
-                    callback(step_data)
+                    "beta": beta
+                }
+                callback(step_data)
 
     # Final Save/Plot
     values = S_comm.gather(rho_phys_field)
