@@ -25,6 +25,12 @@ from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any
 import scipy.ndimage
 
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+
 # Add project root to path
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
@@ -324,39 +330,76 @@ def run_fenitop_optimization(
     
     # --- History Recording ---
     history = []
+    pbar = None
+    start_time_simp = None
     
     def record_step(data):
         if comm.rank == 0:
+            nonlocal pbar, start_time_simp
+            
+            # Inicializa tqdm na primeira iteração
+            if pbar is None and HAS_TQDM:
+                start_time_simp = time.time()
+                pbar = tqdm(
+                    total=max_iter,
+                    desc=f"  SIMP {strategy}",
+                    unit="iter",
+                    ncols=100,
+                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, C={postfix}]'
+                )
+            
             rho_flat = data['density']
+            iter_num = data['iter']
             
             # Reconstruct 3D voxel grid from flat DOF array
             if grid_mapper is None:
                 rho_3d = np.full((nx, ny, nz), simp_config.vol_frac, dtype=np.float32)
             elif len(rho_flat) != len(grid_mapper[0]):
-                print(f"  WARNING: Size mismatch in record_step")
+                if pbar is None or not HAS_TQDM:
+                    print(f"  WARNING: Size mismatch in record_step")
                 rho_3d = np.full((nx, ny, nz), simp_config.vol_frac, dtype=np.float32)
             else:
                 rho_nodal = np.zeros((nx+1, ny+1, nz+1), dtype=np.float32)
                 rho_nodal[grid_mapper[0], grid_mapper[1], grid_mapper[2]] = rho_flat
                 rho_3d = rho_nodal[:-1, :-1, :-1]
 
+            compliance = float(data['compliance'])
+            vol_frac = float(data['vol_frac'])
+            beta = data.get('beta', 1)
+            
             history.append({
-                'step': data['iter'],
+                'step': iter_num,
                 'density_map': rho_3d,
-                'compliance': float(data['compliance']),
-                'vol_frac': float(data['vol_frac']),
-                'beta': data.get('beta', 1)  # Track beta for filtering later
+                'compliance': compliance,
+                'vol_frac': vol_frac,
+                'beta': beta
             })
             
-            if data['iter'] % 10 == 0 or data['iter'] < 5:
-                print(f"  Step {data['iter']:3d}: C={data['compliance']:.4f} V={data['vol_frac']:.4f} β={data.get('beta', 1)}", flush=True)
+            # Atualiza tqdm
+            if pbar is not None:
+                pbar.set_postfix_str(f"{compliance:.2f}, V={vol_frac:.3f}, β={beta}")
+                pbar.update(1)
+            elif iter_num % 10 == 0 or iter_num < 5:
+                print(f"  Step {iter_num:3d}: C={compliance:.4f} V={vol_frac:.4f} β={beta}", flush=True)
 
     # --- Run Optimization ---
     if comm.rank == 0:
-        print(f"  FEniTop: iter={max_iter}, V={simp_config.vol_frac:.2f}, r={filter_r:.1f}, strategy={strategy}", flush=True)
-    topopt(fem, opt, initial_density=initial_density, callback=record_step)
-    if comm.rank == 0:
-        print(f"  FEniTop concluído: {len(history)} iterações coletadas", flush=True)
+        if HAS_TQDM:
+            print(f"  FEniTop: iter={max_iter}, V={simp_config.vol_frac:.2f}, r={filter_r:.1f}, strategy={strategy}", flush=True)
+        else:
+            print(f"  FEniTop: iter={max_iter}, V={simp_config.vol_frac:.2f}, r={filter_r:.1f}, strategy={strategy}", flush=True)
+            print(f"  (Instale tqdm para ver progresso: pip install tqdm)")
+    
+    try:
+        topopt(fem, opt, initial_density=initial_density, callback=record_step)
+    finally:
+        if comm.rank == 0 and pbar is not None:
+            pbar.close()
+            if start_time_simp:
+                elapsed = time.time() - start_time_simp
+                print(f"  FEniTop concluído: {len(history)} iterações em {elapsed:.1f}s", flush=True)
+        elif comm.rank == 0:
+            print(f"  FEniTop concluído: {len(history)} iterações coletadas", flush=True)
     
     return history
 
@@ -727,6 +770,20 @@ def main():
     
     if is_main_rank:
         print(f"Starting Harvest: {args.episodes} episodes")
+        if HAS_TQDM:
+            episode_pbar = tqdm(
+                total=args.episodes,
+                desc="Episodes",
+                unit="ep",
+                ncols=100,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+            )
+        else:
+            episode_pbar = None
+    else:
+        episode_pbar = None
+    
+    episode_start_time = time.time()
     
     for i in range(args.episodes):
         start_time = time.time()
@@ -1053,9 +1110,20 @@ def main():
             "status": "SUCCESS"
         })
         
-        print(f"Ep {i+1}/{args.episodes}: C={s_final_compliance:.2f}, V={s_final_vol:.2f}, Samples={len(phase1_records)+len(phase2_records)}, Time={duration:.1f}s")
+        # Atualiza tqdm do episódio
+        if is_main_rank and episode_pbar is not None:
+            episode_pbar.set_postfix_str(f"C={s_final_compliance:.1f}, V={s_final_vol:.2f}, {len(phase1_records)+len(phase2_records)} samples")
+            episode_pbar.update(1)
+        elif is_main_rank:
+            print(f"Ep {i+1}/{args.episodes}: C={s_final_compliance:.2f}, V={s_final_vol:.2f}, Samples={len(phase1_records)+len(phase2_records)}, Time={duration:.1f}s")
         
         gc.collect()
+    
+    # Fecha tqdm do episódio
+    if is_main_rank and episode_pbar is not None:
+        episode_pbar.close()
+        total_time = time.time() - episode_start_time
+        print(f"\nHarvest concluído: {args.episodes} episódios em {total_time:.1f}s ({total_time/args.episodes:.1f}s/ep)")
 
 if __name__ == "__main__":
     main()
