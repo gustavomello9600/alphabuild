@@ -114,17 +114,14 @@ def generate_phase1_slices(
         
     return records
 
-def compute_boundary_mask(density: np.ndarray) -> np.ndarray:
+def compute_boundary_mask(binary_density: np.ndarray) -> np.ndarray:
     """
     Compute boundary mask: voxels that are 0 (void) but have at least one 1 (solid) neighbor.
+    Args:
+        binary_density: Binary numpy array (0 or 1)
     """
-    # Binary structure (assuming density is already somewhat binary or we threshold it)
-    # For SIMP, density is continuous. We treat < 0.5 as void, >= 0.5 as solid for mask purposes?
-    # Or should we use the continuous density?
-    # The user said "Apply mask of boundary (0, with neighbor 1)". This implies binary logic.
-    # We will use threshold 0.1 to be safe (anything with some material is "solid" for neighbor check)
-    
-    solid = (density > 0.1).astype(np.int32)
+    # Ensure binary input
+    solid = (binary_density > 0.5).astype(np.int32)
     
     # Dilate solid to find neighbors
     # Structure for dilation: 6-connectivity
@@ -134,33 +131,29 @@ def compute_boundary_mask(density: np.ndarray) -> np.ndarray:
     # Boundary = Dilated - Solid (i.e., neighbors that are not solid themselves)
     boundary = dilated - solid
     
-    # Also, we only want to ADD where density is low.
-    # So we multiply by (1 - density) to soften the mask?
-    # User said "Apply mask... (0, with neighbor 1)".
-    # We'll return a binary mask where density is low (<0.1) AND it has a neighbor.
-    
     return boundary.astype(np.float32)
 
-def compute_filled_mask(density: np.ndarray) -> np.ndarray:
+def compute_filled_mask(binary_density: np.ndarray) -> np.ndarray:
     """
     Compute filled mask: voxels that have material (1).
+    Args:
+        binary_density: Binary numpy array (0 or 1)
     """
-    # User said "material filled (1)".
-    # We'll use a threshold.
-    return (density > 0.1).astype(np.float32)
+    return (binary_density > 0.5).astype(np.float32)
 
 def generate_refinement_targets(
     current_density: np.ndarray,
-    next_density: np.ndarray
+    next_density: np.ndarray,
+    current_binary_mask: np.ndarray
 ) -> tuple:
     """
     Generate policy targets for Refinement phase (Phase 2).
     
     Logic:
     1. Calculate difference: diff = next - current
-    2. Add Channel: max(0, diff) * boundary_mask
-    3. Remove Channel: max(0, -diff) * filled_mask
-    4. Normalize to [0, 1]
+    2. Add Channel: max(0, diff) * boundary_mask(current_binary)
+    3. Remove Channel: max(0, -diff) * filled_mask(current_binary)
+    4. Normalize: Max-Scaling (val / max(val))
     """
     # 1. Difference
     diff = next_density - current_density
@@ -169,27 +162,27 @@ def generate_refinement_targets(
     raw_add = np.maximum(0, diff)
     raw_remove = np.maximum(0, -diff)
     
-    # 3. Masks
+    # 3. Masks (using binary input state)
     # Boundary mask for ADD: 0 voxels with neighbor 1
-    # We use current_density to determine boundary
-    boundary_mask = compute_boundary_mask(current_density)
+    boundary_mask = compute_boundary_mask(current_binary_mask)
     
     # Filled mask for REMOVE: 1 voxels
-    filled_mask = compute_filled_mask(current_density)
+    filled_mask = compute_filled_mask(current_binary_mask)
     
     # 4. Apply Masks
     target_add = raw_add * boundary_mask
     target_remove = raw_remove * filled_mask
     
-    # 5. Normalization
-    # Since diff is already in range [0, 1] (density difference),
-    # and we want "normalized values 0 to 1", we are good.
-    # However, SIMP steps are small.
-    # If we want to emphasize the signal, we could scale it.
-    # But "normalized" usually implies [0, 1].
-    # We will clip to ensure it stays in range (though it should be).
+    # 5. Normalization (Max-Scaling)
+    # Scale so the maximum value is 1.0 (if there is any signal)
+    # This helps MCTS identify the "best" actions regardless of absolute magnitude
     
-    target_add = np.clip(target_add, 0.0, 1.0)
-    target_remove = np.clip(target_remove, 0.0, 1.0)
+    max_add = np.max(target_add)
+    if max_add > 1e-8:
+        target_add = target_add / max_add
+        
+    max_remove = np.max(target_remove)
+    if max_remove > 1e-8:
+        target_remove = target_remove / max_remove
     
     return target_add, target_remove

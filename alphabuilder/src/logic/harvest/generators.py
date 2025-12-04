@@ -97,28 +97,40 @@ def generate_bezier_structure(
     mid_y, mid_z = ny//2, nz//2
     voxel_grid[0:2, mid_y-3:mid_y+3, mid_z-2:mid_z+2] = 1.0
 
-    # Load Anchor: Positioned at the CENTER of final Bezier sections
+    # Load Anchor: Must cover ALL final Bezier curve endpoints (bounding box approach)
     if final_positions:
-        avg_y = np.mean([p[1] for p in final_positions])
-        avg_z = np.mean([p[2] for p in final_positions])
+        # Calculate bounding box of all final positions
+        all_y = [p[1] for p in final_positions]
+        all_z = [p[2] for p in final_positions]
+        
+        min_y, max_y = min(all_y), max(all_y)
+        min_z, max_z = min(all_z), max(all_z)
+        
+        # Add padding based on section sizes
         max_w = max([s[0] for s in final_sections])
         max_h = max([s[1] for s in final_sections])
+        
+        # Anchor covers the bounding box with padding
+        anchor_depth = 3
+        y_padding = max(2, int(max_h / 2) + 1)
+        z_padding = max(2, int(max_w / 2) + 1)
+        
+        x_s = max(0, nx - anchor_depth)
+        x_e = nx
+        y_s = max(0, int(min_y - y_padding))
+        y_e = min(ny, int(max_y + y_padding))
+        z_s = max(0, int(min_z - z_padding))
+        z_e = min(nz, int(max_z + z_padding))
     else:
-        avg_y = load_config['y']
-        avg_z = (load_config['z_start'] + load_config['z_end']) / 2.0
-        max_w, max_h = 4, 6
-    
-    # Anchor covers the average final section position
-    anchor_depth = 3
-    anchor_hw = max(2, int(max_w / 2) + 1)  # Half-width in Z
-    anchor_hh = max(2, int(max_h / 2) + 1)  # Half-height in Y
-    
-    x_s = max(0, nx - anchor_depth)
-    x_e = nx
-    y_s = max(0, int(avg_y - anchor_hh))
-    y_e = min(ny, int(avg_y + anchor_hh))
-    z_s = max(0, int(avg_z - anchor_hw))
-    z_e = min(nz, int(avg_z + anchor_hw))
+        # Fallback to load config
+        anchor_depth = 3
+        x_s = max(0, nx - anchor_depth)
+        x_e = nx
+        y_s = max(0, int(load_config['y'] - 4))
+        y_e = min(ny, int(load_config['y'] + 4))
+        z_center = (load_config['z_start'] + load_config['z_end']) / 2.0
+        z_s = max(0, int(z_center - 3))
+        z_e = min(nz, int(z_center + 3))
     
     voxel_grid[x_s:x_e, y_s:y_e, z_s:z_e] = 1.0
         

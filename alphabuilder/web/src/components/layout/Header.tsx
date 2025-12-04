@@ -10,7 +10,7 @@ const routeConfig: Record<string, { label: string; icon: typeof Home }> = {
     '/settings': { label: 'Configurações', icon: Settings },
 };
 
-export const Header = () => {
+export const Header = ({ collapsed }: { collapsed: boolean }) => {
     const location = useLocation();
     const params = useParams<{ id?: string; dbId?: string; episodeId?: string }>();
 
@@ -26,10 +26,10 @@ export const Header = () => {
             crumbs.push({ label: 'Painel', isActive: true });
         } else if (path.startsWith('/data')) {
             crumbs.push({ label: 'Dados de Treino', icon: Database });
-            
+
             if (params.dbId) {
                 crumbs.push({ label: params.dbId, isActive: !params.episodeId });
-                
+
                 if (params.episodeId) {
                     crumbs.push({
                         label: `Replay`,
@@ -57,7 +57,10 @@ export const Header = () => {
     const breadcrumbs = getBreadcrumbs();
 
     return (
-        <header className="h-16 border-b border-white/5 bg-void/50 backdrop-blur-sm flex items-center justify-between px-8 fixed top-0 right-0 left-0 z-40 ml-[80px] lg:ml-[260px] transition-all">
+        <header
+            className="h-16 border-b border-white/5 bg-void/50 backdrop-blur-sm flex items-center justify-between px-8 fixed top-0 right-0 z-40 transition-all duration-300"
+            style={{ left: collapsed ? 80 : 260 }}
+        >
             {/* Breadcrumbs / Context */}
             <div className="flex items-center gap-1">
                 {breadcrumbs.map((crumb, index) => (
@@ -66,9 +69,8 @@ export const Header = () => {
                             <ChevronRight size={14} className="mx-2 text-white/20" />
                         )}
                         <span
-                            className={`text-sm font-mono flex items-center gap-1.5 ${
-                                crumb.isActive ? 'text-white' : 'text-white/40'
-                            }`}
+                            className={`text-sm font-mono flex items-center gap-1.5 ${crumb.isActive ? 'text-white' : 'text-white/40'
+                                }`}
                         >
                             {crumb.icon && <crumb.icon size={14} className={crumb.isActive ? 'text-cyan' : ''} />}
                             {crumb.label}

@@ -84,13 +84,26 @@ def detect_schema_version(db_path: Path) -> str:
     cursor = conn.cursor()
     
     try:
-        cursor.execute("SELECT COUNT(*) FROM episodes")
-        count = cursor.fetchone()[0]
+        # Check for v2 schema (episodes table)
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='episodes'")
+        has_episodes = cursor.fetchone() is not None
+        
+        # Check for v1 schema (training_data table)
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='training_data'")
+        has_training_data = cursor.fetchone() is not None
+        
         conn.close()
-        return "v2" if count > 0 else "v1"
-    except sqlite3.OperationalError:
+        
+        if has_episodes:
+            return "v2"
+        elif has_training_data:
+            return "v1"
+        else:
+            # Unknown schema, default to v2 but will be handled gracefully
+            return "unknown"
+    except sqlite3.Error:
         conn.close()
-        return "v1"
+        return "unknown"
 
 
 # --- Sparse Decode Helper ---
@@ -134,25 +147,47 @@ def get_database_info(db_path: Path) -> DatabaseInfo:
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
-    if schema_version == "v2":
-        cursor.execute("SELECT COUNT(*) FROM episodes")
-        episode_count = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM records")
-        total_steps = cursor.fetchone()[0]
-    else:
-        cursor.execute("SELECT COUNT(DISTINCT episode_id) FROM training_data")
-        episode_count = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM training_data")
-        total_steps = cursor.fetchone()[0]
+    episode_count = 0
+    total_steps = 0
     
-    conn.close()
+    try:
+        if schema_version == "v2":
+            cursor.execute("SELECT COUNT(*) FROM episodes")
+            episode_count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM records")
+            total_steps = cursor.fetchone()[0]
+        elif schema_version == "v1":
+            cursor.execute("SELECT COUNT(DISTINCT episode_id) FROM training_data")
+            episode_count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM training_data")
+            total_steps = cursor.fetchone()[0]
+        else:
+            # Unknown schema - try to detect tables
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [row[0] for row in cursor.fetchall()]
+            # If no known tables, leave counts at 0
+            pass
+    except sqlite3.OperationalError as e:
+        # Table doesn't exist or other SQL error
+        print(f"Warning: Error reading database {db_path.name}: {e}")
+        episode_count = 0
+        total_steps = 0
+    finally:
+        conn.close()
     
     size_mb = db_path.stat().st_size / (1024 * 1024)
+    
+    # Calculate relative path, fallback to absolute if outside PROJECT_ROOT
+    try:
+        path_str = str(db_path.relative_to(PROJECT_ROOT))
+    except ValueError:
+        # Database is outside PROJECT_ROOT, use absolute path
+        path_str = str(db_path)
     
     return DatabaseInfo(
         id=db_path.stem,
         name=db_path.name,
-        path=str(db_path.relative_to(PROJECT_ROOT)),
+        path=path_str,
         episode_count=episode_count,
         total_steps=total_steps,
         size_mb=round(size_mb, 2),
@@ -441,8 +476,40 @@ def root():
 @app.get("/databases", response_model=list[DatabaseInfo])
 def list_databases():
     """List all available databases."""
-    databases = find_databases()
-    return [get_database_info(db) for db in databases]
+    try:
+        databases = find_databases()
+        result = []
+        for db in databases:
+            try:
+                result.append(get_database_info(db))
+            except Exception as e:
+                # Log error but continue processing other databases
+                print(f"Error processing database {db.name}: {e}")
+                # Still include the database with minimal info
+                try:
+                    size_mb = db.stat().st_size / (1024 * 1024)
+                    try:
+                        path_str = str(db.relative_to(PROJECT_ROOT))
+                    except ValueError:
+                        path_str = str(db)
+                    result.append(DatabaseInfo(
+                        id=db.stem,
+                        name=db.name,
+                        path=path_str,
+                        episode_count=0,
+                        total_steps=0,
+                        size_mb=round(size_mb, 2),
+                        schema_version="unknown",
+                    ))
+                except Exception:
+                    # Skip this database if we can't even get basic info
+                    pass
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao listar databases: {str(e)}"
+        )
 
 
 @app.get("/databases/{db_id}/episodes", response_model=list[EpisodeSummary])

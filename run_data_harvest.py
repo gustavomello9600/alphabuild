@@ -264,7 +264,7 @@ def main():
             input_state = best_binary
             
             # Generate Targets using NEW Logic
-            target_add, target_remove = generate_refinement_targets(curr_dens, next_dens)
+            target_add, target_remove = generate_refinement_targets(curr_dens, next_dens, input_state)
             
             # Compute normalized value
             current_compliance = float(current_frame['compliance'])

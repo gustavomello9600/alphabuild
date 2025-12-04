@@ -43,6 +43,41 @@ const CHANNEL = {
     FORCE_Z: 6,
 };
 
+// Log-Squash constants (from config.py - Spec 4.2)
+const LOG_SQUASH = {
+    ALPHA: 12.0,      // Volume penalty coefficient
+    MU: -6.65,        // Estimated mean of log(C) distribution
+    SIGMA: 2.0,       // Estimated std of log(C) distribution
+    EPSILON: 1e-9,
+};
+
+/**
+ * Recover compliance from fitness score and volume fraction.
+ * Inverse of the log-squash normalization:
+ *   s_raw = -log(C + ε) - α·vol
+ *   normalized = tanh((s_raw - μ) / σ)
+ * 
+ * Inverse:
+ *   s_raw = arctanh(normalized) * σ + μ
+ *   C = exp(-(s_raw + α·vol)) - ε
+ */
+function recoverCompliance(fitnessScore: number, volumeFraction: number): number {
+    // Clamp fitness to avoid arctanh(±1) = ±∞
+    const clampedFitness = Math.max(-0.999, Math.min(0.999, fitnessScore));
+
+    // Inverse tanh: arctanh(x) = 0.5 * ln((1+x)/(1-x))
+    const arctanh = 0.5 * Math.log((1 + clampedFitness) / (1 - clampedFitness));
+
+    // Recover s_raw
+    const sRaw = arctanh * LOG_SQUASH.SIGMA + LOG_SQUASH.MU;
+
+    // Recover compliance: -log(C + ε) = s_raw + α·vol
+    // => C = exp(-(s_raw + α·vol)) - ε
+    const compliance = Math.exp(-(sRaw + LOG_SQUASH.ALPHA * volumeFraction)) - LOG_SQUASH.EPSILON;
+
+    return Math.max(0, compliance); // Ensure non-negative
+}
+
 // Support type colors based on constraint combination
 // Following design system colors for semantic meaning
 const SUPPORT_COLORS = {
@@ -59,9 +94,9 @@ function getSupportColor(maskX: number, maskY: number, maskZ: number): string | 
     const hasX = maskX > 0.5;
     const hasY = maskY > 0.5;
     const hasZ = maskZ > 0.5;
-    
+
     if (!hasX && !hasY && !hasZ) return null; // Not a support
-    
+
     if (hasX && hasY && hasZ) {
         return SUPPORT_COLORS.FULL_CLAMP; // Full clamp (XYZ)
     } else if (hasX && hasY && !hasZ) {
@@ -88,9 +123,9 @@ const LoadVector = ({ tensor }: { tensor: ReplayState['tensor'] | null }) => {
         for (let h = 0; h < H; h++) {
             for (let w = 0; w < W; w++) {
                 const flatIdx = d * (H * W) + h * W + w;
-                
+
                 let fx = 0, fy = 0, fz = 0;
-                
+
                 if (is7Channel) {
                     // v3.1: Channels 4, 5, 6 are Fx, Fy, Fz
                     fx = tensor.data[CHANNEL.FORCE_X * (D * H * W) + flatIdx];
@@ -102,7 +137,7 @@ const LoadVector = ({ tensor }: { tensor: ReplayState['tensor'] | null }) => {
                 }
 
                 const magnitude = Math.sqrt(fx * fx + fy * fy + fz * fz);
-                
+
                 if (magnitude > 0.01) {
                     const pos = new THREE.Vector3(d - D / 2, h + 0.5, w - W / 2);
                     const dir = new THREE.Vector3(fx, fy, fz).normalize();
@@ -143,18 +178,69 @@ const VoxelGrid = ({
     heatmap?: { add: Float32Array; remove: Float32Array };
     showHeatmap: boolean;
 }) => {
-    const meshRef = useRef<THREE.InstancedMesh>(null);
+    // Separate refs for opaque (standard) and transparent (policy) meshes
+    const opaqueRef = useRef<THREE.InstancedMesh>(null);
+    const policyRef = useRef<THREE.InstancedMesh>(null);
+    const opacityAttrRef = useRef<THREE.InstancedBufferAttribute | null>(null);
     const dummy = new THREE.Object3D();
 
+    // Shader injection for per-instance opacity on policy mesh
+    const policyMaterialRef = useRef<THREE.MeshStandardMaterial | null>(null);
+
     useEffect(() => {
-        if (!meshRef.current || !tensor) return;
+        if (!policyRef.current) return;
+
+        const material = policyRef.current.material as THREE.MeshStandardMaterial;
+        policyMaterialRef.current = material;
+
+        material.onBeforeCompile = (shader) => {
+            shader.vertexShader = `
+                attribute float instanceOpacity;
+                varying float vInstanceOpacity;
+                ${shader.vertexShader}
+            `.replace(
+                '#include <begin_vertex>',
+                `
+                #include <begin_vertex>
+                vInstanceOpacity = instanceOpacity;
+                `
+            );
+
+            shader.fragmentShader = `
+                varying float vInstanceOpacity;
+                ${shader.fragmentShader}
+            `.replace(
+                '#include <dithering_fragment>',
+                `
+                #include <dithering_fragment>
+                gl_FragColor.a *= vInstanceOpacity;
+                `
+            );
+        };
+        material.needsUpdate = true;
+    }, []);
+
+    useEffect(() => {
+        if (!opaqueRef.current || !policyRef.current || !tensor) return;
 
         const numChannels = tensor.shape[0];
         const [, D, H, W] = tensor.shape;
         const is7Channel = numChannels >= 7;
-        let count = 0;
 
-        const getHeatmapColor = (idx: number): THREE.Color | null => {
+        let opaqueCount = 0;
+        let policyCount = 0;
+
+        // Initialize opacity attribute for policy mesh
+        const maxPolicyInstances = 10000;
+        if (!opacityAttrRef.current) {
+            const opacityArray = new Float32Array(maxPolicyInstances).fill(1.0);
+            opacityAttrRef.current = new THREE.InstancedBufferAttribute(opacityArray, 1);
+            opacityAttrRef.current.setUsage(THREE.DynamicDrawUsage);
+            policyRef.current.geometry.setAttribute('instanceOpacity', opacityAttrRef.current);
+        }
+
+        // Helper to get policy data (color + opacity)
+        const getPolicyData = (idx: number): { color: THREE.Color; opacity: number } | null => {
             if (!showHeatmap || !heatmap) return null;
 
             const addVal = heatmap.add ? heatmap.add[idx] : 0;
@@ -162,17 +248,18 @@ const VoxelGrid = ({
 
             if (addVal < 0.01 && removeVal < 0.01) return null;
 
-            const color = new THREE.Color();
+            // FIXED COLORS - only opacity varies
             if (addVal > removeVal) {
-                color.set('#00FF9D');
-                const intensity = Math.min(1, addVal * 2.5);
-                color.lerp(new THREE.Color('#333333'), 1 - intensity);
+                return {
+                    color: new THREE.Color('#00FF9D'),  // Fixed green
+                    opacity: addVal  // Direct value as opacity (0-1)
+                };
             } else {
-                color.set('#FF0055');
-                const intensity = Math.min(1, removeVal * 2.5);
-                color.lerp(new THREE.Color('#333333'), 1 - intensity);
+                return {
+                    color: new THREE.Color('#FF0055'),  // Fixed red
+                    opacity: removeVal  // Direct value as opacity (0-1)
+                };
             }
-            return color;
         };
 
         for (let d = 0; d < D; d++) {
@@ -182,11 +269,11 @@ const VoxelGrid = ({
 
                     // Channel 0: Density
                     const density = tensor.data[CHANNEL.DENSITY * (D * H * W) + flatIdx];
-                    
+
                     // Support detection and color based on constraint type
                     let supportColor: string | null = null;
                     let maskX = 0, maskY = 0, maskZ = 0;
-                    
+
                     if (is7Channel) {
                         maskX = tensor.data[CHANNEL.MASK_X * (D * H * W) + flatIdx];
                         maskY = tensor.data[CHANNEL.MASK_Y * (D * H * W) + flatIdx];
@@ -197,9 +284,9 @@ const VoxelGrid = ({
                         const isSupport = tensor.data[1 * (D * H * W) + flatIdx] > 0.5;
                         if (isSupport) supportColor = SUPPORT_COLORS.FULL_CLAMP;
                     }
-                    
+
                     const isSupport = supportColor !== null;
-                    
+
                     // Load: Force magnitude > 0 (channels 4, 5, 6 for 7-channel, channel 3 for 5-channel)
                     let hasLoad = false;
                     if (is7Channel) {
@@ -212,47 +299,88 @@ const VoxelGrid = ({
                         hasLoad = Math.abs(tensor.data[3 * (D * H * W) + flatIdx]) > 0.01;
                     }
 
-                    const heatmapColor = getHeatmapColor(flatIdx);
-
                     const isVisibleStandard = density > 0.1 || isSupport || hasLoad;
-                    const isVisibleHeatmap = !!heatmapColor;
 
-                    if (isVisibleStandard || isVisibleHeatmap) {
+                    // Get policy data for this voxel
+                    const addVal = (showHeatmap && heatmap?.add) ? heatmap.add[flatIdx] : 0;
+                    const removeVal = (showHeatmap && heatmap?.remove) ? heatmap.remove[flatIdx] : 0;
+
+                    // 1. Always render standard voxels (density, support, load)
+                    if (isVisibleStandard) {
                         dummy.position.set(d - D / 2, h + 0.5, w - W / 2);
                         dummy.updateMatrix();
-                        meshRef.current.setMatrixAt(count, dummy.matrix);
+                        opaqueRef.current.setMatrixAt(opaqueCount, dummy.matrix);
 
-                        if (heatmapColor) {
-                            meshRef.current.setColorAt(count, heatmapColor);
-                        } else if (supportColor) {
-                            // Color based on support constraint type
-                            meshRef.current.setColorAt(count, new THREE.Color(supportColor));
+                        if (supportColor) {
+                            opaqueRef.current.setColorAt(opaqueCount, new THREE.Color(supportColor));
                         } else if (hasLoad) {
-                            // Magenta for loads (from design system)
-                            meshRef.current.setColorAt(count, new THREE.Color('#FF0055'));
+                            opaqueRef.current.setColorAt(opaqueCount, new THREE.Color('#FF0055'));
                         } else {
-                            // Gray scale for density
                             const val = Math.max(0.2, density);
                             const color = new THREE.Color().setHSL(0, 0, val * 0.95);
-                            meshRef.current.setColorAt(count, color);
+                            opaqueRef.current.setColorAt(opaqueCount, color);
                         }
+                        opaqueCount++;
+                    }
 
-                        count++;
+                    // 2. REMOVE channel: overlay on existing mass (voxel "glows" red)
+                    if (showHeatmap && removeVal > 0.01 && isVisibleStandard) {
+                        dummy.position.set(d - D / 2, h + 0.5, w - W / 2);
+                        dummy.updateMatrix();
+                        policyRef.current.setMatrixAt(policyCount, dummy.matrix);
+                        policyRef.current.setColorAt(policyCount, new THREE.Color('#FF0055'));
+                        if (opacityAttrRef.current) {
+                            opacityAttrRef.current.setX(policyCount, removeVal);
+                        }
+                        policyCount++;
+                    }
+
+                    // 3. ADD channel: only where there's NO mass (new voxel suggestion)
+                    if (showHeatmap && addVal > 0.01 && !isVisibleStandard) {
+                        dummy.position.set(d - D / 2, h + 0.5, w - W / 2);
+                        dummy.updateMatrix();
+                        policyRef.current.setMatrixAt(policyCount, dummy.matrix);
+                        policyRef.current.setColorAt(policyCount, new THREE.Color('#00FF9D'));
+                        if (opacityAttrRef.current) {
+                            opacityAttrRef.current.setX(policyCount, addVal);
+                        }
+                        policyCount++;
                     }
                 }
             }
         }
 
-        meshRef.current.count = count;
-        meshRef.current.instanceMatrix.needsUpdate = true;
-        if (meshRef.current.instanceColor) meshRef.current.instanceColor.needsUpdate = true;
+        // Update opaque mesh
+        opaqueRef.current.count = opaqueCount;
+        opaqueRef.current.instanceMatrix.needsUpdate = true;
+        if (opaqueRef.current.instanceColor) opaqueRef.current.instanceColor.needsUpdate = true;
+
+        // Update policy mesh
+        policyRef.current.count = policyCount;
+        policyRef.current.instanceMatrix.needsUpdate = true;
+        if (policyRef.current.instanceColor) policyRef.current.instanceColor.needsUpdate = true;
+        if (opacityAttrRef.current) opacityAttrRef.current.needsUpdate = true;
     }, [tensor, heatmap, showHeatmap]);
 
     return (
-        <instancedMesh ref={meshRef} args={[undefined, undefined, 20000]}>
-            <boxGeometry args={[0.9, 0.9, 0.9]} />
-            <meshStandardMaterial roughness={0.2} metalness={0.8} />
-        </instancedMesh>
+        <group>
+            {/* Opaque mesh for standard voxels - unchanged from original */}
+            <instancedMesh ref={opaqueRef} args={[undefined, undefined, 20000]}>
+                <boxGeometry args={[0.9, 0.9, 0.9]} />
+                <meshStandardMaterial roughness={0.2} metalness={0.8} />
+            </instancedMesh>
+
+            {/* Transparent mesh for policy voxels only */}
+            <instancedMesh ref={policyRef} args={[undefined, undefined, 10000]}>
+                <boxGeometry args={[0.92, 0.92, 0.92]} />
+                <meshStandardMaterial
+                    roughness={0.3}
+                    metalness={0.5}
+                    transparent={true}
+                    depthWrite={false}
+                />
+            </instancedMesh>
+        </group>
     );
 };
 
@@ -380,28 +508,40 @@ const ReplayControlPanel = ({
                     <div>
                         <div className="flex justify-between text-sm mb-2">
                             <span className="text-white/40">Compliance</span>
-                            <span
-                                className={`font-mono ${!state?.metadata.compliance
-                                        ? 'text-magenta text-xs'
-                                        : 'text-white'
-                                    }`}
-                            >
-                                {state?.metadata.compliance
-                                    ? state.metadata.compliance.toFixed(2)
-                                    : 'DESCONECTADO'}
+                            <span className="font-mono text-white">
+                                {(() => {
+                                    // Direct compliance if available
+                                    if (state?.metadata.compliance) {
+                                        return state.metadata.compliance.toFixed(2);
+                                    }
+                                    // Recover from fitness + volume
+                                    if (state?.fitness_score !== undefined && state?.metadata.volume_fraction !== undefined) {
+                                        const recovered = recoverCompliance(state.fitness_score, state.metadata.volume_fraction);
+                                        return `~${recovered.toFixed(2)}`;
+                                    }
+                                    return 'N/A';
+                                })()}
                             </span>
                         </div>
                         <div className="w-full bg-white/5 h-1.5 rounded-full overflow-hidden">
-                            {state?.metadata.compliance ? (
-                                <motion.div
-                                    className="h-full bg-gradient-to-r from-magenta to-purple"
-                                    animate={{
-                                        width: `${Math.min(100, (state.metadata.compliance / maxCompliance) * 100)}%`,
-                                    }}
-                                />
-                            ) : (
-                                <div className="h-full bg-magenta/50 w-full animate-pulse" />
-                            )}
+                            {(() => {
+                                const compliance = state?.metadata.compliance
+                                    || (state?.fitness_score !== undefined && state?.metadata.volume_fraction !== undefined
+                                        ? recoverCompliance(state.fitness_score, state.metadata.volume_fraction)
+                                        : null);
+
+                                if (compliance) {
+                                    return (
+                                        <motion.div
+                                            className="h-full bg-gradient-to-r from-magenta to-purple"
+                                            animate={{
+                                                width: `${Math.min(100, (compliance / maxCompliance) * 100)}%`,
+                                            }}
+                                        />
+                                    );
+                                }
+                                return <div className="h-full bg-magenta/50 w-full animate-pulse" />;
+                            })()}
                         </div>
                     </div>
 
@@ -575,10 +715,10 @@ const NeuralHUD = ({
                                 {(() => {
                                     const windowSize = 20;
                                     // Get last windowSize values (most recent at the end)
-                                    const visibleHistory = history.length > 0 
+                                    const visibleHistory = history.length > 0
                                         ? history.slice(-windowSize)
                                         : [];
-                                    
+
                                     if (visibleHistory.length === 0) {
                                         return Array.from({ length: windowSize }).map((_, i) => (
                                             <div key={i} className="flex-1" />
@@ -586,8 +726,8 @@ const NeuralHUD = ({
                                     }
 
                                     const scale = getScale(visibleHistory);
-                                    const zeroLine = scale.min < 0 && scale.max > 0 
-                                        ? (-scale.min / scale.range) * 100 
+                                    const zeroLine = scale.min < 0 && scale.max > 0
+                                        ? (-scale.min / scale.range) * 100
                                         : null;
 
                                     return (
@@ -731,13 +871,13 @@ export const EpisodeReplay = () => {
             // Get current frame's step number
             const currentFrame = allFramesData[simState.currentStep];
             const currentStepNumber = currentFrame.step;
-            
+
             // Get all frames up to current step, sorted by step number (ascending)
             // This ensures we show frames in order: oldest (left) to current (right)
             const framesUpToCurrent = allFramesData
                 .filter(f => f.step <= currentStepNumber)
                 .sort((a, b) => a.step - b.step);
-            
+
             const historyValues = framesUpToCurrent.map(f => f.value_confidence || 0);
             setHistory(historyValues);
         }
@@ -759,7 +899,7 @@ export const EpisodeReplay = () => {
             await trainingDataReplayService.loadEpisode(dbId, episodeId);
             const serviceState = trainingDataReplayService.getState();
             setSimState(serviceState);
-            
+
             // Build initial history from all loaded frames
             const allFramesData = trainingDataReplayService.getAllFrames();
             if (allFramesData.length > 0) {
@@ -770,7 +910,7 @@ export const EpisodeReplay = () => {
                 const historyValues = framesUpToCurrent.map(f => f.value_confidence || 0);
                 setHistory(historyValues);
             }
-            
+
             setLoading(false);
 
             return unsubscribe;

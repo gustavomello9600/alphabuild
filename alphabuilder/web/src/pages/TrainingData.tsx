@@ -225,24 +225,24 @@ const Pagination = ({
     const pageNumbers = useMemo(() => {
         const pages: (number | string)[] = [];
         const showPages = 5;
-        
+
         if (totalPages <= showPages + 2) {
             for (let i = 1; i <= totalPages; i++) pages.push(i);
         } else {
             pages.push(1);
-            
+
             if (currentPage > 3) pages.push('...');
-            
+
             const start = Math.max(2, currentPage - 1);
             const end = Math.min(totalPages - 1, currentPage + 1);
-            
+
             for (let i = start; i <= end; i++) pages.push(i);
-            
+
             if (currentPage < totalPages - 2) pages.push('...');
-            
+
             pages.push(totalPages);
         }
-        
+
         return pages;
     }, [currentPage, totalPages]);
 
@@ -315,7 +315,7 @@ const LoadingSkeleton = () => (
 );
 
 // --- Empty State ---
-const EmptyState = ({ message, icon: Icon }: { message: string; icon: typeof Database }) => (
+const EmptyState = ({ message, icon: Icon, onRetry }: { message: string; icon: typeof Database; onRetry?: () => void }) => (
     <motion.div
         initial={{ opacity: 0, scale: 0.9 }}
         animate={{ opacity: 1, scale: 1 }}
@@ -324,7 +324,16 @@ const EmptyState = ({ message, icon: Icon }: { message: string; icon: typeof Dat
         <div className="p-6 rounded-full bg-white/5 text-white/20 mb-6">
             <Icon size={48} strokeWidth={1} />
         </div>
-        <p className="text-white/40 text-lg">{message}</p>
+        <p className="text-white/40 text-lg mb-6">{message}</p>
+        {onRetry && (
+            <button
+                onClick={onRetry}
+                className="px-6 py-2 bg-cyan/10 hover:bg-cyan/20 text-cyan rounded-lg transition-colors flex items-center gap-2"
+            >
+                <RefreshCw size={16} />
+                Tentar Novamente
+            </button>
+        )}
     </motion.div>
 );
 
@@ -337,13 +346,14 @@ export const TrainingData = () => {
     const [databases, setDatabases] = useState<DatabaseInfo[]>([]);
     const [episodes, setEpisodes] = useState<EpisodeSummary[]>([]);
     const [loadingDbs, setLoadingDbs] = useState(true);
-    const [loadingEpisodes, setLoadingEpisodes] = useState(false);
+    // Initialize loading state based on whether we have a dbId to load
+    const [loadingEpisodes, setLoadingEpisodes] = useState(!!dbId);
     const [error, setError] = useState<string | null>(null);
-    
+
     // Pagination state
     const [currentPage, setCurrentPage] = useState(1);
     const [searchQuery, setSearchQuery] = useState('');
-    
+
     // Track previous location to detect back navigation
     const previousPathRef = useRef<string>('');
     const loadedDbIdRef = useRef<string | null>(null);
@@ -352,13 +362,13 @@ export const TrainingData = () => {
     const filteredEpisodes = useMemo(() => {
         if (!searchQuery.trim()) return episodes;
         const query = searchQuery.toLowerCase();
-        return episodes.filter(ep => 
+        return episodes.filter(ep =>
             ep.episode_id.toLowerCase().includes(query)
         );
     }, [episodes, searchQuery]);
 
     const totalPages = Math.ceil(filteredEpisodes.length / EPISODES_PER_PAGE);
-    
+
     const paginatedEpisodes = useMemo(() => {
         const start = (currentPage - 1) * EPISODES_PER_PAGE;
         return filteredEpisodes.slice(start, start + EPISODES_PER_PAGE);
@@ -369,66 +379,7 @@ export const TrainingData = () => {
         setCurrentPage(1);
     }, [searchQuery]);
 
-    // Load databases on mount
-    useEffect(() => {
-        loadDatabases();
-    }, []);
-
-    // Detect navigation changes and force reload when coming back from replay
-    useEffect(() => {
-        const currentPath = location.pathname;
-        const previousPath = previousPathRef.current;
-        
-        // Check if we're navigating back from a replay page to episode list
-        const wasOnReplay = previousPath.includes('/episode/');
-        const isOnEpisodeList = currentPath.match(/^\/data\/[^/]+$/);
-        
-        console.log(`[TrainingData] Navigation: ${previousPath} -> ${currentPath}`);
-        console.log(`[TrainingData] Was on replay: ${wasOnReplay}, Is on episode list: ${isOnEpisodeList}, dbId: ${dbId}`);
-        
-        // If we came back from replay to episode list, force reload
-        if (wasOnReplay && isOnEpisodeList && dbId) {
-            console.log(`[TrainingData] Detected back navigation from replay, forcing reload for: ${dbId}`);
-            // Reset the loaded ref to force reload
-            loadedDbIdRef.current = null;
-            // Clear episodes first to trigger UI update
-            setEpisodes([]);
-            // Force reload episodes
-            setTimeout(() => {
-                loadEpisodes(dbId);
-            }, 50);
-        }
-        
-        previousPathRef.current = currentPath;
-    }, [location.pathname, dbId]);
-
-    // Load episodes when dbId changes (from URL) or on mount
-    useEffect(() => {
-        console.log(`[TrainingData] dbId effect: ${dbId}, location: ${location.pathname}, loadedDbId: ${loadedDbIdRef.current}`);
-        
-        if (dbId) {
-            // Always reload if dbId changed or if we haven't loaded it yet
-            if (loadedDbIdRef.current !== dbId) {
-                console.log(`[TrainingData] Loading episodes for dbId: ${dbId}`);
-                loadedDbIdRef.current = dbId;
-                loadEpisodes(dbId);
-            } else {
-                console.log(`[TrainingData] Already loaded episodes for dbId: ${dbId}`);
-                // Even if already loaded, check if episodes array is empty (might have been cleared)
-                if (episodes.length === 0 && !loadingEpisodes) {
-                    console.log(`[TrainingData] Episodes array is empty, reloading...`);
-                    loadEpisodes(dbId);
-                }
-            }
-        } else {
-            setEpisodes([]);
-            setCurrentPage(1);
-            setSearchQuery('');
-            loadedDbIdRef.current = null;
-        }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [dbId]);
-
+    // Load databases function
     const loadDatabases = async () => {
         setLoadingDbs(true);
         setError(null);
@@ -436,13 +387,15 @@ export const TrainingData = () => {
             const data = await fetchDatabases();
             setDatabases(data);
         } catch (err) {
-            setError('Não foi possível conectar ao backend. Certifique-se de que o servidor está rodando.');
+            const errorMessage = err instanceof Error ? err.message : 'Erro desconhecido ao carregar databases';
+            setError(errorMessage);
             console.error('Failed to fetch databases:', err);
         } finally {
             setLoadingDbs(false);
         }
     };
 
+    // Load episodes function
     const loadEpisodes = async (databaseId: string) => {
         setLoadingEpisodes(true);
         setError(null);
@@ -456,10 +409,74 @@ export const TrainingData = () => {
         } catch (err) {
             console.error('[TrainingData] Failed to fetch episodes:', err);
             const errorMessage = err instanceof Error ? err.message : 'Erro desconhecido';
-            setError(`Erro ao carregar episódios: ${errorMessage}. Verifique se o backend está rodando.`);
+            setError(`Erro ao carregar episódios: ${errorMessage}`);
             setEpisodes([]);
         } finally {
             setLoadingEpisodes(false);
+        }
+    };
+
+    // Load databases on mount
+    useEffect(() => {
+        loadDatabases();
+    }, []);
+
+    // Load episodes when dbId changes (from URL) or on mount
+    useEffect(() => {
+        let mounted = true;
+
+        const load = async () => {
+            if (!dbId) {
+                if (mounted) {
+                    setEpisodes([]);
+                    setCurrentPage(1);
+                    setSearchQuery('');
+                    setLoadingEpisodes(false);
+                }
+                return;
+            }
+
+            // Ensure loading state is true before starting fetch
+            setLoadingEpisodes(true);
+            setError(null);
+            setCurrentPage(1);
+            setSearchQuery('');
+
+            try {
+                console.log(`[TrainingData] Loading episodes for database: ${dbId}`);
+                const data = await fetchEpisodes(dbId);
+
+                if (mounted) {
+                    console.log(`[TrainingData] Loaded ${data.length} episodes`);
+                    setEpisodes(data);
+                }
+            } catch (err) {
+                console.error('[TrainingData] Failed to fetch episodes:', err);
+                if (mounted) {
+                    const errorMessage = err instanceof Error ? err.message : 'Erro desconhecido';
+                    setError(`Erro ao carregar episódios: ${errorMessage}`);
+                    setEpisodes([]);
+                }
+            } finally {
+                if (mounted) {
+                    setLoadingEpisodes(false);
+                }
+            }
+        };
+
+        load();
+
+        return () => {
+            mounted = false;
+        };
+    }, [dbId]);
+
+    // Manual reload function
+    const handleReload = () => {
+        if (dbId) {
+            loadEpisodes(dbId);
+        } else {
+            loadDatabases();
         }
     };
 
@@ -485,24 +502,14 @@ export const TrainingData = () => {
         window.scrollTo({ top: 200, behavior: 'smooth' });
     };
 
-    // Safety check: if we're on episode list route but episodes are empty, reload
-    useEffect(() => {
-        const isOnEpisodeList = location.pathname.match(/^\/data\/[^/]+$/);
-        if (isOnEpisodeList && dbId && episodes.length === 0 && !loadingEpisodes && !loadingDbs) {
-            console.log(`[TrainingData] Safety check: episodes empty on episode list route, reloading for: ${dbId}`);
-            loadedDbIdRef.current = null;
-            loadEpisodes(dbId);
-        }
-    }, [location.pathname, dbId, episodes.length, loadingEpisodes, loadingDbs]);
-
     // Stats calculations
     const stats = useMemo(() => {
         if (episodes.length === 0) return null;
-        
+
         const avgReward = episodes.reduce((sum, e) => sum + (e.final_reward || 0), 0) / episodes.length;
         const totalPhase1 = episodes.reduce((sum, e) => sum + e.steps_phase1, 0);
         const totalPhase2 = episodes.reduce((sum, e) => sum + e.steps_phase2, 0);
-        
+
         return {
             total: episodes.length,
             avgReward,
@@ -542,7 +549,7 @@ export const TrainingData = () => {
                 </div>
 
                 <button
-                    onClick={() => dbId ? loadEpisodes(dbId) : loadDatabases()}
+                    onClick={handleReload}
                     disabled={loadingDbs || loadingEpisodes}
                     className="bg-white/5 hover:bg-white/10 disabled:opacity-50 text-white px-4 py-2 rounded-lg flex items-center gap-2 transition-colors"
                 >
@@ -566,16 +573,17 @@ export const TrainingData = () => {
                 )}
             </AnimatePresence>
 
+
             {/* Content */}
             <AnimatePresence mode="wait">
                 {!dbId ? (
                     // Database Selection View
                     <motion.div
-                        key="databases"
-                        initial="hidden"
-                        animate="visible"
-                        exit="hidden"
-                        variants={containerVariants}
+                        key="database-list"
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
+                        className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"
                     >
                         {loadingDbs ? (
                             <LoadingSkeleton />
@@ -585,33 +593,27 @@ export const TrainingData = () => {
                                 message="Nenhum database encontrado. Verifique se existem arquivos .db na raiz do projeto ou na pasta data."
                             />
                         ) : (
-                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                                {databases.map((db) => (
-                                    <DatabaseCard
-                                        key={db.id}
-                                        db={db}
-                                        onClick={() => handleSelectDb(db.id)}
-                                        isSelected={false}
-                                    />
-                                ))}
-                            </div>
+                            databases.map((db) => (
+                                <DatabaseCard
+                                    key={db.id}
+                                    db={db}
+                                    onClick={() => handleSelectDb(db.id)}
+                                    isSelected={false}
+                                />
+                            ))
                         )}
                     </motion.div>
                 ) : (
                     // Episode List View
                     <motion.div
-                        key="episodes"
-                        initial="hidden"
-                        animate="visible"
-                        exit="hidden"
-                        variants={containerVariants}
+                        key="episode-list"
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
                     >
                         {/* Stats Bar */}
                         {stats && (
-                            <motion.div
-                                variants={itemVariants}
-                                className="grid grid-cols-4 gap-4 mb-6"
-                            >
+                            <div className="grid grid-cols-4 gap-4 mb-6">
                                 <div className="p-4 rounded-xl bg-matter/40 border border-white/5">
                                     <div className="flex items-center gap-2 mb-2">
                                         <Layers size={16} className="text-cyan" />
@@ -656,11 +658,11 @@ export const TrainingData = () => {
                                         {stats.avgReward > 0 ? '+' : ''}{stats.avgReward.toFixed(3)}
                                     </div>
                                 </div>
-                            </motion.div>
+                            </div>
                         )}
 
                         {/* Search Bar */}
-                        <motion.div variants={itemVariants} className="mb-4">
+                        <div className="mb-4">
                             <div className="relative">
                                 <Search size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-white/30" />
                                 <input
@@ -676,7 +678,7 @@ export const TrainingData = () => {
                                     </span>
                                 )}
                             </div>
-                        </motion.div>
+                        </div>
 
                         {/* Episodes Table */}
                         {loadingEpisodes ? (
@@ -685,13 +687,11 @@ export const TrainingData = () => {
                             <EmptyState
                                 icon={Layers}
                                 message={searchQuery ? "Nenhum episódio encontrado com este filtro." : "Nenhum episódio encontrado neste database."}
+                                onRetry={handleReload}
                             />
                         ) : (
                             <>
-                                <motion.div
-                                    variants={itemVariants}
-                                    className="bg-matter/30 border border-white/5 rounded-xl overflow-hidden"
-                                >
+                                <div className="bg-matter/30 border border-white/5 rounded-xl overflow-hidden">
                                     <table className="w-full">
                                         <thead className="bg-white/5 text-xs uppercase font-mono text-white/40">
                                             <tr>
@@ -714,12 +714,7 @@ export const TrainingData = () => {
                                                 <th className="p-3 text-right">Replay</th>
                                             </tr>
                                         </thead>
-                                        <motion.tbody
-                                            key={currentPage}
-                                            initial="hidden"
-                                            animate="visible"
-                                            variants={containerVariants}
-                                        >
+                                        <tbody>
                                             {paginatedEpisodes.map((episode) => (
                                                 <EpisodeRow
                                                     key={episode.episode_id}
@@ -727,9 +722,9 @@ export const TrainingData = () => {
                                                     onClick={() => handlePlayEpisode(episode.episode_id)}
                                                 />
                                             ))}
-                                        </motion.tbody>
+                                        </tbody>
                                     </table>
-                                </motion.div>
+                                </div>
 
                                 {/* Pagination */}
                                 <Pagination

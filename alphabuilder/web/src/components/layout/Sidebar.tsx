@@ -48,14 +48,13 @@ const NavItem = ({ icon: Icon, label, path, collapsed, active }: { icon: any, la
     </Link>
 );
 
-export const Sidebar = () => {
-    const [collapsed, setCollapsed] = useState(false);
+export const Sidebar = ({ collapsed, setCollapsed }: { collapsed: boolean; setCollapsed: (v: boolean) => void }) => {
     const location = useLocation();
 
     return (
         <motion.aside
             animate={{ width: collapsed ? 80 : 260 }}
-            className="h-screen bg-matter/80 backdrop-blur-xl border-r border-white/5 flex flex-col relative z-50"
+            className="h-screen bg-matter/80 backdrop-blur-xl border-r border-white/5 flex flex-col relative z-50 shrink-0"
         >
             {/* Logo Area */}
             <div className="h-20 flex items-center justify-center border-b border-white/5 relative">
@@ -67,7 +66,7 @@ export const Sidebar = () => {
                         <motion.div
                             initial={{ opacity: 0 }}
                             animate={{ opacity: 1 }}
-                            className="font-display font-bold text-xl text-white tracking-tight"
+                            className="font-display font-bold text-xl text-white tracking-tight whitespace-nowrap"
                         >
                             Alpha<span className="text-cyan">Builder</span>
                         </motion.div>
@@ -77,23 +76,23 @@ export const Sidebar = () => {
                 {/* Collapse Toggle */}
                 <button
                     onClick={() => setCollapsed(!collapsed)}
-                    className="absolute -right-3 top-8 w-6 h-6 bg-steel border border-white/10 rounded-full flex items-center justify-center text-white/60 hover:text-white hover:bg-cyan hover:text-black transition-colors"
+                    className="absolute -right-3 top-8 w-6 h-6 bg-steel border border-white/10 rounded-full flex items-center justify-center text-white/60 hover:text-white hover:bg-cyan hover:text-black transition-colors z-50"
                 >
                     {collapsed ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
                 </button>
             </div>
 
             {/* Navigation */}
-            <div className="flex-1 py-8 px-4 overflow-y-auto">
+            <div className="flex-1 py-8 px-4 overflow-y-auto overflow-x-hidden">
                 <div className="mb-8">
-                    {!collapsed && <h3 className="text-xs font-mono text-white/30 mb-4 px-2 uppercase">Principal</h3>}
+                    {!collapsed && <h3 className="text-xs font-mono text-white/30 mb-4 px-2 uppercase whitespace-nowrap">Principal</h3>}
                     <NavItem icon={LayoutDashboard} label="Painel" path="/" collapsed={collapsed} active={location.pathname === '/'} />
                     <NavItem icon={Box} label="Laboratório" path="/workspace" collapsed={collapsed} active={location.pathname.includes('/workspace')} />
                     <NavItem icon={Database} label="Dados de Treino" path="/data" collapsed={collapsed} active={location.pathname.startsWith('/data')} />
                 </div>
 
                 <div>
-                    {!collapsed && <h3 className="text-xs font-mono text-white/30 mb-4 px-2 uppercase">Sistema</h3>}
+                    {!collapsed && <h3 className="text-xs font-mono text-white/30 mb-4 px-2 uppercase whitespace-nowrap">Sistema</h3>}
                     <NavItem icon={Cpu} label="Rede Neural" path="/neural" collapsed={collapsed} active={location.pathname === '/neural'} />
                     <NavItem icon={Settings} label="Configurações" path="/settings" collapsed={collapsed} active={location.pathname === '/settings'} />
                 </div>

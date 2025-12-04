@@ -130,6 +130,7 @@ const VoxelGrid = ({
     showHeatmap: boolean
 }) => {
     const meshRef = useRef<THREE.InstancedMesh>(null);
+    const opacityRef = useRef<THREE.InstancedBufferAttribute | null>(null);
     const dummy = new THREE.Object3D();
 
     useEffect(() => {
@@ -140,8 +141,16 @@ const VoxelGrid = ({
         const is7Channel = numChannels >= 7;
         let count = 0;
 
+        // Initialize opacity attribute if needed
+        const maxInstances = 20000;
+        if (!opacityRef.current || opacityRef.current.count !== maxInstances) {
+            const opacityArray = new Float32Array(maxInstances);
+            opacityRef.current = new THREE.InstancedBufferAttribute(opacityArray, 1);
+            opacityRef.current.setUsage(THREE.DynamicDrawUsage);
+        }
+
         // Helper for heatmap color
-        const getHeatmapColor = (idx: number): THREE.Color | null => {
+        const getHeatmapColor = (idx: number): { color: THREE.Color; opacity: number } | null => {
             if (!showHeatmap || !heatmap) return null;
 
             const addVal = heatmap.add ? heatmap.add[idx] : 0;
@@ -150,18 +159,21 @@ const VoxelGrid = ({
             if (addVal < 0.01 && removeVal < 0.01) return null;
 
             const color = new THREE.Color();
+            let opacity = 0;
+            
             if (addVal > removeVal) {
                 // Add: Green (Project Identity)
                 color.set('#00FF9D');
-                const intensity = Math.min(1, addVal * 2.5);
-                color.lerp(new THREE.Color('#333333'), 1 - intensity);
+                // Opacity based on add value (0.3 to 1.0 range for visibility)
+                opacity = Math.max(0.3, Math.min(1.0, addVal * 2.5));
             } else {
                 // Remove: Red/Pink (Project Identity)
                 color.set('#FF0055');
-                const intensity = Math.min(1, removeVal * 2.5);
-                color.lerp(new THREE.Color('#333333'), 1 - intensity);
+                // Opacity based on remove value (0.3 to 1.0 range for visibility)
+                opacity = Math.max(0.3, Math.min(1.0, removeVal * 2.5));
             }
-            return color;
+            
+            return { color, opacity };
         };
 
         // Iterate through tensor
@@ -202,30 +214,39 @@ const VoxelGrid = ({
                         hasLoad = Math.abs(tensor.data[3 * (D * H * W) + flatIdx]) > 0.01;
                     }
 
-                    const heatmapColor = getHeatmapColor(flatIdx);
+                    const heatmapData = getHeatmapColor(flatIdx);
 
                     // Visibility Logic
                     const isVisibleStandard = density > 0.1 || isSupport || hasLoad;
-                    const isVisibleHeatmap = !!heatmapColor;
+                    const isVisibleHeatmap = !!heatmapData;
 
                     if (isVisibleStandard || isVisibleHeatmap) {
                         dummy.position.set(d - D / 2, h + 0.5, w - W / 2);
                         dummy.updateMatrix();
                         meshRef.current.setMatrixAt(count, dummy.matrix);
 
-                        // Color Logic
-                        if (heatmapColor) {
-                            meshRef.current.setColorAt(count, heatmapColor);
-                        } else if (supportColor) {
-                            // Color based on support constraint type
-                            meshRef.current.setColorAt(count, new THREE.Color(supportColor));
-                        } else if (hasLoad) {
-                            // Magenta for loads (from design system)
-                            meshRef.current.setColorAt(count, new THREE.Color('#FF0055'));
+                        // Set opacity based on heatmap value
+                        if (heatmapData && opacityRef.current) {
+                            opacityRef.current.setX(count, heatmapData.opacity);
+                            meshRef.current.setColorAt(count, heatmapData.color);
+                        } else {
+                            // Full opacity for non-heatmap voxels
+                            if (opacityRef.current) {
+                                opacityRef.current.setX(count, 1.0);
+                            }
+                            
+                            // Color Logic
+                            if (supportColor) {
+                                // Color based on support constraint type
+                                meshRef.current.setColorAt(count, new THREE.Color(supportColor));
+                            } else if (hasLoad) {
+                                // Magenta for loads (from design system)
+                                meshRef.current.setColorAt(count, new THREE.Color('#FF0055'));
                             } else {
                                 const val = Math.max(0.2, density);
                                 const color = new THREE.Color().setHSL(0, 0, val * 0.95);
                                 meshRef.current.setColorAt(count, color);
+                            }
                         }
 
                         count++;
@@ -237,13 +258,63 @@ const VoxelGrid = ({
         meshRef.current.count = count;
         meshRef.current.instanceMatrix.needsUpdate = true;
         if (meshRef.current.instanceColor) meshRef.current.instanceColor.needsUpdate = true;
+        
+        // Update opacity attribute
+        if (opacityRef.current) {
+            opacityRef.current.needsUpdate = true;
+            opacityRef.current.count = count;
+        }
+    }, [tensor, heatmap, showHeatmap]);
 
+    // Update geometry with opacity attribute
+    useEffect(() => {
+        if (!meshRef.current || !opacityRef.current) return;
+        
+        const geometry = meshRef.current.geometry;
+        if (opacityRef.current) {
+            geometry.setAttribute('opacity', opacityRef.current);
+        }
     }, [tensor, heatmap, showHeatmap]);
 
     return (
         <instancedMesh ref={meshRef} args={[undefined, undefined, 20000]}>
             <boxGeometry args={[0.9, 0.9, 0.9]} />
-            <meshStandardMaterial roughness={0.2} metalness={0.8} />
+            {showHeatmap ? (
+                <shaderMaterial
+                    key="heatmap-material"
+                    vertexShader={`
+                        attribute float opacity;
+                        varying float vOpacity;
+                        varying vec3 vColor;
+                        
+                        void main() {
+                            vOpacity = opacity;
+                            vColor = color;
+                            vec4 mvPosition = modelViewMatrix * instanceMatrix * vec4(position, 1.0);
+                            gl_Position = projectionMatrix * mvPosition;
+                        }
+                    `}
+                    fragmentShader={`
+                        varying float vOpacity;
+                        varying vec3 vColor;
+                        
+                        void main() {
+                            gl_FragColor = vec4(vColor, vOpacity);
+                        }
+                    `}
+                    transparent={true}
+                    vertexColors={true}
+                    roughness={0.2}
+                    metalness={0.8}
+                />
+            ) : (
+                <meshStandardMaterial 
+                    key="standard-material"
+                    roughness={0.2} 
+                    metalness={0.8} 
+                    vertexColors={true}
+                />
+            )}
         </instancedMesh>
     );
 };
@@ -508,14 +579,14 @@ const NeuralHUD = ({
                                                 ? 'bg-gradient-to-t from-cyan/30 to-cyan/80'
                                                 : 'bg-gradient-to-t from-magenta/30 to-magenta/80';
 
-                                            return (
-                                                <div
-                                                    key={i}
+                                    return (
+                                        <div
+                                            key={i}
                                                     className={`flex-1 ${colorClass} rounded-t-sm transition-all duration-300`}
                                                     style={{ height: `${height}%` }}
                                                     title={`Step ${history.length - visibleHistory.length + i + 1}: ${value.toFixed(4)}`}
-                                                />
-                                            );
+                                        />
+                                    );
                                         })}
                                         {/* Pad with empty slots if needed */}
                                         {Array.from({ length: windowSize - visibleHistory.length }).map((_, i) => (

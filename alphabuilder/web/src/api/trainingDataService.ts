@@ -49,11 +49,34 @@ export interface EpisodeData {
  * Fetch all available databases
  */
 export async function fetchDatabases(): Promise<DatabaseInfo[]> {
-    const response = await fetch(`${API_BASE}/databases`);
-    if (!response.ok) {
-        throw new Error('Failed to fetch databases');
+    try {
+        const response = await fetch(`${API_BASE}/databases?t=${Date.now()}`);
+        if (!response.ok) {
+            let errorMessage = `Erro do servidor (${response.status})`;
+            try {
+                const errorText = await response.text();
+                if (errorText) {
+                    // Try to parse as JSON error detail
+                    try {
+                        const errorJson = JSON.parse(errorText);
+                        errorMessage = errorJson.detail || errorText;
+                    } catch {
+                        errorMessage = errorText;
+                    }
+                }
+            } catch {
+                // If we can't read error text, use default message
+            }
+            throw new Error(errorMessage);
+        }
+        return response.json();
+    } catch (err) {
+        if (err instanceof TypeError && err.message.includes('fetch')) {
+            // Network error - backend is not reachable
+            throw new Error('Não foi possível conectar ao backend. Verifique se o servidor está rodando em http://localhost:8000');
+        }
+        throw err;
     }
-    return response.json();
 }
 
 /**
@@ -61,15 +84,31 @@ export async function fetchDatabases(): Promise<DatabaseInfo[]> {
  */
 export async function fetchEpisodes(dbId: string): Promise<EpisodeSummary[]> {
     try {
-        const response = await fetch(`${API_BASE}/databases/${dbId}/episodes`);
+        const response = await fetch(`${API_BASE}/databases/${dbId}/episodes?t=${Date.now()}`);
         if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`HTTP ${response.status}: ${errorText || `Failed to fetch episodes for database ${dbId}`}`);
+            let errorMessage = `Erro ao buscar episódios (${response.status})`;
+            try {
+                const errorText = await response.text();
+                if (errorText) {
+                    try {
+                        const errorJson = JSON.parse(errorText);
+                        errorMessage = errorJson.detail || errorText;
+                    } catch {
+                        errorMessage = errorText;
+                    }
+                }
+            } catch {
+                // If we can't read error text, use default message
+            }
+            throw new Error(errorMessage);
         }
         const data = await response.json();
         console.log(`[fetchEpisodes] Received ${data.length} episodes for ${dbId}`);
         return data;
     } catch (err) {
+        if (err instanceof TypeError && err.message.includes('fetch')) {
+            throw new Error('Não foi possível conectar ao backend. Verifique se o servidor está rodando.');
+        }
         console.error(`[fetchEpisodes] Error fetching episodes for ${dbId}:`, err);
         throw err;
     }
@@ -79,11 +118,32 @@ export async function fetchEpisodes(dbId: string): Promise<EpisodeSummary[]> {
  * Fetch full episode data for replay
  */
 export async function fetchEpisodeData(dbId: string, episodeId: string): Promise<EpisodeData> {
-    const response = await fetch(`${API_BASE}/databases/${dbId}/episodes/${episodeId}`);
-    if (!response.ok) {
-        throw new Error(`Failed to fetch episode ${episodeId}`);
+    try {
+        const response = await fetch(`${API_BASE}/databases/${dbId}/episodes/${episodeId}?t=${Date.now()}`);
+        if (!response.ok) {
+            let errorMessage = `Erro ao buscar episódio (${response.status})`;
+            try {
+                const errorText = await response.text();
+                if (errorText) {
+                    try {
+                        const errorJson = JSON.parse(errorText);
+                        errorMessage = errorJson.detail || errorText;
+                    } catch {
+                        errorMessage = errorText;
+                    }
+                }
+            } catch {
+                // If we can't read error text, use default message
+            }
+            throw new Error(errorMessage);
+        }
+        return response.json();
+    } catch (err) {
+        if (err instanceof TypeError && err.message.includes('fetch')) {
+            throw new Error('Não foi possível conectar ao backend. Verifique se o servidor está rodando.');
+        }
+        throw err;
     }
-    return response.json();
 }
 
 // --- Replay Service Class ---
@@ -125,16 +185,16 @@ export class TrainingDataReplayService {
      */
     async loadEpisode(dbId: string, episodeId: string): Promise<void> {
         this.stop();
-        
+
         const data = await fetchEpisodeData(dbId, episodeId);
         this.frames = this.processFrames(data);
-        
+
         // Calculate max compliance for scaling
         this.maxCompliance = Math.max(
             1.0,
             ...this.frames.map(f => f.metadata.compliance || 0)
         );
-        
+
         this.currentStepIndex = 0;
         if (this.frames.length > 0) {
             this.notifySubscribers(this.frames[0]);
@@ -146,18 +206,18 @@ export class TrainingDataReplayService {
             // Convert tensor data to Float32Array
             const tensorData = new Float32Array(frame.tensor_data);
             const shape = frame.tensor_shape as [number, number, number, number];
-            
+
             // Process policy heatmap if available
             // Note: policy_add or policy_remove may be null/empty arrays
             let policyHeatmap = undefined;
             if (frame.policy_add || frame.policy_remove) {
                 const spatialSize = shape[1] * shape[2] * shape[3]; // D * H * W
                 policyHeatmap = {
-                    add: frame.policy_add 
-                        ? new Float32Array(frame.policy_add) 
+                    add: frame.policy_add
+                        ? new Float32Array(frame.policy_add)
                         : new Float32Array(spatialSize),
-                    remove: frame.policy_remove 
-                        ? new Float32Array(frame.policy_remove) 
+                    remove: frame.policy_remove
+                        ? new Float32Array(frame.policy_remove)
                         : new Float32Array(spatialSize),
                 };
             }
@@ -185,19 +245,19 @@ export class TrainingDataReplayService {
 
     play(): void {
         if (this.isPlaying || this.frames.length === 0) return;
-        
+
         // If at end, restart
         if (this.currentStepIndex >= this.frames.length - 1) {
             this.currentStepIndex = 0;
         }
-        
+
         this.isPlaying = true;
         this.intervalId = setInterval(() => {
             if (this.currentStepIndex >= this.frames.length - 1) {
                 this.pause();
                 return;
             }
-            
+
             this.currentStepIndex++;
             this.notifySubscribers(this.frames[this.currentStepIndex]);
         }, 500);

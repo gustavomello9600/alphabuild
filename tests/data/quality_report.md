@@ -1,6 +1,6 @@
 # 📊 Relatório de Qualidade de Dados de Treino
 
-**Gerado em:** 2025-12-03 12:43:35
+**Gerado em:** 2025-12-04 02:51:47
 **Banco de Dados:** `episodios_de_testes_de_integracao.db`
 
 ---
@@ -55,21 +55,21 @@
 
 | Métrica | Canal ADD | Canal REMOVE |
 |---------|-----------|--------------|
-| Média % Positivos | 6.27% | 0.00% |
-| Mediana % Positivos | 0.00% | 0.00% |
-| Max % Positivos | 32.91% | 0.00% |
+| Média % Positivos | 8.36% | 5.39% |
+| Mediana % Positivos | 4.91% | 0.81% |
+| Max % Positivos | 32.91% | 34.86% |
 
 ### 5.2 Recomendação de pos_weight (BCEWithLogitsLoss)
 
 | Canal | pos_weight Recomendado |
 |-------|------------------------|
-| ADD | **15.0** |
-| REMOVE | **5.0** |
+| ADD | **11.0** |
+| REMOVE | **15.0** |
 
 ### 5.3 Balanceamento por Fase
 
 **GROWTH (Fase 1):** ADD médio = 14.58%
-**REFINEMENT (Fase 2):** ADD médio = 0.00%
+**REFINEMENT (Fase 2):** ADD médio = 3.68%
 
 ## 6. Análise de Metadados
 
