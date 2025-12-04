@@ -71,7 +71,7 @@ def install_dependencies():
                 if result.returncode == 0:
                     # Recarrega módulos
                     import importlib
-        import dolfinx
+                    import dolfinx
                     print(f"✓ FEniCSx instalado: {dolfinx.__version__}")
                 else:
                     print(f"✗ Falha na instalação: {result.stderr[:200]}")
