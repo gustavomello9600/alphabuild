@@ -147,27 +147,10 @@ train_dataset, val_dataset = random_split(
 print(f"   Train samples: {len(train_dataset):,}")
 print(f"   Val samples: {len(val_dataset):,}")
 
-# DataLoaders
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=CONFIG['batch_size'] * torch.cuda.device_count(),
-    shuffle=True,
-    num_workers=CONFIG['num_workers'],
-    pin_memory=True,
-    persistent_workers=True,
-    drop_last=True,
-)
+# NOTE: DataLoaders are created fresh each epoch to manage memory
+# See training loop for DataLoader configuration
 
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=CONFIG['batch_size'] * torch.cuda.device_count(),
-    shuffle=False,
-    num_workers=CONFIG['num_workers'],
-    pin_memory=True,
-)
-
-print(f"   Batches per epoch: {len(train_loader)}")
-print(f"   Effective batch size: {CONFIG['batch_size'] * torch.cuda.device_count()}")
+print(f"   DataLoaders will be created per-epoch for memory management")
 
 # ============================================================================
 # CELL 7: Create Model
@@ -324,25 +307,52 @@ best_val_loss = float('inf')
 patience_counter = 0
 history = {'train_loss': [], 'val_loss': [], 'lr': []}
 
+# DataLoader config
+batch_size = CONFIG['batch_size'] * max(1, torch.cuda.device_count())
+num_workers = CONFIG['num_workers']
+
 training_start = time.time()
 
 for epoch in range(CONFIG['epochs']):
     epoch_start = time.time()
     
+    # === CREATE TRAIN DATALOADER (fresh each epoch) ===
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+    
     # Train
     train_metrics = train_epoch(model, train_loader, optimizer, scaler, device)
     
-    # Memory cleanup before validation
-    print(f"  📊 Post-train memory: {get_memory_info()}")
+    # === CLEANUP TRAIN LOADER ===
+    del train_loader
+    import gc
+    gc.collect()
     torch.cuda.empty_cache()
-    print(f"  📊 After empty_cache: {get_memory_info()}")
+    print(f"  📊 After train cleanup: {get_memory_info()}")
+    
+    # === CREATE VAL DATALOADER (fresh) ===
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
     
     # Validate
     val_metrics = validate_epoch(model, val_loader, device)
     
-    # Memory cleanup after validation
-    print(f"  📊 Post-val memory: {get_memory_info()}")
+    # === CLEANUP VAL LOADER ===
+    del val_loader
+    gc.collect()
     torch.cuda.empty_cache()
+    print(f"  📊 After val cleanup: {get_memory_info()}")
     
     # Update scheduler
     scheduler.step()
