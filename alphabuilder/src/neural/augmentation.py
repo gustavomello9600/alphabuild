@@ -82,6 +82,79 @@ def flip_y(
     return state_flip, policy_flip
 
 
+def random_pad_to_target(
+    state: np.ndarray,
+    policy: np.ndarray,
+    divisor: int = 32
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Pad tensor to target size (divisible by divisor) with random positioning.
+    
+    Instead of always padding on the right (deterministic), this places
+    the original structure at a random position within the padded volume.
+    
+    This teaches translational invariance - the network cannot rely
+    on the structure being in a fixed corner.
+    
+    Args:
+        state: (C, D, H, W) tensor
+        policy: (2, D, H, W) tensor
+        divisor: Target dimensions will be ceil to nearest multiple of this
+        
+    Returns:
+        Padded (state, policy) tuple with random positioning
+    """
+    C, D, H, W = state.shape
+    
+    # Calculate target dimensions (next multiple of divisor)
+    def next_multiple(x, div):
+        return ((x + div - 1) // div) * div
+    
+    target_d = next_multiple(D, divisor)
+    target_h = next_multiple(H, divisor)
+    target_w = next_multiple(W, divisor)
+    
+    # Calculate total padding needed
+    pad_d = target_d - D
+    pad_h = target_h - H
+    pad_w = target_w - W
+    
+    # If no padding needed, return as-is
+    if pad_d == 0 and pad_h == 0 and pad_w == 0:
+        return state, policy
+    
+    # Randomly distribute padding between left and right for each dimension
+    pad_d_left = np.random.randint(0, pad_d + 1) if pad_d > 0 else 0
+    pad_d_right = pad_d - pad_d_left
+    
+    pad_h_left = np.random.randint(0, pad_h + 1) if pad_h > 0 else 0
+    pad_h_right = pad_h - pad_h_left
+    
+    pad_w_left = np.random.randint(0, pad_w + 1) if pad_w > 0 else 0
+    pad_w_right = pad_w - pad_w_left
+    
+    # Create padded arrays
+    state_padded = np.zeros((C, target_d, target_h, target_w), dtype=state.dtype)
+    policy_padded = np.zeros((2, target_d, target_h, target_w), dtype=policy.dtype)
+    
+    # Place original data at random position
+    state_padded[
+        :,
+        pad_d_left:pad_d_left + D,
+        pad_h_left:pad_h_left + H,
+        pad_w_left:pad_w_left + W
+    ] = state
+    
+    policy_padded[
+        :,
+        pad_d_left:pad_d_left + D,
+        pad_h_left:pad_h_left + H,
+        pad_w_left:pad_w_left + W
+    ] = policy
+    
+    return state_padded, policy_padded
+
+
 def erosion_attack(
     state: np.ndarray,
     policy: np.ndarray,

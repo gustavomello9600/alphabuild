@@ -15,7 +15,7 @@ from typing import Optional, Dict, List, Tuple
 import json
 
 from alphabuilder.src.neural.augmentation import (
-    rotate_90_z, flip_y, erosion_attack, 
+    rotate_90_z, flip_y, random_pad_to_target, erosion_attack, 
     load_multiplier, sabotage, saboteur
 )
 
@@ -38,13 +38,28 @@ def deserialize_sparse(blob: bytes) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def deserialize_array(blob: bytes) -> np.ndarray:
-    """Deserialize numpy array from compressed bytes."""
-    return pickle.loads(zlib.decompress(blob))
+    """
+    Deserialize numpy array from compressed bytes.
+    
+    Supports both formats:
+    - New: np.save format (Kaggle-compatible, version independent)
+    - Old: pickle format (legacy, NumPy version dependent)
+    """
+    decompressed = zlib.decompress(blob)
+    
+    # Try np.load format first (starts with numpy magic bytes)
+    if decompressed[:6] == b'\x93NUMPY':
+        import io
+        buffer = io.BytesIO(decompressed)
+        return np.load(buffer, allow_pickle=False)
+    
+    # Fall back to pickle format (legacy)
+    return pickle.loads(decompressed)
 
 
 def deserialize_state_legacy(blob: bytes) -> np.ndarray:
     """Legacy: deserialize from pickle with compression."""
-    return pickle.loads(zlib.decompress(blob))
+    return deserialize_array(blob)  # Use unified function
 
 
 def detect_schema_version(db_path: Path) -> str:
@@ -333,31 +348,50 @@ class TopologyDatasetV31(Dataset):
     
     def _apply_augmentation(self, state, policy, value, is_final, is_connected):
         """
-        Apply augmentation based on spec v3.1.
+        Apply augmentation based on spec v3.1 + Aggressive D4 Symmetry + Translation.
         
-        Priority order:
-        1. Final step -> Erosion Attack (100%)
-        2. Connected -> Load Multiplier (5%)
-        3. General -> Sabotage (5%) or Saboteur (10%)
-        4. Always: Random flip (50%) - rotation only if D==H
+        ORDER:
+        1. Negative sampling (exclusive - only ONE effect, probabilistic)
+        2. D4 Symmetry (ALWAYS applies uniformly: 4 rotations × 2 flips)
+        3. Random translation (ALWAYS applies: shifts structure within volume)
+        
+        Combined augmentation ensures:
+        - Probability of seeing original orientation: 1/8 (12.5%)
+        - Network learns rotation and translation invariance
+        - Batches have maximum statistical diversity
         """
-        # Physical augmentation (always, 50% chance)
-        if np.random.random() < 0.5:
-            D, H = state.shape[1], state.shape[2]
-            if D == H and np.random.random() < 0.5:
-                state, policy = rotate_90_z(state, policy)
-            else:
-                state, policy = flip_y(state, policy)
-        
-        # Negative sampling based on conditions
+        # STEP 1: Negative Sampling (exclusive - only ONE effect)
         if is_final:
+            # Condition A: Erosion Attack (100% for final states)
             state, policy, value = erosion_attack(state, policy, value)
         elif is_connected and np.random.random() < 0.05:
+            # Condition B: Load Multiplier (5% for connected states)
             state, policy, value = load_multiplier(state, policy, value, k=3.0)
         elif np.random.random() < 0.05:
+            # Condition C: Sabotage (5% general)
             state, policy, value = sabotage(state, policy, value)
         elif np.random.random() < 0.10:
+            # Condition D: Saboteur (10% general)
             state, policy, value = saboteur(state, policy, value)
+        
+        # STEP 2: D4 Symmetry - Aggressive (ALWAYS applies uniformly)
+        # Applied to BOTH original and negative samples
+        D, H = state.shape[1], state.shape[2]
+        
+        # Uniform rotation: 0°, 90°, 180°, or 270° (if D==H)
+        if D == H:
+            num_rotations = np.random.randint(0, 4)  # 0, 1, 2, or 3
+            for _ in range(num_rotations):
+                state, policy = rotate_90_z(state, policy)
+        
+        # Uniform flip: apply or not (50/50, but now part of D4 group)
+        if np.random.random() < 0.5:
+            state, policy = flip_y(state, policy)
+        
+        # STEP 3: Random Padding (ALWAYS applies)
+        # Pads to target size (divisible by 32) with random positioning
+        # This replaces deterministic padding in the model
+        state, policy = random_pad_to_target(state, policy, divisor=32)
         
         return state, policy, value
     
