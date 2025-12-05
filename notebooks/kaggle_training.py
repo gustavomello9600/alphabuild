@@ -299,8 +299,21 @@ def validate_epoch(model, loader, device):
 # CELL 9: Training Loop
 # ============================================================================
 
+def get_memory_info():
+    """Get current GPU and RAM memory usage."""
+    import psutil
+    ram_percent = psutil.virtual_memory().percent
+    ram_used = psutil.virtual_memory().used / 1024**3
+    
+    if torch.cuda.is_available():
+        gpu_allocated = torch.cuda.memory_allocated() / 1024**3
+        gpu_reserved = torch.cuda.memory_reserved() / 1024**3
+        return f"RAM: {ram_used:.1f}GB ({ram_percent:.0f}%) | GPU: {gpu_allocated:.1f}GB alloc / {gpu_reserved:.1f}GB reserved"
+    return f"RAM: {ram_used:.1f}GB ({ram_percent:.0f}%)"
+
 print(f"\n🚀 Starting training: {CONFIG['epochs']} epochs")
 print("-" * 60)
+print(f"📊 Initial memory: {get_memory_info()}")
 
 # Checkpoint directory
 checkpoint_dir = Path("/kaggle/working/checkpoints")
@@ -319,8 +332,17 @@ for epoch in range(CONFIG['epochs']):
     # Train
     train_metrics = train_epoch(model, train_loader, optimizer, scaler, device)
     
+    # Memory cleanup before validation
+    print(f"  📊 Post-train memory: {get_memory_info()}")
+    torch.cuda.empty_cache()
+    print(f"  📊 After empty_cache: {get_memory_info()}")
+    
     # Validate
     val_metrics = validate_epoch(model, val_loader, device)
+    
+    # Memory cleanup after validation
+    print(f"  📊 Post-val memory: {get_memory_info()}")
+    torch.cuda.empty_cache()
     
     # Update scheduler
     scheduler.step()
@@ -345,6 +367,10 @@ for epoch in range(CONFIG['epochs']):
         best_val_loss = val_metrics['loss']
         patience_counter = 0
         
+        # Memory cleanup before checkpoint
+        torch.cuda.empty_cache()
+        print(f"  📊 Before checkpoint: {get_memory_info()}")
+        
         model_state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
         torch.save({
             'epoch': epoch,
@@ -354,6 +380,7 @@ for epoch in range(CONFIG['epochs']):
             'config': CONFIG,
         }, checkpoint_dir / "best_model.pt")
         print(f"  ✓ New best model saved (val_loss: {best_val_loss:.4f})")
+        del model_state  # Free memory immediately
     else:
         patience_counter += 1
     
