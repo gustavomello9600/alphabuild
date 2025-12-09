@@ -135,7 +135,7 @@ def check_structure_connectivity(
     threshold: float = 0.5
 ) -> Tuple[bool, bool]:
     """
-    Check if structure connects support (X=0) to load region.
+    Check if structure connects support to load region.
     
     This is used for Phase 1 -> Phase 2 transition detection.
     
@@ -240,6 +240,94 @@ def check_structure_connectivity(
         return connected_to_support, False
     
     return connected_to_support, reached_load
+
+
+def calculate_connectivity_reward(
+    density: np.ndarray,
+    bc_masks: Tuple[np.ndarray, np.ndarray, np.ndarray],
+    forces: Tuple[np.ndarray, np.ndarray, np.ndarray],
+    threshold: float = 0.5
+) -> float:
+    """
+    Calculate reward based on connectivity to support and load.
+    
+    Rewards:
+    - Not connected to support: 0.0
+    - Connected to support: 0.1 (Base foundation reward)
+    - Connected to load: Scales from 0.1 to 1.0 based on fraction of load voxels connected.
+    
+    Args:
+        density: Density grid (D, H, W)
+        bc_masks: (mask_x, mask_y, mask_z) boundary condition masks. 1.0 = fixed.
+        forces: (fx, fy, fz) force vectors. Non-zero = load applied.
+        threshold: Density threshold for binarization.
+        
+    Returns:
+        Reward value in [0.0, 1.0]
+    """
+    nx, ny, nz = density.shape
+    binary = density > threshold
+    
+    # Label connected components
+    labeled, n_components = ndimage.label(binary)
+    
+    if n_components == 0:
+        return 0.0
+    
+    # Identify support voxels (where BCs are applied)
+    # BC masks are 1.0 where fixed.
+    # We check if any component touches a fixed voxel.
+    # Combine masks to find any fixed degree of freedom
+    # (Usually fixed ground is enough to be "support")
+    support_mask = (bc_masks[0] > 0.5) | (bc_masks[1] > 0.5) | (bc_masks[2] > 0.5)
+    
+    # Check if we have any support mask points at all
+    if not np.any(support_mask):
+         return 0.0
+
+    # Find labels that touch support
+    support_labels_found = np.unique(labeled[support_mask])
+    # Remove 0 (background)
+    support_labels = support_labels_found[support_labels_found > 0]
+    
+    if len(support_labels) == 0:
+        return 0.0
+        
+    # We have a connection to support! Base reward.
+    base_reward = 0.1
+    
+    # Identify load voxels
+    # Force magnitude > 0 implies load
+    force_mag = np.abs(forces[0]) + np.abs(forces[1]) + np.abs(forces[2])
+    load_mask = force_mag > 1e-6
+    
+    # Identificar voxels de suporte conectados
+    connected_mask = np.isin(labeled, support_labels)
+    
+    # Check which load voxels are connected to support
+    # Get labels at load positions where there is material
+    load_material_mask = load_mask & binary
+    
+    total_load_voxels = np.sum(load_mask)
+    if total_load_voxels == 0:
+        return 0.0
+
+    connected_load_voxels = 0
+    if np.any(load_material_mask):
+        labels_at_load = labeled[load_material_mask]
+        is_connected = np.isin(labels_at_load, support_labels)
+        connected_load_voxels = np.sum(is_connected)
+    
+    # Only reward if we have connection to load
+    if connected_load_voxels == 0:
+        return 0.0
+        
+    fraction_connected = connected_load_voxels / total_load_voxels
+    
+    # Bonus: +0 to +0.5 based on coverage
+    reward = 0.5 * fraction_connected
+    
+    return float(reward)
 
 
 def get_phase2_terminal_reward(

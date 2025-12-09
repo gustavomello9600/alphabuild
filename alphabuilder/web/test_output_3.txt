@@ -1,0 +1,265 @@
+
+[1m[46m RUN [49m[22m [36mv4.0.15 [39m[90m/home/Gustavo/projects/alphabuild/alphabuilder/web[39m
+
+ [32m✓[39m src/api/__tests__/trainingDataService.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 7[2mms[22m[39m
+[90mstderr[2m | src/pages/__tests__/EpisodeReplay.test.tsx
+[22m[39mTHREE.WARNING: Multiple instances of Three.js being imported.
+
+[90mstderr[2m | src/pages/__tests__/EpisodeReplay.test.tsx[2m > [22m[2mEpisodeReplay[2m > [22m[2mrenders loading state initially
+[22m[39m[vitest] The vi.fn() mock did not use 'function' or 'class' in its implementation, see https://vitest.dev/api/vi#vi-spyon for examples.
+[vitest] The vi.fn() mock did not use 'function' or 'class' in its implementation, see https://vitest.dev/api/vi#vi-spyon for examples.
+
+[90mstderr[2m | src/pages/__tests__/EpisodeReplay.test.tsx[2m > [22m[2mEpisodeReplay[2m > [22m[2mloads episode data on mount
+[22m[39m[vitest] The vi.fn() mock did not use 'function' or 'class' in its implementation, see https://vitest.dev/api/vi#vi-spyon for examples.
+[vitest] The vi.fn() mock did not use 'function' or 'class' in its implementation, see https://vitest.dev/api/vi#vi-spyon for examples.
+
+ [31m❯[39m src/pages/__tests__/EpisodeReplay.test.tsx [2m([22m[2m2 tests[22m[2m | [22m[31m2 failed[39m[2m)[22m[32m 226[2mms[22m[39m
+[31m     [31m×[31m renders loading state initially[39m[32m 185[2mms[22m[39m
+[31m     [31m×[31m loads episode data on mount[39m[32m 39[2mms[22m[39m
+
+[31m⎯⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 2 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[41m[1m FAIL [22m[49m src/pages/__tests__/EpisodeReplay.test.tsx[2m > [22mEpisodeReplay[2m > [22mrenders loading state initially
+{
+  stack: 'AggregateError: \n' +
+    '    at aggregateErrors (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react/cjs/react.development.js:551:11)\n' +
+    '    at process.env.NODE_ENV.exports.act (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react/cjs/react.development.js:897:24)\n' +
+    '    at /home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@testing-library/react/dist/act-compat.js:47:25\n' +
+    '    at renderRoot (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@testing-library/react/dist/pure.js:190:26)\n' +
+    '    at Proxy.render (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@testing-library/react/dist/pure.js:292:10)\n' +
+    '    at /home/Gustavo/projects/alphabuild/alphabuilder/web/src/pages/__tests__/EpisodeReplay.test.tsx:46:9\n' +
+    '    at file:///home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@vitest/runner/dist/index.js:145:11\n' +
+    '    at file:///home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@vitest/runner/dist/index.js:915:26\n' +
+    '    at file:///home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@vitest/runner/dist/index.js:1240:20\n' +
+    '    at new Promise (<anonymous>)',
+  errors: [
+    {
+      stack: 'TypeError: () => ({\n' +
+        '  observe: __vite_ssr_import_1__.vi.fn(),\n' +
+        '  unobserve: __vite_ssr_import_1__.vi.fn(),\n' +
+        '  disconnect: __...<omitted>...}) is not a constructor\n' +
+        '    at new Mock (file:///home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@vitest/spy/dist/index.js:262:27)\n' +
+        '    at E (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-use-measure/dist/index.cjs:1:1816)\n' +
+        '    at z (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-use-measure/dist/index.cjs:1:2383)\n' +
+        '    at commitAttachRef (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:13482:44)\n' +
+        '    at runWithFiberInDEV (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:874:13)\n' +
+        '    at safelyAttachRef (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:13500:9)\n' +
+        '    at commitLayoutEffectOnFiber (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:14089:26)\n' +
+        '    at recursivelyTraverseLayoutEffects (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:15159:11)\n' +
+        '    at commitLayoutEffectOnFiber (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:14065:11)\n' +
+        '    at recursivelyTraverseLayoutEffects (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:15159:11)',
+      message: '() => ({\n' +
+        '  observe: __vite_ssr_import_1__.vi.fn(),\n' +
+        '  unobserve: __vite_ssr_import_1__.vi.fn(),\n' +
+        '  disconnect: __...<omitted>...}) is not a constructor',
+      constructor: 'Function<TypeError>',
+      name: 'TypeError',
+      toString: 'Function<toString>'
+    },
+    {
+      stack: 'TypeError: () => ({\n' +
+        '  observe: __vite_ssr_import_1__.vi.fn(),\n' +
+        '  unobserve: __vite_ssr_import_1__.vi.fn(),\n' +
+        '  disconnect: __...<omitted>...}) is not a constructor\n' +
+        '    at new Mock (file:///home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@vitest/spy/dist/index.js:262:27)\n' +
+        '    at E (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-use-measure/dist/index.cjs:1:1816)\n' +
+        '    at /home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-use-measure/dist/index.cjs:1:2431\n' +
+        '    at Object.react_stack_bottom_frame (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:25989:20)\n' +
+        '    at runWithFiberInDEV (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:874:13)\n' +
+        '    at commitHookEffectListMount (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:13249:29)\n' +
+        '    at commitHookPassiveMountEffects (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:13336:11)\n' +
+        '    at commitPassiveMountOnFiber (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:15484:13)\n' +
+        '    at recursivelyTraversePassiveMountEffects (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:15439:11)\n' +
+        '    at commitPassiveMountOnFiber (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:15718:11)',
+      message: '() => ({\n' +
+        '  observe: __vite_ssr_import_1__.vi.fn(),\n' +
+        '  unobserve: __vite_ssr_import_1__.vi.fn(),\n' +
+        '  disconnect: __...<omitted>...}) is not a constructor',
+      constructor: 'Function<TypeError>',
+      name: 'TypeError',
+      toString: 'Function<toString>'
+    }
+  ],
+  constructor: 'Function<AggregateError>',
+  name: 'AggregateError',
+  message: '',
+  toString: 'Function<toString>',
+  stacks: [
+    {
+      method: 'aggregateErrors',
+      file: '/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react/cjs/react.development.js',
+      line: 551,
+      column: 11
+    },
+    {
+      method: 'process.env.NODE_ENV.exports.act',
+      file: '/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react/cjs/react.development.js',
+      line: 897,
+      column: 24
+    },
+    {
+      method: '',
+      file: '/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@testing-library/react/dist/act-compat.js',
+      line: 47,
+      column: 25
+    },
+    {
+      method: 'renderRoot',
+      file: '/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@testing-library/react/dist/pure.js',
+      line: 190,
+      column: 26
+    },
+    {
+      method: 'Proxy.render',
+      file: '/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@testing-library/react/dist/pure.js',
+      line: 292,
+      column: 10
+    },
+    {
+      method: '',
+      file: '/home/Gustavo/projects/alphabuild/alphabuilder/web/src/pages/__tests__/EpisodeReplay.test.tsx',
+      line: 46,
+      column: 9
+    }
+  ]
+}
+[90m [2m❯[22m aggregateErrors node_modules/react/cjs/react.development.js:[2m551:11[22m[39m
+[90m [2m❯[22m process.env.NODE_ENV.exports.act node_modules/react/cjs/react.development.js:[2m897:24[22m[39m
+[90m [2m❯[22m node_modules/@testing-library/react/dist/act-compat.js:[2m47:25[22m[39m
+[90m [2m❯[22m renderRoot node_modules/@testing-library/react/dist/pure.js:[2m190:26[22m[39m
+[90m [2m❯[22m Proxy.render node_modules/@testing-library/react/dist/pure.js:[2m292:10[22m[39m
+[36m [2m❯[22m src/pages/__tests__/EpisodeReplay.test.tsx:[2m46:9[22m[39m
+    [90m 44| [39m
+    [90m 45| [39m    [34mit[39m([32m'renders loading state initially'[39m[33m,[39m () [33m=>[39m {
+    [90m 46| [39m        [34mrender[39m(
+    [90m   | [39m        [31m^[39m
+    [90m 47| [39m            <MemoryRouter initialEntries={['/databases/db1/episodes/ep…
+    [90m 48| [39m                [33m<[39m[33mRoutes[39m[33m>[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/pages/__tests__/EpisodeReplay.test.tsx[2m > [22mEpisodeReplay[2m > [22mloads episode data on mount
+{
+  stack: 'AggregateError: \n' +
+    '    at aggregateErrors (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react/cjs/react.development.js:551:11)\n' +
+    '    at process.env.NODE_ENV.exports.act (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react/cjs/react.development.js:897:24)\n' +
+    '    at /home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@testing-library/react/dist/act-compat.js:47:25\n' +
+    '    at renderRoot (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@testing-library/react/dist/pure.js:190:26)\n' +
+    '    at Proxy.render (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@testing-library/react/dist/pure.js:292:10)\n' +
+    '    at /home/Gustavo/projects/alphabuild/alphabuilder/web/src/pages/__tests__/EpisodeReplay.test.tsx:60:9\n' +
+    '    at file:///home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@vitest/runner/dist/index.js:145:11\n' +
+    '    at file:///home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@vitest/runner/dist/index.js:915:26\n' +
+    '    at file:///home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@vitest/runner/dist/index.js:1240:20\n' +
+    '    at new Promise (<anonymous>)',
+  errors: [
+    {
+      stack: 'TypeError: () => ({\n' +
+        '  observe: __vite_ssr_import_1__.vi.fn(),\n' +
+        '  unobserve: __vite_ssr_import_1__.vi.fn(),\n' +
+        '  disconnect: __...<omitted>...}) is not a constructor\n' +
+        '    at new Mock (file:///home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@vitest/spy/dist/index.js:262:27)\n' +
+        '    at E (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-use-measure/dist/index.cjs:1:1816)\n' +
+        '    at z (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-use-measure/dist/index.cjs:1:2383)\n' +
+        '    at commitAttachRef (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:13482:44)\n' +
+        '    at runWithFiberInDEV (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:874:13)\n' +
+        '    at safelyAttachRef (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:13500:9)\n' +
+        '    at commitLayoutEffectOnFiber (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:14089:26)\n' +
+        '    at recursivelyTraverseLayoutEffects (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:15159:11)\n' +
+        '    at commitLayoutEffectOnFiber (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:14065:11)\n' +
+        '    at recursivelyTraverseLayoutEffects (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:15159:11)',
+      message: '() => ({\n' +
+        '  observe: __vite_ssr_import_1__.vi.fn(),\n' +
+        '  unobserve: __vite_ssr_import_1__.vi.fn(),\n' +
+        '  disconnect: __...<omitted>...}) is not a constructor',
+      constructor: 'Function<TypeError>',
+      name: 'TypeError',
+      toString: 'Function<toString>'
+    },
+    {
+      stack: 'TypeError: () => ({\n' +
+        '  observe: __vite_ssr_import_1__.vi.fn(),\n' +
+        '  unobserve: __vite_ssr_import_1__.vi.fn(),\n' +
+        '  disconnect: __...<omitted>...}) is not a constructor\n' +
+        '    at new Mock (file:///home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@vitest/spy/dist/index.js:262:27)\n' +
+        '    at E (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-use-measure/dist/index.cjs:1:1816)\n' +
+        '    at /home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-use-measure/dist/index.cjs:1:2431\n' +
+        '    at Object.react_stack_bottom_frame (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:25989:20)\n' +
+        '    at runWithFiberInDEV (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:874:13)\n' +
+        '    at commitHookEffectListMount (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:13249:29)\n' +
+        '    at commitHookPassiveMountEffects (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:13336:11)\n' +
+        '    at commitPassiveMountOnFiber (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:15484:13)\n' +
+        '    at recursivelyTraversePassiveMountEffects (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:15439:11)\n' +
+        '    at commitPassiveMountOnFiber (/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react-dom/cjs/react-dom-client.development.js:15718:11)',
+      message: '() => ({\n' +
+        '  observe: __vite_ssr_import_1__.vi.fn(),\n' +
+        '  unobserve: __vite_ssr_import_1__.vi.fn(),\n' +
+        '  disconnect: __...<omitted>...}) is not a constructor',
+      constructor: 'Function<TypeError>',
+      name: 'TypeError',
+      toString: 'Function<toString>'
+    }
+  ],
+  constructor: 'Function<AggregateError>',
+  name: 'AggregateError',
+  message: '',
+  toString: 'Function<toString>',
+  stacks: [
+    {
+      method: 'aggregateErrors',
+      file: '/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react/cjs/react.development.js',
+      line: 551,
+      column: 11
+    },
+    {
+      method: 'process.env.NODE_ENV.exports.act',
+      file: '/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/react/cjs/react.development.js',
+      line: 897,
+      column: 24
+    },
+    {
+      method: '',
+      file: '/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@testing-library/react/dist/act-compat.js',
+      line: 47,
+      column: 25
+    },
+    {
+      method: 'renderRoot',
+      file: '/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@testing-library/react/dist/pure.js',
+      line: 190,
+      column: 26
+    },
+    {
+      method: 'Proxy.render',
+      file: '/home/Gustavo/projects/alphabuild/alphabuilder/web/node_modules/@testing-library/react/dist/pure.js',
+      line: 292,
+      column: 10
+    },
+    {
+      method: '',
+      file: '/home/Gustavo/projects/alphabuild/alphabuilder/web/src/pages/__tests__/EpisodeReplay.test.tsx',
+      line: 60,
+      column: 9
+    }
+  ]
+}
+[90m [2m❯[22m aggregateErrors node_modules/react/cjs/react.development.js:[2m551:11[22m[39m
+[90m [2m❯[22m process.env.NODE_ENV.exports.act node_modules/react/cjs/react.development.js:[2m897:24[22m[39m
+[90m [2m❯[22m node_modules/@testing-library/react/dist/act-compat.js:[2m47:25[22m[39m
+[90m [2m❯[22m renderRoot node_modules/@testing-library/react/dist/pure.js:[2m190:26[22m[39m
+[90m [2m❯[22m Proxy.render node_modules/@testing-library/react/dist/pure.js:[2m292:10[22m[39m
+[36m [2m❯[22m src/pages/__tests__/EpisodeReplay.test.tsx:[2m60:9[22m[39m
+    [90m 58| [39m
+    [90m 59| [39m    [34mit[39m([32m'loads episode data on mount'[39m[33m,[39m [35masync[39m () [33m=>[39m {
+    [90m 60| [39m        [34mrender[39m(
+    [90m   | [39m        [31m^[39m
+    [90m 61| [39m            <MemoryRouter initialEntries={['/databases/db1/episodes/ep…
+    [90m 62| [39m                [33m<[39m[33mRoutes[39m[33m>[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯[22m[39m
+
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[2m | [22m[1m[32m1 passed[39m[22m[90m (2)[39m
+[2m      Tests [22m [1m[31m2 failed[39m[22m[2m | [22m[1m[32m3 passed[39m[22m[90m (5)[39m
+[2m   Start at [22m 02:24:12
+[2m   Duration [22m 1.64s[2m (transform 151ms, setup 134ms, import 749ms, tests 233ms, environment 997ms)[22m
+

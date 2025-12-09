@@ -26,7 +26,7 @@ from dolfinx.fem import form, Function
 from dolfinx import la
 from dolfinx.fem.petsc import (create_vector, create_matrix,
                                assemble_vector, assemble_matrix, set_bc)
-import pyvista
+# import pyvista  <-- Lazy import
 
 
 def create_mechanism_vectors(func_space, in_spring, out_spring):
@@ -215,6 +215,7 @@ def compare_matrices(array1, array2, precision=12, k=1):
 class Plotter():
     def __init__(self, mesh):
         """Initialize a plotter."""
+        import pyvista
         pyvista.OFF_SCREEN = True
         pyvista.start_xvfb()
         self.dim = mesh.topology.dim

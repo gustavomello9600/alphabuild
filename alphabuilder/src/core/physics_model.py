@@ -15,14 +15,14 @@ class PhysicalProperties:
     penalty_epsilon: float = 0.1
     penalty_alpha: float = 10.0
 
-import dolfinx.fem.petsc
+from dolfinx.fem import petsc
 
 @dataclass
 class FEMContext:
     domain: mesh.Mesh
     V: fem.FunctionSpace
     bc: fem.DirichletBC
-    problem: dolfinx.fem.petsc.LinearProblem
+    problem: petsc.LinearProblem
     u_sol: fem.Function
     dof_map: np.ndarray # Map from Grid Voxel to FEM Cell
     material_field: fem.Function # DG0 field for density
@@ -81,6 +81,8 @@ def initialize_cantilever_context(resolution=(64, 32, 32), props: PhysicalProper
     v = ufl.TestFunction(V)
     
     # Material Field (Density 0 or 1)
+    
+    # Material Field (Density 0 or 1)
     # We use a DG0 space (constant per cell) to map voxels to elements
     V_mat = fem.functionspace(domain, ("DG", 0))
     material_field = fem.Function(V_mat)
@@ -121,7 +123,7 @@ def initialize_cantilever_context(resolution=(64, 32, 32), props: PhysicalProper
         # "ksp_monitor": None, # Enable monitor
         # "ksp_view": None     # Enable view (verbose)
     }
-    problem = dolfinx.fem.petsc.LinearProblem(a, L, bcs=[bc], petsc_options=solver_options, petsc_options_prefix="cantilever")
+    problem = petsc.LinearProblem(a, L, bcs=[bc], petsc_options=solver_options, petsc_options_prefix="cantilever")
     
     # 6. DOF Map (Voxel -> Cell Index)
     # In FEniCSx with structured box mesh, cell indices usually follow a pattern.

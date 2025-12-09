@@ -161,9 +161,10 @@ class TestLegalMoves:
         density = np.zeros((4, 4, 4))
         valid_add = get_legal_add_moves(density)
         # 4x4 = 16 voxels on X=0 support plane
-        assert valid_add.sum() == 16
-        assert valid_add[0, :, :].sum() == 16  # All on support plane
-        assert valid_add[1:, :, :].sum() == 0  # Nothing else
+        # Plus 4x4 = 16 voxels on X=1 support plane (legacy fallback) -> Total 32
+        assert valid_add.sum() == 32
+        assert valid_add[0:2, :, :].sum() == 32  # All on support planes
+        assert valid_add[2:, :, :].sum() == 0  # Nothing else
     
     def test_legal_add_moves_empty_grid_no_supports(self):
         """Empty grid without supports: no valid add moves."""
@@ -178,8 +179,11 @@ class TestLegalMoves:
         
         valid_add = get_legal_add_moves(density)
         
-        # 6 face neighbors + 25 support plane voxels = 31
-        assert valid_add.sum() == 31
+        # 6 face neighbors + 50 support plane voxels (X=0, X=1)
+        # One neighbor (1, 2, 2) is at X=1, so it overlaps.
+        # Supports: 50. Neighbors: 6. Overlap: 1.
+        # Total = 50 + 6 - 1 = 55.
+        assert valid_add.sum() == 55
         assert valid_add[2, 2, 2] == 0  # Original position not valid
         assert valid_add[1, 2, 2] == 1  # Left neighbor
         assert valid_add[3, 2, 2] == 1  # Right neighbor

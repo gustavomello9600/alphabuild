@@ -168,7 +168,11 @@ def generate_quality_report(db_path: Path, output_path: Path) -> str:
     if len(scores_array) == 0:
         report_lines.append("⚠️ Nenhum score encontrado no banco de dados.")
         report_lines.append("")
-        return "\n".join(report_lines)
+        # Salva e retorna
+        report_content = "\n".join(report_lines)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(report_content, encoding='utf-8')
+        return str(output_path)
     
     report_lines.append(f"### 4.1 Estatísticas Gerais")
     report_lines.append("")
@@ -298,7 +302,11 @@ def generate_quality_report(db_path: Path, output_path: Path) -> str:
     if len(add_ratios) == 0:
         report_lines.append("⚠️ Nenhuma policy encontrada no banco de dados.")
         report_lines.append("")
-        return "\n".join(report_lines)
+        # Salva e retorna
+        report_content = "\n".join(report_lines)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(report_content, encoding='utf-8')
+        return str(output_path)
     
     report_lines.append(f"| Métrica | Canal ADD | Canal REMOVE |")
     report_lines.append(f"|---------|-----------|--------------|")

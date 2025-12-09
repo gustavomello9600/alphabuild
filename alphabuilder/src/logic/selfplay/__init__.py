@@ -41,6 +41,7 @@ from .reward import (
     analyze_structure_islands,
     calculate_island_penalty,
     get_reward_with_island_penalty,
+    calculate_connectivity_reward,
 )
 
 __all__ = [
@@ -59,5 +60,6 @@ __all__ = [
     'list_games',
     'get_game_count',
     'generate_game_id',
+    'calculate_connectivity_reward',
 ]
 

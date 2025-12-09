@@ -4,6 +4,7 @@ Executa run_data_harvest.py como subprocess para uso em testes.
 """
 import subprocess
 import sys
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -42,14 +43,18 @@ def generate_test_episode(
     # Monta comando
     resolution_str = f"{resolution[0]}x{resolution[1]}x{resolution[2]}"
     
-    # Use absolute path for mpirun from the same environment as python
-    mpirun_path = Path(sys.executable).parent / "mpirun"
-    if not mpirun_path.exists():
-        # Fallback to system mpirun if not found in env (though it should be there)
-        mpirun_path = "mpirun"
+    # Find MPI executable
+    mpi_cmd = None
+    for cmd in ["mpirun", "mpiexec", "mpiexec.gforker"]:
+        mpi_cmd = shutil.which(cmd)
+        if mpi_cmd:
+            break
+            
+    if not mpi_cmd:
+        raise RuntimeError("MPI executable (mpirun, mpiexec, or mpiexec.gforker) not found. MPI is required.")
     
     cmd = [
-        str(mpirun_path), "-np", "2",  # 2 processos para testes
+        mpi_cmd, "-np", "2",  # 2 processos para testes
         sys.executable,
         str(PROJECT_ROOT / "run_data_harvest.py"),
         "--episodes", "1",
@@ -68,6 +73,7 @@ def generate_test_episode(
         cwd=str(PROJECT_ROOT),
         capture_output=True,
         text=True,
+        errors="replace",
         timeout=300  # 5 minutos max para testes rápidos
     )
     

@@ -21,14 +21,15 @@ STRUCTURE_3D = ndimage.generate_binary_structure(3, 1)
 def get_legal_add_moves(
     density: np.ndarray, 
     threshold: float = 0.5,
-    include_supports: bool = True
+    include_supports: bool = True,
+    bc_masks: Tuple[np.ndarray, np.ndarray, np.ndarray] = None
 ) -> np.ndarray:
     """
     Get valid positions for adding material.
     
     Add actions are valid at:
     1. Boundary of existing material: dilate(grid) - grid
-    2. Support locations (X=0 plane) - ensures structure can grow from supports
+    2. Support locations (where BCs are fixed) - ensures structure can grow from supports
     
     This ensures:
     - We only add adjacent to existing structure (connectivity)
@@ -38,7 +39,8 @@ def get_legal_add_moves(
     Args:
         density: Current density grid (D, H, W) with values in [0, 1]
         threshold: Density threshold for "solid" material (default 0.5)
-        include_supports: If True, include X=0 plane as valid add positions
+        include_supports: If True, include support voxels as valid add positions
+        bc_masks: Optional tuple of (mask_x, mask_y, mask_z) boundary condition masks
         
     Returns:
         Binary mask (D, H, W) where 1 indicates valid add position
@@ -53,10 +55,24 @@ def get_legal_add_moves(
     boundary = dilated.astype(np.float32) - solid.astype(np.float32)
     valid_add = (boundary > 0).astype(np.float32)
     
-    # Add support plane (X=0) as valid, excluding already-solid voxels
+    # Add support locations as valid, excluding already-solid voxels
     if include_supports:
         support_mask = np.zeros_like(density)
-        support_mask[0, :, :] = 1.0  # X=0 plane
+        
+        if bc_masks is not None:
+            # Use provided BC masks: any voxel with ANY fixed DOF is a support anchor
+            mask_x, mask_y, mask_z = bc_masks
+            raw_support = ((mask_x > 0.5) | (mask_y > 0.5) | (mask_z > 0.5))
+            
+            # Dilate support region by 1 voxel to allow building "near" supports (e.g. X=1)
+            # This matches the fallback logic that includes X=0 and X=1
+            dilated_support = ndimage.binary_dilation(raw_support, structure=STRUCTURE_3D)
+            support_mask = dilated_support.astype(np.float32)
+        else:
+            # Fallback (legacy): X=0 and X=1 planes
+            support_mask[0, :, :] = 1.0
+            support_mask[1, :, :] = 1.0
+            
         # Only where not already solid
         support_valid = support_mask * (1.0 - solid.astype(np.float32))
         valid_add = np.maximum(valid_add, support_valid)
@@ -83,7 +99,8 @@ def get_legal_remove_moves(density: np.ndarray, threshold: float = 0.5) -> np.nd
 
 def get_legal_moves(
     density: np.ndarray, 
-    threshold: float = 0.5
+    threshold: float = 0.5,
+    bc_masks: Tuple[np.ndarray, np.ndarray, np.ndarray] = None
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Get all legal moves (add and remove) for current state.
@@ -91,11 +108,12 @@ def get_legal_moves(
     Args:
         density: Current density grid (D, H, W) with values in [0, 1]
         threshold: Density threshold for "solid" material (default 0.5)
+        bc_masks: Optional tuple of (mask_x, mask_y, mask_z) BC masks for support definition
         
     Returns:
         Tuple of (valid_add, valid_remove) binary masks
     """
-    valid_add = get_legal_add_moves(density, threshold)
+    valid_add = get_legal_add_moves(density, threshold, bc_masks=bc_masks)
     valid_remove = get_legal_remove_moves(density, threshold)
     
     return valid_add, valid_remove
@@ -190,7 +208,8 @@ def masked_softmax(
 
 def count_legal_moves(
     density: np.ndarray,
-    threshold: float = 0.5
+    threshold: float = 0.5,
+    bc_masks: Tuple[np.ndarray, np.ndarray, np.ndarray] = None
 ) -> Tuple[int, int]:
     """
     Count total legal moves available.
@@ -198,11 +217,12 @@ def count_legal_moves(
     Args:
         density: Current density grid
         threshold: Density threshold
+        bc_masks: Optional BC masks for support definition
         
     Returns:
         Tuple of (num_add, num_remove) legal moves
     """
-    valid_add, valid_remove = get_legal_moves(density, threshold)
+    valid_add, valid_remove = get_legal_moves(density, threshold, bc_masks=bc_masks)
     return int(valid_add.sum()), int(valid_remove.sum())
 
 
@@ -210,7 +230,8 @@ def is_terminal_state(
     density: np.ndarray,
     max_volume_fraction: float = 0.3,
     min_volume_fraction: float = 0.01,
-    threshold: float = 0.5
+    threshold: float = 0.5,
+    bc_masks: Tuple[np.ndarray, np.ndarray, np.ndarray] = None
 ) -> Tuple[bool, str]:
     """
     Check if state is terminal (no more meaningful moves).
@@ -225,6 +246,7 @@ def is_terminal_state(
         max_volume_fraction: Maximum allowed volume fraction
         min_volume_fraction: Minimum allowed volume fraction
         threshold: Density threshold
+        bc_masks: Optional BC masks for support definition
         
     Returns:
         Tuple of (is_terminal, reason)
@@ -238,7 +260,7 @@ def is_terminal_state(
     if vol_fraction < min_volume_fraction:
         return True, "structure_too_small"
     
-    valid_add, valid_remove = get_legal_moves(density, threshold)
+    valid_add, valid_remove = get_legal_moves(density, threshold, bc_masks=bc_masks)
     if valid_add.sum() == 0 and valid_remove.sum() == 0:
         return True, "no_legal_moves"
     

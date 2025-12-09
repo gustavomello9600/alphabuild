@@ -1,0 +1,90 @@
+Metadata-Version: 2.4
+Name: alphabuilder
+Version: 3.1.0
+Summary: AlphaBuilder - Generative Topology Optimization with Deep Learning
+Author: Gustavo Mello
+License: MIT
+Project-URL: Homepage, https://github.com/gustavomello9600/alphabuild
+Project-URL: Repository, https://github.com/gustavomello9600/alphabuild
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Topic :: Scientific/Engineering
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.21.0
+Requires-Dist: scipy>=1.7.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.0.0; extra == "dev"
+Requires-Dist: pytest-timeout>=2.0.0; extra == "dev"
+Requires-Dist: ruff>=0.1.0; extra == "dev"
+Requires-Dist: mypy>=1.0.0; extra == "dev"
+Requires-Dist: tqdm>=4.60.0; extra == "dev"
+Provides-Extra: full
+Requires-Dist: monai>=1.0.0; extra == "full"
+Requires-Dist: mpi4py>=3.0.0; extra == "full"
+Requires-Dist: fenics-dolfinx>=0.6.0; extra == "full"
+
+# AlphaBuilder
+
+Projeto de otimização topológica usando redes neurais e SIMP/FEniTop.
+
+**📋 Especificação Atual:** [specs/CURRENT.md](specs/CURRENT.md) → [v3.1](specs/v3.1_spec.md)
+
+## Estrutura do Projeto
+
+```
+alphabuilder/
+├── src/
+│   ├── core/             # Física e tensores
+│   ├── logic/            # FEniTop, storage, geração de estruturas
+│   ├── neural/           # Arquitetura neural (PyTorch/MONAI)
+│   └── utils/            # Utilitários (logger)
+└── web/                  # Frontend React
+
+scripts raiz:
+├── run_data_harvest.py   # Geração de dados de treino
+└── extract_mock_episode.py # Exportação para frontend
+```
+
+## Setup do Ambiente
+
+### Instalação do Miniforge (Arch Linux)
+
+```bash
+yay -S miniforge
+echo '[ -f /opt/miniforge/etc/profile.d/conda.sh ] && source /opt/miniforge/etc/profile.d/conda.sh' >> ~/.bashrc
+source ~/.bashrc
+```
+
+### Criar e Ativar o Ambiente
+
+```bash
+mamba env create -f environment.yml
+mamba activate alphabuilder
+```
+
+## Geração de Dados
+
+```bash
+# Gerar episódio com estratégia Bezier
+mpirun -np 4 python run_data_harvest.py --strategy BEZIER --episodes 1
+
+# Gerar episódio Full Domain
+mpirun -np 4 python run_data_harvest.py --strategy FULL_DOMAIN --episodes 1
+
+# Exportar para frontend
+python extract_mock_episode.py --output alphabuilder/web/public/data/mock_episode_bezier.json
+```
+
+## Dependências Principais
+
+- **FEniCSx/DOLFINx**: Solver FEM
+- **PyTorch + MONAI**: Deep Learning (Swin-UNETR)
+- **MPI (mpi4py)**: Paralelismo
+- **React + Vite**: Frontend

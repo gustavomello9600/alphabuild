@@ -37,6 +37,7 @@ from . import (
     get_phase2_terminal_reward,
     analyze_structure_islands,
     calculate_island_penalty,
+    calculate_connectivity_reward,
 )
 
 
@@ -327,10 +328,55 @@ def run_episode(
     start_time = time.time()
     
     # Initialize Stateful MCTS
-    # Note: We configure it initially for Phase 1. Config can be updated.
-    # We use a lambda to bridge the predict call.
+    # We use a wrapper predictor to inject analytical rewards in Phase 1
+    def hybrid_predictor(state_tensor: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
+        # Get raw network prediction
+        val, p_add, p_remove = model.predict(state_tensor)
+        
+        # In Phase 1 (Growth), inject analytical connectivity reward
+        # State tensor layout: [density, mask_x, mask_y, mask_z, fx, fy, fz]
+        if state.phase == Phase.GROWTH:
+            density_grid = state_tensor[0]
+            masks = (state_tensor[1], state_tensor[2], state_tensor[3])
+            force_vecs = (state_tensor[4], state_tensor[5], state_tensor[6])
+            
+            # 1. Connectivity Bonus (+0.0 to +0.5)
+            connectivity_bonus = calculate_connectivity_reward(
+                density_grid, masks, force_vecs
+            )
+            
+            # 2. Island Penalty
+            # Need to re-analyze islands for the *current* state tensor
+            # Ideally this info is passed in, but we have to recompute from tensor here
+            # to keep predictor stateless/consistent with MCTS node expansion.
+            # Convert channel 0 density back to standard format
+            island_analysis = analyze_structure_islands(
+                density_grid, 
+                state.load_config,
+                threshold=0.5
+            )
+            island_penalty = calculate_island_penalty(
+                island_analysis['n_islands'], 
+                island_analysis['loose_voxels'], 
+                total_voxels=int((density_grid > 0.5).sum())
+            )
+            
+            # 3. Combine Components
+            # Base: Network Value [-1, 1]
+            # Bonus: Connectivity [+0, +0.5]
+            # Penalty: Islands [-0, -0.3]
+            # Penalty: Living [-0.01 per step]
+            living_penalty = 0.01
+            
+            val = val + connectivity_bonus - island_penalty - living_penalty
+            
+            # Clamp to Valid Value Head Range [-1, 1]
+            val = max(-1.0, min(1.0, val))
+            
+        return val, p_add, p_remove
+
     mcts_wrapper = AlphaBuilderMCTS(
-        predict_fn=lambda s: model.predict(s),
+        predict_fn=hybrid_predictor,
         num_simulations=PHASE1_CONFIG.num_simulations,
         batch_size=PHASE1_CONFIG.batch_size,
         c_puct=PHASE1_CONFIG.c_puct

@@ -5,16 +5,21 @@ import sys
 
 # Mock dolfinx and mpi4py in sys.modules BEFORE importing modules that depend on them
 # This ensures tests run even if these heavy dependencies are missing (e.g. in CI)
-mock_dolfinx = MagicMock()
-mock_mpi4py = MagicMock()
-mock_basix = MagicMock()
+try:
+    import dolfinx
+    import mpi4py
+    import basix
+except ImportError:
+    mock_dolfinx = MagicMock()
+    mock_mpi4py = MagicMock()
+    mock_basix = MagicMock()
 
-sys.modules['dolfinx'] = mock_dolfinx
-sys.modules['dolfinx.mesh'] = mock_dolfinx.mesh
-sys.modules['dolfinx.fem'] = mock_dolfinx.fem
-sys.modules['mpi4py'] = mock_mpi4py
-sys.modules['basix'] = mock_basix
-sys.modules['basix.ufl'] = mock_basix.ufl
+    sys.modules['dolfinx'] = mock_dolfinx
+    sys.modules['dolfinx.mesh'] = mock_dolfinx.mesh
+    sys.modules['dolfinx.fem'] = mock_dolfinx.fem
+    sys.modules['mpi4py'] = mock_mpi4py
+    sys.modules['basix'] = mock_basix
+    sys.modules['basix.ufl'] = mock_basix.ufl
 
 from alphabuilder.src.logic.harvest.config import SIMPConfig, LOG_SQUASH_ALPHA
 from alphabuilder.src.logic.harvest.generators import (

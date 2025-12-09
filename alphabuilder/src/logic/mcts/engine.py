@@ -37,6 +37,8 @@ class MCTSConfig(NamedTuple):
     add_root_noise: bool = False
     root_dirichlet_alpha: float = 0.3
     root_exploration_fraction: float = 0.25
+    tree_search_batching: bool = False
+    max_search_depth: int = 1
 
 
 # Phase-specific configuration presets (from MCTS Spec Section 8)
@@ -45,7 +47,9 @@ PHASE1_CONFIG = MCTSConfig(
     num_simulations=80,   # Reduced from 320 for faster local runs
     batch_size=32,
     c_puct=1.5,
-    phase="GROWTH"
+    phase="GROWTH",
+    tree_search_batching=True,
+    max_search_depth=4
 )
 
 PHASE2_CONFIG = MCTSConfig(
@@ -240,6 +244,123 @@ def backup(path: List[MCTSNode], value: float) -> None:
         node.update(value)
 
 
+def extract_batch_from_tree(
+    root: MCTSNode,
+    batch_size: int,
+    max_depth: int
+) -> Tuple[List[Action], Dict[Action, int]]:
+    """
+    Extract a batch of actions by traversing the tree greedily based on visit counts.
+    
+    Instead of just taking the top-k children of root, we explore the tree
+    prioritizing identifying the 'best' nodes across multiple levels.
+    
+    Algorithm:
+    1. Priority Queue of candidates (initially root's children), ordered by visit count.
+    2. Pop best candidate.
+    3. Add its action (relative to parent?) -> Wait, we need absolute actions?
+    
+    PROBLEM: To apply a sequence of actions, we need their sequence order.
+    If we pick Action A (Level 1) and Action B (Level 2, child of A),
+    we must execute A then B.
+    
+    If we pick Action C (Level 1) as well, we have {A, C}.
+    But B depends on A.
+    
+    Return format for this project is `List[Action]`.
+    The `apply_micro_batch` function iterates this list and applies them.
+    If list is [A, B, C], it applies A, then B, then C.
+    
+    So we need to return a valid topological sort.
+    Since we extract from a tree, parents always come before children if we extract in order?
+    Actually if we use a PQ by visits:
+    - Root has children A (100 visits), C (80 visits).
+    - A has child B (50 visits).
+    
+    PQ: [(100, A), (80, C)]
+    Pop A. Result: [A].
+    Add children of A to PQ: [(80, C), (50, B)]
+    Pop C. Result: [A, C].
+    Add children of C...
+    Pop B. Result: [A, C, B].
+    
+    Applying A, C, B is valid?
+    A and C are siblings (independent branches from root).
+    Applying both means we are merging branches. THIS IS AN APPROXIMATION.
+    MCTS assumes mutually exclusive choices.
+    Here we assume actions are additive/independent enough to be combined.
+    
+    B is child of A. It assumes A was taken.
+    So sequence A -> B is correct.
+    Sequence C is independent.
+    So {A, C, B} -> apply A, apply C, apply B.
+    State becomes Root + A + C + B.
+    
+    Is this valid?
+    B was optimized on state Root+A.
+    Applying it on Root+A+C might be different if C interference with B.
+    But assuming spatial locality (micro-structure), interference is continuous.
+    
+    So yes, this topological sort (Parent before Child) is naturally handled
+    if we process PQ carefully. But standard PQ pops by score. B (50) could be less than C (80).
+    So we pick C before B.
+    Start: [A, C, B].
+    Dependence: B needs A.
+    A is in list. Result order: A, C, B.
+    
+    Args:
+        root: Root node
+        batch_size: Max actions to return
+        max_depth: limit tree depth
+    
+    Returns:
+        Tuple of (actions list, visit distribution for logging)
+    """
+    import heapq
+    
+    if not root.children:
+        return [], {}
+    
+    # Candidate tuple: (-visit_count, tie_breaker_uid, action, node, depth)
+    # We use negative visits for Max-Heap behavior with standard heapq (min-heap)
+    # tie_breaker necessary because MCTSNode comparisons might not be safe
+    pq = []
+    uid = 0
+    
+    # Initialize with root children
+    for action, child in root.children.items():
+        # Depth 1 (children of root)
+        heapq.heappush(pq, (-child.visit_count, uid, action, child, 1))
+        uid += 1
+    
+    selected_actions = []
+    visit_dist_map = {} # Only for top-level visualization? Or all?
+    # Spec says "visit_distribution" is used for logging visits.
+    # Usually relative to root.
+    # We can just return root's distribution logic for logging, 
+    # but that misses the "depth" aspect in logs.
+    # For now, let's keep visit_dist as just root children for compatibility,
+    # or empty if we are doing tree batching (logs might look weird).
+    
+    visits_recorded = {}
+    
+    while len(selected_actions) < batch_size and pq:
+        neg_visits, _, action, node, depth = heapq.heappop(pq)
+        visits = -neg_visits
+        
+        # Add to selection
+        selected_actions.append(action)
+        visits_recorded[action] = visits
+        
+        # If we can go deeper, add children
+        if depth < max_depth and node.is_expanded:
+            for child_action, child_node in node.children.items():
+                heapq.heappush(pq, (-child_node.visit_count, uid, child_action, child_node, depth + 1))
+                uid += 1
+                
+    return selected_actions, visits_recorded
+
+
 # =============================================================================
 # Main Search Function
 # =============================================================================
@@ -284,14 +405,18 @@ def run_mcts_search(
             # Should not happen if passed correctly, but safe fallback
             root_state = build_state_tensor(root_density, bc_masks, forces)
             value, p_add, p_remove = predict_fn(root_state)
-            valid_add, valid_remove = get_legal_moves(root_density, config.density_threshold)
+            valid_add, valid_remove = get_legal_moves(
+                root_density, config.density_threshold, bc_masks=bc_masks
+            )
             expand_node(root, p_add, p_remove, valid_add, valid_remove, config)
             root.update(value)
     else:
         # Create fresh tree
         root_state = build_state_tensor(root_density, bc_masks, forces)
         root_value, policy_add, policy_remove = predict_fn(root_state)
-        valid_add, valid_remove = get_legal_moves(root_density, config.density_threshold)
+        valid_add, valid_remove = get_legal_moves(
+            root_density, config.density_threshold, bc_masks=bc_masks
+        )
         root = MCTSNode(prior=1.0)
         expand_node(root, policy_add, policy_remove, valid_add, valid_remove, config)
         root.update(root_value)
@@ -330,7 +455,8 @@ def run_mcts_search(
             leaf_density,
             max_volume_fraction=config.max_volume_fraction,
             min_volume_fraction=config.min_volume_fraction,
-            threshold=config.density_threshold
+            threshold=config.density_threshold,
+            bc_masks=bc_masks
         )
         
         if is_terminal:
@@ -354,7 +480,9 @@ def run_mcts_search(
                 eval_cache[state_hash] = (value, policy_add, policy_remove)
             
             # Get legal moves for leaf
-            valid_add, valid_remove = get_legal_moves(leaf_density, config.density_threshold)
+            valid_add, valid_remove = get_legal_moves(
+                leaf_density, config.density_threshold, bc_masks=bc_masks
+            )
             
             # Expand leaf
             expand_node(leaf, policy_add, policy_remove, valid_add, valid_remove, config)
@@ -363,8 +491,19 @@ def run_mcts_search(
         backup(path, value)
     
     # Extract results
-    visit_dist = root.get_visit_distribution()
-    top_actions = root.get_top_k_actions(config.batch_size)
+    if config.tree_search_batching:
+        # Use tree-based batch extraction (Depth > 1)
+        top_actions, batch_visit_dist = extract_batch_from_tree(
+            root, config.batch_size, config.max_search_depth
+        )
+        # Use root visit distribution for general logging, but maybe we should mix?
+        # SearchResult expects visit_distribution to be Dict[Action, int]
+        # We can pass the batch_visit_dist for specific logging of selected nodes
+        visit_dist = root.get_visit_distribution() 
+    else:
+        # Standard top-k from root (Depth 1)
+        visit_dist = root.get_visit_distribution()
+        top_actions = root.get_top_k_actions(config.batch_size)
     
     return SearchResult(
         actions=top_actions,
@@ -498,7 +637,9 @@ class AlphaBuilderMCTS:
             # Create fresh root
             root_state = build_state_tensor(density, bc_masks, forces)
             root_value, policy_add, policy_remove = self.predict_fn(root_state)
-            valid_add, valid_remove = get_legal_moves(density, self.config.density_threshold)
+            valid_add, valid_remove = get_legal_moves(
+                density, self.config.density_threshold, bc_masks=bc_masks
+            )
             self.root = MCTSNode(prior=1.0)
             expand_node(self.root, policy_add, policy_remove, valid_add, valid_remove, self.config)
             self.root.update(root_value)

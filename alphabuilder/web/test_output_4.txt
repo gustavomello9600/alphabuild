@@ -1,0 +1,36 @@
+
+[1m[46m RUN [49m[22m [36mv4.0.15 [39m[90m/home/Gustavo/projects/alphabuild/alphabuilder/web[39m
+
+ [32m✓[39m src/api/__tests__/trainingDataService.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+[90mstderr[2m | src/pages/__tests__/EpisodeReplay.test.tsx
+[22m[39mTHREE.WARNING: Multiple instances of Three.js being imported.
+
+[90mstderr[2m | src/pages/__tests__/EpisodeReplay.test.tsx[2m > [22m[2mEpisodeReplay[2m > [22m[2mrenders loading state initially
+[22m[39mAn update to EpisodeReplay inside a test was not wrapped in act(...).
+
+When testing, code that causes React state updates should be wrapped into act(...):
+
+act(() => {
+  /* fire events that update state */
+});
+/* assert on the output */
+
+This ensures that you're testing the behavior the user would see in the browser. Learn more at https://react.dev/link/wrap-tests-with-act
+An update to EpisodeReplay inside a test was not wrapped in act(...).
+
+When testing, code that causes React state updates should be wrapped into act(...):
+
+act(() => {
+  /* fire events that update state */
+});
+/* assert on the output */
+
+This ensures that you're testing the behavior the user would see in the browser. Learn more at https://react.dev/link/wrap-tests-with-act
+
+ [32m✓[39m src/pages/__tests__/EpisodeReplay.test.tsx [2m([22m[2m2 tests[22m[2m)[22m[32m 258[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m2 passed[39m[22m[90m (2)[39m
+[2m      Tests [22m [1m[32m5 passed[39m[22m[90m (5)[39m
+[2m   Start at [22m 02:24:39
+[2m   Duration [22m 1.62s[2m (transform 167ms, setup 133ms, import 758ms, tests 264ms, environment 906ms)[22m
+
