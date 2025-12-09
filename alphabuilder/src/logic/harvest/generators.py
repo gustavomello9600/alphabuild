@@ -194,11 +194,18 @@ def generate_seeded_cantilever(
 def generate_random_load_config(resolution):
     """
     Generate load configuration for cantilever beam (v3.1).
+    
+    Load position constraints:
+    - X: Random in range (L/2, L-1] to ensure load is in the "free" half
+    - Y: Random around center with ±25% variation
+    - Z: Random around center with ±25% variation
     """
     nx, ny, nz = resolution
     
-    # Load always at X=nx-1 (free end face)
-    load_x = nx - 1
+    # Load X is random in range (L/2, L-1] - ensures X > L/2
+    min_load_x = nx // 2 + 1  # Minimum is L/2 + 1
+    max_load_x = nx - 1       # Maximum is L - 1 (last valid index)
+    load_x = random.randint(min_load_x, max_load_x)
     
     # Center the load region in Y and Z with some randomness
     load_y = ny // 2 + random.randint(-ny//4, ny//4)

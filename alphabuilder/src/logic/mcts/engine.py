@@ -31,6 +31,29 @@ class MCTSConfig(NamedTuple):
     min_prior_threshold: float = 1e-6
     max_volume_fraction: float = 0.3
     min_volume_fraction: float = 0.01
+    max_volume_fraction: float = 0.3
+    min_volume_fraction: float = 0.01
+    phase: str = "REFINEMENT"  # "GROWTH" or "REFINEMENT"
+    add_root_noise: bool = False
+    root_dirichlet_alpha: float = 0.3
+    root_exploration_fraction: float = 0.25
+
+
+# Phase-specific configuration presets (from MCTS Spec Section 8)
+# NOTE: Reduced simulations for faster iteration on local hardware
+PHASE1_CONFIG = MCTSConfig(
+    num_simulations=80,   # Reduced from 320 for faster local runs
+    batch_size=32,
+    c_puct=1.5,
+    phase="GROWTH"
+)
+
+PHASE2_CONFIG = MCTSConfig(
+    num_simulations=80,
+    batch_size=8,
+    c_puct=1.25,
+    phase="REFINEMENT"
+)
 
 
 class SearchResult(NamedTuple):
@@ -226,7 +249,9 @@ def run_mcts_search(
     bc_masks: Tuple[np.ndarray, np.ndarray, np.ndarray],
     forces: Tuple[np.ndarray, np.ndarray, np.ndarray],
     predict_fn: Callable[[np.ndarray], Tuple[float, np.ndarray, np.ndarray]],
-    config: MCTSConfig = MCTSConfig()
+    config: MCTSConfig = MCTSConfig(),
+    root_node: Optional[MCTSNode] = None,
+    eval_cache: Optional[Dict[str, Tuple[float, np.ndarray, np.ndarray]]] = None
 ) -> SearchResult:
     """
     Run MCTS search from given root state.
@@ -247,24 +272,49 @@ def run_mcts_search(
     Returns:
         SearchResult with top-k actions and statistics
     """
-    # Build root state tensor
-    root_state = build_state_tensor(root_density, bc_masks, forces)
+    # Reuse provided cache or create new one
+    if eval_cache is None:
+        eval_cache = {}
+        
+    # Setup Root
+    if root_node is not None:
+        # Reuse existing tree
+        root = root_node
+        if not root.is_expanded:
+            # Should not happen if passed correctly, but safe fallback
+            root_state = build_state_tensor(root_density, bc_masks, forces)
+            value, p_add, p_remove = predict_fn(root_state)
+            valid_add, valid_remove = get_legal_moves(root_density, config.density_threshold)
+            expand_node(root, p_add, p_remove, valid_add, valid_remove, config)
+            root.update(value)
+    else:
+        # Create fresh tree
+        root_state = build_state_tensor(root_density, bc_masks, forces)
+        root_value, policy_add, policy_remove = predict_fn(root_state)
+        valid_add, valid_remove = get_legal_moves(root_density, config.density_threshold)
+        root = MCTSNode(prior=1.0)
+        expand_node(root, policy_add, policy_remove, valid_add, valid_remove, config)
+        root.update(root_value)
     
-    # Get initial policy and value for root
-    root_value, policy_add, policy_remove = predict_fn(root_state)
-    
-    # Get legal moves for root
-    valid_add, valid_remove = get_legal_moves(root_density, config.density_threshold)
-    
-    # Create and expand root node
-    root = MCTSNode(prior=1.0)
-    expand_node(root, policy_add, policy_remove, valid_add, valid_remove, config)
-    
-    # Initial backup for root
-    root.update(root_value)
+    # Add Dirichlet noise to root (crucial for exploration with reused trees)
+    if config.add_root_noise and root.is_expanded:
+        # Note: We apply noise to the priors of CHILDREN
+        # But MCTSNode stores children in a dict.
+        # We need to re-normalize priors.
+        # Simplification: Only efficient way is if expand_node supports noise injection,
+        # or we hack it here. 
+        # Given functional structures, modifying children's priors is OK.
+        
+        children = list(root.children.values())
+        if children:
+            noise = np.random.dirichlet([config.root_dirichlet_alpha] * len(children))
+            frac = config.root_exploration_fraction
+            for child, n in zip(children, noise):
+                child.prior = child.prior * (1 - frac) + n * frac
     
     # Cache for neural network evaluations (state_hash -> (value, policy_add, policy_remove))
-    eval_cache: Dict[str, Tuple[float, np.ndarray, np.ndarray]] = {}
+    # Using the eval_cache passed in argument
+
     
     # Simulation loop
     for sim in range(config.num_simulations):
@@ -356,8 +406,16 @@ class AlphaBuilderMCTS:
         self.config = MCTSConfig(
             num_simulations=num_simulations,
             batch_size=batch_size,
-            c_puct=c_puct
+            c_puct=c_puct,
+            add_root_noise=True  # Enable noise for tree reuse
         )
+        self.root: Optional[MCTSNode] = None
+        self.eval_cache: Dict[str, Tuple[float, np.ndarray, np.ndarray]] = {}
+
+    def reset(self):
+        """Clear search tree and cache for new episode."""
+        self.root = None
+        self.eval_cache = {}
     
     def get_action_batch(
         self,
@@ -381,10 +439,44 @@ class AlphaBuilderMCTS:
             bc_masks=bc_masks,
             forces=forces,
             predict_fn=self.predict_fn,
-            config=self.config
+            config=self.config,
+            root_node=self.root,
+            eval_cache=self.eval_cache
         )
+        
+        # Update our root reference to the (potentially new) root of the search
+        # Actually run_mcts_search doesn't return the root explicitly, 
+        # but if we passed self.root, it modified it in-place.
+        # If self.root was None, we need to know what the new root is.
+        # Problem: run_mcts_search creates 'root' local var if None passed.
+        # We need to capture it.
+        # Solution: Since run_mcts_search returns SearchResult which doesn't include root...
+        # We should probably modify run_mcts_search or this wrapper to handle it.
+        # BUT: For get_action_batch, we generally don't want to advance the tree yet?
+        # Typically this is used for parallel playing.
+        # Let's assume for now we don't support tree reuse in get_action_batch 
+        # unless we refactor run_mcts_search to return the root.
+        
+        # ACTUALLY: The best way to use this wrapper is via a explicit 'step' method.
+        pass # Placeholder comment
+        
         return result.actions, result.visit_distribution
     
+    def step(self, action: Action) -> None:
+        """
+        Advance the tree to the selected child.
+        
+        Args:
+            action: Comparison action (channel, x, y, z)
+        """
+        if self.root is not None and action in self.root.children:
+            new_root = self.root.children[action]
+            new_root.detach_parent()
+            self.root = new_root
+        else:
+            # Tree divergence or reset: clear root to start fresh next search
+            self.root = None
+            
     def search(
         self,
         density: np.ndarray,
@@ -394,21 +486,33 @@ class AlphaBuilderMCTS:
         """
         Full MCTS search with complete results.
         
-        Args:
-            density: Current density grid
-            bc_masks: Boundary condition masks
-            forces: Force vectors
-            
-        Returns:
-            SearchResult with full statistics
+        Updates internal state (root) if it was None.
         """
-        return run_mcts_search(
+        # If root is None, create it here effectively by passing None
+        # But we need to capture the created root.
+        # Since run_mcts_search doesn't return root, we have a problem implementing 'reuse' 
+        # if we start from scratch.
+        # Workaround: Manually create root if None.
+        
+        if self.root is None:
+            # Create fresh root
+            root_state = build_state_tensor(density, bc_masks, forces)
+            root_value, policy_add, policy_remove = self.predict_fn(root_state)
+            valid_add, valid_remove = get_legal_moves(density, self.config.density_threshold)
+            self.root = MCTSNode(prior=1.0)
+            expand_node(self.root, policy_add, policy_remove, valid_add, valid_remove, self.config)
+            self.root.update(root_value)
+            
+        result = run_mcts_search(
             root_density=density,
             bc_masks=bc_masks,
             forces=forces,
             predict_fn=self.predict_fn,
-            config=self.config
+            config=self.config,
+            root_node=self.root,
+            eval_cache=self.eval_cache
         )
+        return result
 
 
 # =============================================================================

@@ -157,10 +157,10 @@ const LoadVector = ({ tensor }: { tensor: ReplayState['tensor'] | null }) => {
                 const origin = lp.pos.clone().sub(lp.dir.clone().multiplyScalar(arrowLength));
                 return (
                     <group key={i}>
-                        <arrowHelper args={[lp.dir, origin, arrowLength, 0xff0055, 1, 0.5]} />
+                        <arrowHelper args={[lp.dir, origin, arrowLength, 0xff6b00, 1, 0.5]} />
                         <mesh position={lp.pos}>
                             <sphereGeometry args={[0.2, 8, 8]} />
-                            <meshBasicMaterial color="#ff0055" />
+                            <meshBasicMaterial color="#ff6b00" />
                         </mesh>
                     </group>
                 );
@@ -239,29 +239,6 @@ const VoxelGrid = ({
             policyRef.current.geometry.setAttribute('instanceOpacity', opacityAttrRef.current);
         }
 
-        // Helper to get policy data (color + opacity)
-        const getPolicyData = (idx: number): { color: THREE.Color; opacity: number } | null => {
-            if (!showHeatmap || !heatmap) return null;
-
-            const addVal = heatmap.add ? heatmap.add[idx] : 0;
-            const removeVal = heatmap.remove ? heatmap.remove[idx] : 0;
-
-            if (addVal < 0.01 && removeVal < 0.01) return null;
-
-            // FIXED COLORS - only opacity varies
-            if (addVal > removeVal) {
-                return {
-                    color: new THREE.Color('#00FF9D'),  // Fixed green
-                    opacity: addVal  // Direct value as opacity (0-1)
-                };
-            } else {
-                return {
-                    color: new THREE.Color('#FF0055'),  // Fixed red
-                    opacity: removeVal  // Direct value as opacity (0-1)
-                };
-            }
-        };
-
         for (let d = 0; d < D; d++) {
             for (let h = 0; h < H; h++) {
                 for (let w = 0; w < W; w++) {
@@ -314,7 +291,7 @@ const VoxelGrid = ({
                         if (supportColor) {
                             opaqueRef.current.setColorAt(opaqueCount, new THREE.Color(supportColor));
                         } else if (hasLoad) {
-                            opaqueRef.current.setColorAt(opaqueCount, new THREE.Color('#FF0055'));
+                            opaqueRef.current.setColorAt(opaqueCount, new THREE.Color('#FF6B00'));
                         } else {
                             const val = Math.max(0.2, density);
                             const color = new THREE.Color().setHSL(0, 0, val * 0.95);
@@ -743,7 +720,6 @@ const NeuralHUD = ({
                                                 // Normalize value to 0-100% based on scale
                                                 const normalized = ((value - scale.min) / scale.range) * 100;
                                                 const height = Math.max(2, Math.min(100, normalized)); // Min 2px for visibility
-                                                const isPositive = value >= 0;
 
                                                 return (
                                                     <div
@@ -864,24 +840,14 @@ export const EpisodeReplay = () => {
         };
     }, [dbId, episodeId]);
 
-    // Update history when step changes - ensure order by step index
+    // Update history when step changes
     useEffect(() => {
-        const allFramesData = trainingDataReplayService.getAllFrames();
-        if (allFramesData.length > 0 && simState.currentStep >= 0 && simState.currentStep < allFramesData.length) {
-            // Get current frame's step number
-            const currentFrame = allFramesData[simState.currentStep];
-            const currentStepNumber = currentFrame.step;
-
-            // Get all frames up to current step, sorted by step number (ascending)
-            // This ensures we show frames in order: oldest (left) to current (right)
-            const framesUpToCurrent = allFramesData
-                .filter(f => f.step <= currentStepNumber)
-                .sort((a, b) => a.step - b.step);
-
-            const historyValues = framesUpToCurrent.map(f => f.value_confidence || 0);
-            setHistory(historyValues);
+        const fullHistory = trainingDataReplayService.getFitnessHistory();
+        if (fullHistory.length > 0 && simState.currentStep >= 0) {
+            // Slice history up to current step
+            setHistory(fullHistory.slice(0, simState.currentStep + 1));
         }
-    }, [simState.currentStep, simState.stepsLoaded, replayState]);
+    }, [simState.currentStep, simState.stepsLoaded]);
 
     const loadEpisode = async () => {
         if (!dbId || !episodeId) return;
@@ -900,15 +866,10 @@ export const EpisodeReplay = () => {
             const serviceState = trainingDataReplayService.getState();
             setSimState(serviceState);
 
-            // Build initial history from all loaded frames
-            const allFramesData = trainingDataReplayService.getAllFrames();
-            if (allFramesData.length > 0) {
-                const currentFrame = allFramesData[serviceState.currentStep];
-                const framesUpToCurrent = allFramesData
-                    .filter(f => f.step <= currentFrame.step)
-                    .sort((a, b) => a.step - b.step);
-                const historyValues = framesUpToCurrent.map(f => f.value_confidence || 0);
-                setHistory(historyValues);
+            // Build initial history
+            const fullHistory = trainingDataReplayService.getFitnessHistory();
+            if (fullHistory.length > 0) {
+                setHistory(fullHistory.slice(0, 1)); // Start with first point or empty
             }
 
             setLoading(false);

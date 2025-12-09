@@ -1,5 +1,5 @@
 import { useEffect, useState, useMemo, useRef } from 'react';
-import { useNavigate, useParams, useLocation } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
     Database,
@@ -30,16 +30,6 @@ import {
 const EPISODES_PER_PAGE = 50;
 
 // --- Animation Variants ---
-const containerVariants = {
-    hidden: { opacity: 0 },
-    visible: {
-        opacity: 1,
-        transition: {
-            staggerChildren: 0.03,
-        },
-    },
-};
-
 const itemVariants = {
     hidden: { opacity: 0, y: 10 },
     visible: { opacity: 1, y: 0 },
@@ -340,7 +330,6 @@ const EmptyState = ({ message, icon: Icon, onRetry }: { message: string; icon: t
 // --- Main Component ---
 export const TrainingData = () => {
     const navigate = useNavigate();
-    const location = useLocation();
     const { dbId } = useParams<{ dbId?: string }>();
 
     const [databases, setDatabases] = useState<DatabaseInfo[]>([]);
@@ -354,8 +343,7 @@ export const TrainingData = () => {
     const [currentPage, setCurrentPage] = useState(1);
     const [searchQuery, setSearchQuery] = useState('');
 
-    // Track previous location to detect back navigation
-    const previousPathRef = useRef<string>('');
+    // Track episode load state
     const loadedDbIdRef = useRef<string | null>(null);
 
     // Filter and paginate episodes

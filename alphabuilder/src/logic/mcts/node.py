@@ -47,6 +47,16 @@ class MCTSNode:
     children: Dict[Action, 'MCTSNode'] = field(default_factory=dict)
     is_expanded: bool = False
     
+    def detach_parent(self) -> None:
+        """
+        Sever the link to parent.
+        
+        Usage: call this when promoting a child node to be the new root of the search tree.
+        Crucial for garbage collection of the old, unused parts of the tree.
+        """
+        self.parent = None
+        self.action_to_parent = None
+    
     @property
     def mean_value(self) -> float:
         """

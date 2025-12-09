@@ -45,9 +45,9 @@ function getSupportColor(maskX: number, maskY: number, maskZ: number): string | 
     const hasX = maskX > 0.5;
     const hasY = maskY > 0.5;
     const hasZ = maskZ > 0.5;
-    
+
     if (!hasX && !hasY && !hasZ) return null; // Not a support
-    
+
     if (hasX && hasY && hasZ) {
         return SUPPORT_COLORS.FULL_CLAMP; // Full clamp (XYZ)
     } else if (hasX && hasY && !hasZ) {
@@ -74,9 +74,9 @@ const LoadVector = ({ tensor }: { tensor: Tensor5D | null }) => {
         for (let h = 0; h < H; h++) {
             for (let w = 0; w < W; w++) {
                 const flatIdx = d * (H * W) + h * W + w;
-                
+
                 let fx = 0, fy = 0, fz = 0;
-                
+
                 if (is7Channel) {
                     // v3.1: Channels 4, 5, 6 are Fx, Fy, Fz
                     fx = tensor.data[CHANNEL.FORCE_X * (D * H * W) + flatIdx];
@@ -88,7 +88,7 @@ const LoadVector = ({ tensor }: { tensor: Tensor5D | null }) => {
                 }
 
                 const magnitude = Math.sqrt(fx * fx + fy * fy + fz * fz);
-                
+
                 if (magnitude > 0.01) {
                     const pos = new THREE.Vector3(d - D / 2, h + 0.5, w - W / 2);
                     const dir = new THREE.Vector3(fx, fy, fz).normalize();
@@ -108,10 +108,10 @@ const LoadVector = ({ tensor }: { tensor: Tensor5D | null }) => {
                 const origin = lp.pos.clone().sub(lp.dir.clone().multiplyScalar(arrowLength));
                 return (
                     <group key={i}>
-                        <arrowHelper args={[lp.dir, origin, arrowLength, 0xff0055, 1, 0.5]} />
+                        <arrowHelper args={[lp.dir, origin, arrowLength, 0xff6b00, 1, 0.5]} />
                         <mesh position={lp.pos}>
                             <sphereGeometry args={[0.2, 8, 8]} />
-                            <meshBasicMaterial color="#ff0055" />
+                            <meshBasicMaterial color="#ff6b00" />
                         </mesh>
                     </group>
                 );
@@ -160,7 +160,7 @@ const VoxelGrid = ({
 
             const color = new THREE.Color();
             let opacity = 0;
-            
+
             if (addVal > removeVal) {
                 // Add: Green (Project Identity)
                 color.set('#00FF9D');
@@ -172,7 +172,7 @@ const VoxelGrid = ({
                 // Opacity based on remove value (0.3 to 1.0 range for visibility)
                 opacity = Math.max(0.3, Math.min(1.0, removeVal * 2.5));
             }
-            
+
             return { color, opacity };
         };
 
@@ -184,11 +184,11 @@ const VoxelGrid = ({
 
                     // Channel 0: Density
                     const density = tensor.data[CHANNEL.DENSITY * (D * H * W) + flatIdx];
-                    
+
                     // Support detection and color based on constraint type
                     let supportColor: string | null = null;
                     let maskX = 0, maskY = 0, maskZ = 0;
-                    
+
                     if (is7Channel) {
                         maskX = tensor.data[CHANNEL.MASK_X * (D * H * W) + flatIdx];
                         maskY = tensor.data[CHANNEL.MASK_Y * (D * H * W) + flatIdx];
@@ -196,12 +196,12 @@ const VoxelGrid = ({
                         supportColor = getSupportColor(maskX, maskY, maskZ);
                     } else {
                         // Legacy 5-channel: Channel 1 is support (treat as full clamp)
-                    const isSupport = tensor.data[1 * (D * H * W) + flatIdx] > 0.5;
+                        const isSupport = tensor.data[1 * (D * H * W) + flatIdx] > 0.5;
                         if (isSupport) supportColor = SUPPORT_COLORS.FULL_CLAMP;
                     }
-                    
+
                     const isSupport = supportColor !== null;
-                    
+
                     // Load: Force magnitude > 0 (channels 4, 5, 6 for 7-channel, channel 3 for 5-channel)
                     let hasLoad = false;
                     if (is7Channel) {
@@ -234,14 +234,14 @@ const VoxelGrid = ({
                             if (opacityRef.current) {
                                 opacityRef.current.setX(count, 1.0);
                             }
-                            
+
                             // Color Logic
                             if (supportColor) {
                                 // Color based on support constraint type
                                 meshRef.current.setColorAt(count, new THREE.Color(supportColor));
                             } else if (hasLoad) {
                                 // Magenta for loads (from design system)
-                                meshRef.current.setColorAt(count, new THREE.Color('#FF0055'));
+                                meshRef.current.setColorAt(count, new THREE.Color('#FF6B00'));
                             } else {
                                 const val = Math.max(0.2, density);
                                 const color = new THREE.Color().setHSL(0, 0, val * 0.95);
@@ -258,18 +258,17 @@ const VoxelGrid = ({
         meshRef.current.count = count;
         meshRef.current.instanceMatrix.needsUpdate = true;
         if (meshRef.current.instanceColor) meshRef.current.instanceColor.needsUpdate = true;
-        
+
         // Update opacity attribute
         if (opacityRef.current) {
             opacityRef.current.needsUpdate = true;
-            opacityRef.current.count = count;
         }
     }, [tensor, heatmap, showHeatmap]);
 
     // Update geometry with opacity attribute
     useEffect(() => {
         if (!meshRef.current || !opacityRef.current) return;
-        
+
         const geometry = meshRef.current.geometry;
         if (opacityRef.current) {
             geometry.setAttribute('opacity', opacityRef.current);
@@ -304,14 +303,12 @@ const VoxelGrid = ({
                     `}
                     transparent={true}
                     vertexColors={true}
-                    roughness={0.2}
-                    metalness={0.8}
                 />
             ) : (
-                <meshStandardMaterial 
+                <meshStandardMaterial
                     key="standard-material"
-                    roughness={0.2} 
-                    metalness={0.8} 
+                    roughness={0.2}
+                    metalness={0.8}
                     vertexColors={true}
                 />
             )}
@@ -536,10 +533,10 @@ const NeuralHUD = ({
                             {(() => {
                                 const windowSize = 20;
                                 // Get last windowSize values (most recent at the end)
-                                const visibleHistory = history.length > 0 
+                                const visibleHistory = history.length > 0
                                     ? history.slice(-windowSize)
                                     : [];
-                                
+
                                 if (visibleHistory.length === 0) {
                                     return Array.from({ length: windowSize }).map((_, i) => (
                                         <div key={i} className="flex-1" />
@@ -556,9 +553,9 @@ const NeuralHUD = ({
                                     max: max + padding,
                                     range: range + padding * 2,
                                 };
-                                
-                                const zeroLine = scale.min < 0 && scale.max > 0 
-                                    ? (-scale.min / scale.range) * 100 
+
+                                const zeroLine = scale.min < 0 && scale.max > 0
+                                    ? (-scale.min / scale.range) * 100
                                     : null;
 
                                 return (
@@ -575,18 +572,18 @@ const NeuralHUD = ({
                                             const normalized = ((value - scale.min) / scale.range) * 100;
                                             const height = Math.max(2, Math.min(100, normalized));
                                             const isPositive = value >= 0;
-                                            const colorClass = isPositive 
+                                            const colorClass = isPositive
                                                 ? 'bg-gradient-to-t from-cyan/30 to-cyan/80'
                                                 : 'bg-gradient-to-t from-magenta/30 to-magenta/80';
 
-                                    return (
-                                        <div
-                                            key={i}
+                                            return (
+                                                <div
+                                                    key={i}
                                                     className={`flex-1 ${colorClass} rounded-t-sm transition-all duration-300`}
                                                     style={{ height: `${height}%` }}
                                                     title={`Step ${history.length - visibleHistory.length + i + 1}: ${value.toFixed(4)}`}
-                                        />
-                                    );
+                                                />
+                                            );
                                         })}
                                         {/* Pad with empty slots if needed */}
                                         {Array.from({ length: windowSize - visibleHistory.length }).map((_, i) => (
@@ -656,12 +653,12 @@ export const Workspace = () => {
                         // Get current frame's step number
                         const currentFrame = allFrames[simState.currentStep];
                         const currentStepNumber = currentFrame.step;
-                        
+
                         // Get all frames up to current step, sorted by step (ascending)
                         const framesUpToCurrent = allFrames
                             .filter(f => f.step <= currentStepNumber)
                             .sort((a, b) => a.step - b.step);
-                        
+
                         const historyValues = framesUpToCurrent.map(f => f.value_confidence || 0);
                         setHistory(historyValues);
                     }

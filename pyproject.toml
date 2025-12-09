@@ -25,7 +25,7 @@ classifiers = [
 dependencies = [
     "numpy>=1.21.0",
     "scipy>=1.7.0",
-    "torch>=2.0.0",
+    # torch is installed via conda with XPU support, do not add here
 ]
 
 [project.optional-dependencies]

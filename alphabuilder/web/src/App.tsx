@@ -5,6 +5,8 @@ import { Dashboard } from './pages/Dashboard';
 import { Workspace } from './pages/Workspace';
 import { TrainingData } from './pages/TrainingData';
 import { EpisodeReplay } from './pages/EpisodeReplay';
+import { GamesList } from './pages/GamesList';
+import { GameReplay } from './pages/GameReplay';
 import { NeuralNet } from './pages/NeuralNet';
 import { Settings } from './pages/Settings';
 
@@ -44,6 +46,19 @@ function App() {
         <Route path="/data/:dbId/episode/:episodeId" element={
           <MainLayout>
             <EpisodeReplay />
+          </MainLayout>
+        } />
+
+        {/* Self-Play Games Routes */}
+        <Route path="/games" element={
+          <MainLayout>
+            <GamesList />
+          </MainLayout>
+        } />
+
+        <Route path="/games/:gameId" element={
+          <MainLayout>
+            <GameReplay />
           </MainLayout>
         } />
 

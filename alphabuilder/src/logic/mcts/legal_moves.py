@@ -18,20 +18,27 @@ from typing import Tuple
 STRUCTURE_3D = ndimage.generate_binary_structure(3, 1)
 
 
-def get_legal_add_moves(density: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+def get_legal_add_moves(
+    density: np.ndarray, 
+    threshold: float = 0.5,
+    include_supports: bool = True
+) -> np.ndarray:
     """
     Get valid positions for adding material.
     
-    Add actions are valid only at the boundary of existing material:
-    valid_add = dilate(grid) - grid
+    Add actions are valid at:
+    1. Boundary of existing material: dilate(grid) - grid
+    2. Support locations (X=0 plane) - ensures structure can grow from supports
     
     This ensures:
-    1. We only add adjacent to existing structure (connectivity)
-    2. We don't add where material already exists
+    - We only add adjacent to existing structure (connectivity)
+    - We don't add where material already exists
+    - We can always place at supports to initiate/reinforce connection
     
     Args:
         density: Current density grid (D, H, W) with values in [0, 1]
         threshold: Density threshold for "solid" material (default 0.5)
+        include_supports: If True, include X=0 plane as valid add positions
         
     Returns:
         Binary mask (D, H, W) where 1 indicates valid add position
@@ -42,10 +49,19 @@ def get_legal_add_moves(density: np.ndarray, threshold: float = 0.5) -> np.ndarr
     # Dilate to get envelope + solid
     dilated = ndimage.binary_dilation(solid, structure=STRUCTURE_3D)
     
-    # Boundary = dilated minus solid
+    # Boundary = dilated minus solid (can't add where already solid)
     boundary = dilated.astype(np.float32) - solid.astype(np.float32)
+    valid_add = (boundary > 0).astype(np.float32)
     
-    return (boundary > 0).astype(np.float32)
+    # Add support plane (X=0) as valid, excluding already-solid voxels
+    if include_supports:
+        support_mask = np.zeros_like(density)
+        support_mask[0, :, :] = 1.0  # X=0 plane
+        # Only where not already solid
+        support_valid = support_mask * (1.0 - solid.astype(np.float32))
+        valid_add = np.maximum(valid_add, support_valid)
+    
+    return valid_add
 
 
 def get_legal_remove_moves(density: np.ndarray, threshold: float = 0.5) -> np.ndarray:

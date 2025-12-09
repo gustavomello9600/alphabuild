@@ -1,10 +1,10 @@
-import { useState } from 'react';
 import { motion } from 'framer-motion';
 import { Link, useLocation } from 'react-router-dom';
 import {
     LayoutDashboard,
     Box,
     Database,
+    Gamepad2,
     Cpu,
     Settings,
     ChevronLeft,
@@ -89,6 +89,7 @@ export const Sidebar = ({ collapsed, setCollapsed }: { collapsed: boolean; setCo
                     <NavItem icon={LayoutDashboard} label="Painel" path="/" collapsed={collapsed} active={location.pathname === '/'} />
                     <NavItem icon={Box} label="Laboratório" path="/workspace" collapsed={collapsed} active={location.pathname.includes('/workspace')} />
                     <NavItem icon={Database} label="Dados de Treino" path="/data" collapsed={collapsed} active={location.pathname.startsWith('/data')} />
+                    <NavItem icon={Gamepad2} label="Replay de Partidas" path="/games" collapsed={collapsed} active={location.pathname.startsWith('/games')} />
                 </div>
 
                 <div>

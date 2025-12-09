@@ -170,3 +170,76 @@ O MCTS estará funcionando corretamente se observarmos:
 1.  **Convergência de Seleção:** Nas primeiras 10 simulações, a exploração é alta. Nas últimas 10, o MCTS insiste repetidamente nos mesmos nós (Top-8).
 2.  **Refutação da Rede:** Em ~5% a 10% dos casos, a ação mais visitada pelo MCTS **não** deve ser a ação com maior probabilidade inicial da rede ($P$). Isso prova que o *Value Head* corrigiu a *Policy Head* via simulação.
 3.  **Estabilidade Física:** O Micro-Batch gerado raramente causa "Game Over" imediato por colapso físico, pois o Value Head penalizou ramos instáveis durante a busca.
+
+---
+
+## 7. Função de Recompensa
+
+Para garantir consistência matemática entre a rede neural (treinada no Warm-up) e o MCTS (Self-Play), a função de recompensa espelha a normalização do treino.
+
+### 7.1. Constantes de Normalização (Hard-Coded)
+
+```python
+MU_SCORE = -6.65      # Média do Score "Cru" no dataset
+SIGMA_SCORE = 2.0     # Desvio Padrão para suavizar a Tanh
+ALPHA_VOL = 12.0      # Peso do Volume (20% mais importante que compliance logarítmico)
+EPSILON = 1e-9        # Estabilidade numérica
+```
+
+### 7.2. Score Físico Cru ($S_{raw}$)
+
+$$ S_{raw} = -\ln(C + \epsilon) - \alpha \cdot V_{frac} $$
+
+*   **$C$ (Compliance):** Energia de deformação (Joules). Quanto menor, melhor.
+*   **$V_{frac}$ (Volume Fraction):** Razão voxels/total ($0.0$ a $1.0$). Quanto menor, melhor.
+
+### 7.3. Recompensa Normalizada ($R$)
+
+$$ R = \tanh\left( \frac{S_{raw} - \mu}{\sigma} \right) $$
+
+**Casos Especiais:**
+*   **Colapso/Desconexão:** $R = -1.0$ (Penalidade Máxima)
+*   **Estrutura Média:** $R \approx 0.0$ (quando $S_{raw} \approx \mu$)
+*   **Estrutura Excelente:** $R \rightarrow +1.0$
+
+### 7.4. Estratégia por Fase
+
+#### Fase 1: Growth (Construção)
+Física inválida (estrutura desconectada). Não podemos calcular Compliance.
+
+*   **Passo Normal:** $R = 0$ (ou penalidade de vida $-0.01$). O valor vem de $V_{net}(s)$.
+*   **Conexão Bem-Sucedida:** $R = +0.5$. (Bônus por conectar suporte à carga).
+*   **Falha (Max Steps):** $R = -1.0$.
+
+#### Fase 2: Refinement (Otimização)
+Física válida. MCTS compara predição com realidade física.
+
+*   **Intra-Árvore (Simulação):** Usa $V_{net}(s)$ (FEM é caro demais).
+*   **Estado Terminal Óbvio:** Checar conectividade (rápido). Se desconectado, $R = -1.0$.
+*   **Após Micro-Batch:** Rodar FEM, calcular $R = \text{calculate\_reward}(...)$.
+
+---
+
+## 8. Configuração por Fase
+
+Os parâmetros do MCTS variam conforme a fase do episódio:
+
+| Parâmetro | Fase 1 (Growth) | Fase 2 (Refinement) |
+|-----------|-----------------|---------------------|
+| **Simulações** | 320 | 80 |
+| **Micro-Batch** | 32 ações | 8 ações |
+| **c_puct** | 1.5 (mais exploração) | 1.25 (mais exploração) |
+| **Legal Moves** | Apenas ADD (fronteira) | ADD + REMOVE |
+| **Terminal Check** | Conectividade | Conectividade + Volume |
+
+### 8.1. Transição de Fase
+
+A transição de Fase 1 → Fase 2 ocorre quando:
+1.  A estrutura conecta o suporte (X=0) à região de aplicação de carga
+2.  Verificado via `check_structure_connectivity(density, load_config)`
+
+### 8.2. Condições de Término do Episódio
+
+*   **Sucesso:** Volume frac < target E compliance estável por N passos
+*   **Falha:** Max steps atingido (600) OU estrutura desconectada na Fase 2
+*   **Colapso:** Deslocamento máximo > limite (FEM retornou erro)

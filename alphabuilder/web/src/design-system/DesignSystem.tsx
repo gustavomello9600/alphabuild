@@ -194,7 +194,8 @@ export default function DesignSystem() {
                         </h3>
                         <div className="grid gap-2">
                             <ColorCard name="Ciano: Contorno" hex="#00F0FF" usage="Ações primárias, condições de contorno fixas, segurança." />
-                            <ColorCard name="Magenta: Carga" hex="#FF0055" usage="Ações destrutivas, cargas aplicadas, alertas críticos." />
+                            <ColorCard name="Laranja: Carga" hex="#FF6B00" usage="Cargas aplicadas, forças externas, pontos de aplicação." />
+                            <ColorCard name="Magenta: Remoção" hex="#FF0055" usage="Ações de remoção, policy remove, alertas críticos." />
                             <ColorCard name="Roxo: Neural" hex="#7000FF" usage="Visualização de IA, gradientes de raciocínio." />
                         </div>
                     </div>

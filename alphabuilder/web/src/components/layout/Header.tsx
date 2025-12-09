@@ -1,15 +1,6 @@
 import { useLocation, useParams } from 'react-router-dom';
 import { Bell, Search, Command, Home, Database, Box, Cpu, Settings, Play, ChevronRight } from 'lucide-react';
 
-// Route configuration for breadcrumbs
-const routeConfig: Record<string, { label: string; icon: typeof Home }> = {
-    '/': { label: 'Painel', icon: Home },
-    '/data': { label: 'Dados de Treino', icon: Database },
-    '/workspace': { label: 'Laboratório', icon: Box },
-    '/neural': { label: 'Rede Neural', icon: Cpu },
-    '/settings': { label: 'Configurações', icon: Settings },
-};
-
 export const Header = ({ collapsed }: { collapsed: boolean }) => {
     const location = useLocation();
     const params = useParams<{ id?: string; dbId?: string; episodeId?: string }>();

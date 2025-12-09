@@ -157,20 +157,29 @@ class TestLegalMoves:
     """Tests for legal move generation."""
     
     def test_legal_add_moves_empty_grid(self):
-        """No add moves on empty grid (nothing to expand from)."""
+        """Empty grid: only support plane (X=0) is valid for adding."""
         density = np.zeros((4, 4, 4))
         valid_add = get_legal_add_moves(density)
+        # 4x4 = 16 voxels on X=0 support plane
+        assert valid_add.sum() == 16
+        assert valid_add[0, :, :].sum() == 16  # All on support plane
+        assert valid_add[1:, :, :].sum() == 0  # Nothing else
+    
+    def test_legal_add_moves_empty_grid_no_supports(self):
+        """Empty grid without supports: no valid add moves."""
+        density = np.zeros((4, 4, 4))
+        valid_add = get_legal_add_moves(density, include_supports=False)
         assert valid_add.sum() == 0
     
     def test_legal_add_moves_single_voxel(self):
-        """Add moves are neighbors of existing material."""
+        """Add moves are neighbors of existing material + support plane."""
         density = np.zeros((5, 5, 5))
         density[2, 2, 2] = 1.0  # Single voxel in center
         
         valid_add = get_legal_add_moves(density)
         
-        # Should have 6 neighbors (faces)
-        assert valid_add.sum() == 6
+        # 6 face neighbors + 25 support plane voxels = 31
+        assert valid_add.sum() == 31
         assert valid_add[2, 2, 2] == 0  # Original position not valid
         assert valid_add[1, 2, 2] == 1  # Left neighbor
         assert valid_add[3, 2, 2] == 1  # Right neighbor
@@ -178,6 +187,16 @@ class TestLegalMoves:
         assert valid_add[2, 3, 2] == 1  # Back neighbor
         assert valid_add[2, 2, 1] == 1  # Bottom neighbor
         assert valid_add[2, 2, 3] == 1  # Top neighbor
+    
+    def test_legal_add_moves_single_voxel_no_supports(self):
+        """Add moves without supports: only 6 neighbors."""
+        density = np.zeros((5, 5, 5))
+        density[2, 2, 2] = 1.0
+        
+        valid_add = get_legal_add_moves(density, include_supports=False)
+        
+        # Should have 6 neighbors (faces) only
+        assert valid_add.sum() == 6
     
     def test_legal_remove_moves(self):
         """Remove moves are existing material positions."""
