@@ -29,6 +29,24 @@ class DatabaseInfo(BaseModel):
     size_mb: float
     schema_version: str  # 'v1' or 'v2'
 
+class Action(BaseModel):
+    channel: int
+    x: int
+    y: int
+    z: int
+    visits: Optional[int] = 0
+    q_value: Optional[float] = 0.0
+
+class RewardComponents(BaseModel):
+    base_reward: float
+    connectivity_bonus: float = 0.0
+    fem_reward: float = 0.0
+    island_penalty: float = 0.0
+    loose_penalty: float = 0.0
+    volume_penalty: float = 0.0
+    validity_penalty: float = 0.0
+    total: float
+
 class Frame(BaseModel):
     step: int
     phase: str
@@ -39,6 +57,9 @@ class Frame(BaseModel):
     volume_fraction: Optional[float]
     policy_add: Optional[list[float]] = None
     policy_remove: Optional[list[float]] = None
+    # New fields for replay
+    action_sequence: Optional[List[Action]] = None
+    reward_components: Optional[RewardComponents] = None
 
 class EpisodeMetadata(BaseModel):
     """Metadata for an episode, sufficient for initialization without loading all frames."""

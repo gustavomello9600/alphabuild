@@ -82,6 +82,7 @@ class SelfPlayStepData(BaseModel):
     max_displacement: Optional[float] = None
     island_penalty: float = 0.0
     loose_voxels: int = 0
+    reward_components: Optional[dict] = None
 
 
 class SelfPlayGameData(BaseModel):
@@ -253,6 +254,7 @@ def get_selfplay_game_steps(
             max_displacement=getattr(s, 'max_displacement', None),
             island_penalty=getattr(s, 'island_penalty', 0.0),
             loose_voxels=getattr(s, 'loose_voxels', 0),
+            reward_components=getattr(s, 'reward_components', None) or None,
         ))
         
     return step_data

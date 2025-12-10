@@ -20,6 +20,7 @@ import {
     trainingDataReplayService,
     type ReplayState,
 } from '../api/trainingDataService';
+import { RewardBreakdown } from '../components/RewardBreakdown';
 import * as THREE from 'three';
 
 // --- 3D Components (Adapted from Workspace.tsx) ---
@@ -43,40 +44,7 @@ const CHANNEL = {
     FORCE_Z: 6,
 };
 
-// Log-Squash constants (from config.py - Spec 4.2)
-const LOG_SQUASH = {
-    ALPHA: 12.0,      // Volume penalty coefficient
-    MU: -6.65,        // Estimated mean of log(C) distribution
-    SIGMA: 2.0,       // Estimated std of log(C) distribution
-    EPSILON: 1e-9,
-};
 
-/**
- * Recover compliance from fitness score and volume fraction.
- * Inverse of the log-squash normalization:
- *   s_raw = -log(C + ε) - α·vol
- *   normalized = tanh((s_raw - μ) / σ)
- * 
- * Inverse:
- *   s_raw = arctanh(normalized) * σ + μ
- *   C = exp(-(s_raw + α·vol)) - ε
- */
-function recoverCompliance(fitnessScore: number, volumeFraction: number): number {
-    // Clamp fitness to avoid arctanh(±1) = ±∞
-    const clampedFitness = Math.max(-0.999, Math.min(0.999, fitnessScore));
-
-    // Inverse tanh: arctanh(x) = 0.5 * ln((1+x)/(1-x))
-    const arctanh = 0.5 * Math.log((1 + clampedFitness) / (1 - clampedFitness));
-
-    // Recover s_raw
-    const sRaw = arctanh * LOG_SQUASH.SIGMA + LOG_SQUASH.MU;
-
-    // Recover compliance: -log(C + ε) = s_raw + α·vol
-    // => C = exp(-(s_raw + α·vol)) - ε
-    const compliance = Math.exp(-(sRaw + LOG_SQUASH.ALPHA * volumeFraction)) - LOG_SQUASH.EPSILON;
-
-    return Math.max(0, compliance); // Ensure non-negative
-}
 
 // Support type colors based on constraint combination
 // Following design system colors for semantic meaning
@@ -394,6 +362,39 @@ const ReplayHeader = ({
     </motion.div>
 );
 
+const ActionSequenceList = ({ actions }: { actions: ReplayState['action_sequence'] }) => {
+    if (!actions || actions.length === 0) return null;
+
+    return (
+        <div className="mb-6 p-3 rounded-xl bg-black/30 border border-white/5 max-h-40 overflow-y-auto custom-scrollbar">
+            <div className="text-xs text-white/40 uppercase tracking-wider mb-2 flex justify-between items-center">
+                <span>Sequência de Ações</span>
+                <span className="text-[10px] bg-white/10 px-1.5 py-0.5 rounded text-white/60">
+                    {actions.length} passos
+                </span>
+            </div>
+            <div className="space-y-1">
+                {actions.map((action, i) => (
+                    <div key={i} className="flex items-center gap-2 text-xs font-mono p-1.5 rounded hover:bg-white/5 transition-colors group">
+                        <span className="text-white/20 w-4">{i + 1}.</span>
+                        <span className={`font-bold ${action.type === 'ADD' ? 'text-green-400' : 'text-red-400'}`}>
+                            {action.type === 'ADD' ? '+' : '-'}
+                        </span>
+                        <span className="text-white/60">
+                            [{action.x}, {action.y}, {action.z}]
+                        </span>
+                        {action.value_estimate !== undefined && (
+                            <span className="ml-auto text-cyan/60 group-hover:text-cyan">
+                                {action.value_estimate.toFixed(2)}
+                            </span>
+                        )}
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+};
+
 const ReplayControlPanel = ({
     state,
     simState,
@@ -411,7 +412,6 @@ const ReplayControlPanel = ({
 }) => {
     const totalSteps = simState.stepsLoaded;
     const isPlaying = simState.isPlaying;
-    const maxCompliance = simState.maxCompliance;
 
     return (
         <motion.div
@@ -480,73 +480,12 @@ const ReplayControlPanel = ({
                     </div>
                 </div>
 
-                {/* Metrics */}
+                {/* Action Sequence */}
+                <ActionSequenceList actions={state?.action_sequence} />
+
+                {/* Metrics / Reward Breakdown */}
                 <div className="space-y-4 mb-8">
-                    <div>
-                        <div className="flex justify-between text-sm mb-2">
-                            <span className="text-white/40">Compliance</span>
-                            <span className="font-mono text-white">
-                                {(() => {
-                                    // Direct compliance if available
-                                    if (state?.metadata.compliance) {
-                                        return state.metadata.compliance.toFixed(2);
-                                    }
-                                    // Recover from fitness + volume
-                                    if (state?.fitness_score !== undefined && state?.metadata.volume_fraction !== undefined) {
-                                        const recovered = recoverCompliance(state.fitness_score, state.metadata.volume_fraction);
-                                        return `~${recovered.toFixed(2)}`;
-                                    }
-                                    return 'N/A';
-                                })()}
-                            </span>
-                        </div>
-                        <div className="w-full bg-white/5 h-1.5 rounded-full overflow-hidden">
-                            {(() => {
-                                const compliance = state?.metadata.compliance
-                                    || (state?.fitness_score !== undefined && state?.metadata.volume_fraction !== undefined
-                                        ? recoverCompliance(state.fitness_score, state.metadata.volume_fraction)
-                                        : null);
-
-                                if (compliance) {
-                                    return (
-                                        <motion.div
-                                            className="h-full bg-gradient-to-r from-magenta to-purple"
-                                            animate={{
-                                                width: `${Math.min(100, (compliance / maxCompliance) * 100)}%`,
-                                            }}
-                                        />
-                                    );
-                                }
-                                return <div className="h-full bg-magenta/50 w-full animate-pulse" />;
-                            })()}
-                        </div>
-                    </div>
-
-                    <div>
-                        <div className="flex justify-between text-sm mb-2">
-                            <span className="text-white/40">Fração de Volume</span>
-                            <span className="font-mono text-white">
-                                {((state?.metadata.volume_fraction || 0) * 100).toFixed(1)}%
-                            </span>
-                        </div>
-                        <div className="w-full bg-white/5 h-1.5 rounded-full">
-                            <motion.div
-                                className="h-full bg-white/40 rounded-full"
-                                animate={{
-                                    width: `${(state?.metadata.volume_fraction || 0) * 100}%`,
-                                }}
-                            />
-                        </div>
-                    </div>
-
-                    <div>
-                        <div className="flex justify-between text-sm mb-2">
-                            <span className="text-white/40">Fitness Score</span>
-                            <span className="font-mono text-cyan">
-                                {(state?.fitness_score || 0).toFixed(4)}
-                            </span>
-                        </div>
-                    </div>
+                    <RewardBreakdown state={state} />
                 </div>
 
                 {/* Playback Controls */}

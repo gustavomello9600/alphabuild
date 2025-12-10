@@ -187,7 +187,7 @@ def load_episode_frames_v2(db_path: Path, episode_id: str, limit: int, offset: i
     
     cursor.execute("""
         SELECT step, phase, density_blob, policy_add_blob, policy_remove_blob, 
-               fitness_score, is_connected
+               fitness_score, is_connected, selected_actions_json, reward_components_json
         FROM records 
         WHERE episode_id = ? 
         ORDER BY step ASC
@@ -208,26 +208,10 @@ def load_episode_frames_v2(db_path: Path, episode_id: str, limit: int, offset: i
         policy_add = sparse_decode(p_add_idx, p_add_val, resolution)
         policy_remove = sparse_decode(p_rem_idx, p_rem_val, resolution)
         
-        # Reconstruct tensor for visualizer: [density, 0, 0, 0, 0, 0, 0] 
-        # (visualizer manages BCs globally now)
-        # Actually frontend expects full 7 channels? No, updated `GameReplay` handles it.
-        # But `EpisodeReplay` still might expect 7 channels.
-        # Let's check `EpisodeReplay.tsx`... it uses `InstancedMesh` with `frames[step].tensor_data`.
-        # Ideally we should send what frontend expects.
-        # For v2, we send just density in first channel, others zero, frontend adds BCs from metadata.
-        # Wait, `EpisodeReplay` expects `tensor_data` to be a flattened array.
-        # Let's construct a simple 1-channel tensor for now and let frontend combine with metadata BCs
-        # OR keep compatibility by sending 7 channels with zeros strictly for density
-        
-        # Updated strategy: Send 1 channel density. Frontend needs update? 
-        # Existing `main.py` reconstructed full 7 channels.
-        # Let's replicate `main.py` behavior to be safe.
-        # `main.py`: 
-        # state_tensor = np.concatenate([density[None], bc_masks, forces], axis=0)
-        # But `load_episode_frames` here doesn't have `bc_masks`.
-        # We should probably pass them or change design.
-        # Given we are refactoring, let's keep it simple.
-        
+        # Deserialize JSON fields
+        action_sequence = json.loads(row[7]) if row[7] else None
+        reward_components = json.loads(row[8]) if row[8] else None
+
         frames.append(Frame(
             step=row[0],
             phase=row[1],
@@ -237,7 +221,9 @@ def load_episode_frames_v2(db_path: Path, episode_id: str, limit: int, offset: i
             compliance=None, # In v2 derived from generic metadata or added later
             volume_fraction=None, # Calculated on frontend or added to query if explicit
             policy_add=policy_add.flatten().tolist(),
-            policy_remove=policy_remove.flatten().tolist()
+            policy_remove=policy_remove.flatten().tolist(),
+            action_sequence=action_sequence,
+            reward_components=reward_components
         ))
         
     return frames

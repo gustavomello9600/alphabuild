@@ -6,6 +6,8 @@
 
 const API_BASE = 'http://localhost:8000';
 
+import type { Action, RewardComponents } from './types';
+
 // --- Types ---
 export interface DatabaseInfo {
     id: string;
@@ -52,6 +54,8 @@ export interface Frame {
     volume_fraction: number | null;
     policy_add: number[] | null;
     policy_remove: number[] | null;
+    action_sequence?: Action[] | null;     // [NEW] Sequence of actions
+    reward_components?: RewardComponents | null; // [NEW] Breakdown
 }
 
 export interface EpisodeData {
@@ -138,6 +142,8 @@ export interface ReplayState {
         add: Float32Array;
         remove: Float32Array;
     };
+    action_sequence?: Action[] | null; // [NEW]
+    reward_components?: RewardComponents | null; // [NEW]
 }
 
 export class TrainingDataReplayService {
@@ -242,6 +248,8 @@ export class TrainingDataReplayService {
                 },
                 value_confidence: frame.fitness_score,
                 policy_heatmap: policyHeatmap,
+                action_sequence: frame.action_sequence, // [NEW]
+                reward_components: frame.reward_components, // [NEW]
             };
         });
     }

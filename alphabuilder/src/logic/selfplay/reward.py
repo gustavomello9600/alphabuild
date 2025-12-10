@@ -247,7 +247,7 @@ def calculate_connectivity_reward(
     bc_masks: Tuple[np.ndarray, np.ndarray, np.ndarray],
     forces: Tuple[np.ndarray, np.ndarray, np.ndarray],
     threshold: float = 0.5
-) -> float:
+) -> Tuple[float, float]:
     """
     Calculate reward based on connectivity to support and load.
     
@@ -263,7 +263,9 @@ def calculate_connectivity_reward(
         threshold: Density threshold for binarization.
         
     Returns:
-        Reward value in [0.0, 1.0]
+        Tuple of (reward_bonus, connected_load_fraction)
+        - reward_bonus: Value in [0.0, 1.0]
+        - connected_load_fraction: Fraction of load voxels connected to support [0.0, 1.0]
     """
     nx, ny, nz = density.shape
     binary = density > threshold
@@ -272,7 +274,7 @@ def calculate_connectivity_reward(
     labeled, n_components = ndimage.label(binary)
     
     if n_components == 0:
-        return 0.0
+        return 0.0, 0.0
     
     # Identify support voxels (where BCs are applied)
     # BC masks are 1.0 where fixed.
@@ -283,7 +285,7 @@ def calculate_connectivity_reward(
     
     # Check if we have any support mask points at all
     if not np.any(support_mask):
-         return 0.0
+         return 0.0, 0.0
 
     # Find labels that touch support
     support_labels_found = np.unique(labeled[support_mask])
@@ -291,7 +293,7 @@ def calculate_connectivity_reward(
     support_labels = support_labels_found[support_labels_found > 0]
     
     if len(support_labels) == 0:
-        return 0.0
+        return 0.0, 0.0
         
     # We have a connection to support! Base reward.
     base_reward = 0.1
@@ -308,26 +310,31 @@ def calculate_connectivity_reward(
     # Get labels at load positions where there is material
     load_material_mask = load_mask & binary
     
-    total_load_voxels = np.sum(load_mask)
-    if total_load_voxels == 0:
-        return 0.0
-
+    connected_to_load = False
     connected_load_voxels = 0
+    total_load_voxels = np.sum(load_mask)
+    
     if np.any(load_material_mask):
         labels_at_load = labeled[load_material_mask]
         is_connected = np.isin(labels_at_load, support_labels)
         connected_load_voxels = np.sum(is_connected)
+        if connected_load_voxels > 0:
+            connected_to_load = True
+
+    # If not connected to load, fraction is 0, bonus is 0.
+    # The previous distance heuristic is removed as per new spec.
+
     
-    # Only reward if we have connection to load
-    if connected_load_voxels == 0:
-        return 0.0
+    # If connected to load:
+    fraction_connected = connected_load_voxels / total_load_voxels if total_load_voxels > 0 else 0
+    
+    # Bonus Formula:
+    # 0.5 * fraction + 0.5 (if 100% connected)
+    bonus = 0.5 * fraction_connected
+    if fraction_connected >= 0.999: # Float tolerance
+        bonus += 0.5
         
-    fraction_connected = connected_load_voxels / total_load_voxels
-    
-    # Bonus: +0 to +0.5 based on coverage
-    reward = 0.5 * fraction_connected
-    
-    return float(reward)
+    return float(bonus), float(fraction_connected)
 
 
 def get_phase2_terminal_reward(
@@ -426,10 +433,11 @@ def analyze_structure_islands(
     """
     Analyze the connected components (islands) in a structure.
     
-    Connectivity criteria (STRICT):
+    Connectivity criteria (STRICT - matches check_structure_connectivity):
     - The structure is "connected" if and only if:
       1. There exists at least one island touching both support (X=0) AND load region
-      2. ALL load positions with material are part of the SAME island
+      2. ALL load region voxels are filled (100% coverage)
+      3. All filled load voxels belong to a SINGLE island connected to support
     
     Args:
         density: Density grid (D, H, W)
@@ -464,32 +472,44 @@ def analyze_structure_islands(
     # Find labels touching support (X=0)
     support_labels = set(np.unique(labeled[0, :, :])) - {0}
     
-    # Define load region
+    if not support_labels:
+        total_voxels = int(binary.sum())
+        return {
+            'n_islands': n_islands,
+            'main_island_label': 0,
+            'main_island_mask': np.zeros_like(density, dtype=bool),
+            'main_island_voxels': 0,
+            'loose_voxels': total_voxels,
+            'is_connected': False,
+        }
+    
+    # === Load region calculation (MUST MATCH check_structure_connectivity) ===
     lx = min(load_config.get('x', nx-1), nx-1)
     ly = min(load_config.get('y', ny//2), ny-1)
     lz_s = max(0, load_config.get('z_start', 0))
     lz_e = min(nz, load_config.get('z_end', nz))
     
-    # Load region bounds (with small tolerance for forces applied to area)
-    x_start, x_end = max(0, lx - 1), min(nx, lx + 2)
-    y_start, y_end = max(0, ly - 1), min(ny, ly + 2)
+    load_half_width = 1.0
+    y_min = max(0, int(ly - load_half_width))
+    y_max = min(ny, int(ly + load_half_width) + 1)
+    z_min = max(0, int((lz_s + lz_e)/2.0 - load_half_width))
+    z_max = min(nz, int((lz_s + lz_e)/2.0 + load_half_width) + 1)
+    x_idx = lx
     
-    # Get the labeled slice in load region
-    load_slice = labeled[x_start:x_end, y_start:y_end, lz_s:lz_e]
+    # Get labels exactly at load voxels (same slice as check_structure_connectivity)
+    load_slice_labels = labeled[x_idx, y_min:y_max, z_min:z_max]
+    load_slice_binary = binary[x_idx, y_min:y_max, z_min:z_max]
     
-    # Create mask of actual load positions (where we need material)
-    # The load is applied at x=lx, y=ly, z in [lz_s, lz_e)
-    load_mask = np.zeros_like(labeled, dtype=bool)
-    load_mask[x_start:x_end, y_start:y_end, lz_s:lz_e] = True
+    # Expected voxels in load region
+    expected_vol = (y_max - y_min) * (z_max - z_min)
+    filled_vol = np.sum(load_slice_binary)
     
     # Get labels at load positions where there IS material
-    load_material_mask = binary & load_mask
-    labels_at_load = set(np.unique(labeled[load_material_mask])) - {0}
+    labels_at_load = set(np.unique(load_slice_labels)) - {0}
+    total_voxels = int(binary.sum())
     
-    # Check if any material exists at load location
+    # Check 1: Any material at load?
     if not labels_at_load:
-        # No material at load position - not connected
-        total_voxels = int(binary.sum())
         return {
             'n_islands': n_islands,
             'main_island_label': 0,
@@ -499,13 +519,10 @@ def analyze_structure_islands(
             'is_connected': False,
         }
     
-    # STRICT CRITERIA: ALL material at load must be on a SINGLE island
-    # that also touches support
+    # Check 2: Which labels touch both support AND load?
     valid_islands = labels_at_load & support_labels
     
     if not valid_islands:
-        # Load material doesn't connect to support
-        total_voxels = int(binary.sum())
         return {
             'n_islands': n_islands,
             'main_island_label': 0,
@@ -515,34 +532,35 @@ def analyze_structure_islands(
             'is_connected': False,
         }
     
-    # Check if ALL load material is on exactly ONE island connected to support
-    # If there are multiple labels at load, even if one connects, it's fragmented
-    if len(labels_at_load) > 1:
-        # Multiple islands at load region - check if ALL are valid
-        if labels_at_load != valid_islands:
-            # Some load material is on disconnected islands
-            # Find the best island (largest that connects both)
-            main_label = max(valid_islands, key=lambda lbl: (labeled == lbl).sum())
-            main_mask = labeled == main_label
-            main_voxels = int(main_mask.sum())
-            total_voxels = int(binary.sum())
-            return {
-                'n_islands': n_islands,
-                'main_island_label': main_label,
-                'main_island_mask': main_mask,
-                'main_island_voxels': main_voxels,
-                'loose_voxels': total_voxels - main_voxels,
-                'is_connected': False,  # Not fully connected!
-            }
-    
-    # Success: pick the (largest) valid island as main
+    # Pick main island (largest valid one)
     main_label = max(valid_islands, key=lambda lbl: (labeled == lbl).sum())
     main_mask = labeled == main_label
     main_voxels = int(main_mask.sum())
-    
-    total_voxels = int(binary.sum())
     loose_voxels = total_voxels - main_voxels
     
+    # Check 3: Multiple disjoint labels at load region?
+    if len(labels_at_load) > 1:
+        return {
+            'n_islands': n_islands,
+            'main_island_label': main_label,
+            'main_island_mask': main_mask,
+            'main_island_voxels': main_voxels,
+            'loose_voxels': loose_voxels,
+            'is_connected': False,  # Fragmented at load
+        }
+    
+    # Check 4: Load region fully filled? (STRICT criterion)
+    if filled_vol < expected_vol:
+        return {
+            'n_islands': n_islands,
+            'main_island_label': main_label,
+            'main_island_mask': main_mask,
+            'main_island_voxels': main_voxels,
+            'loose_voxels': loose_voxels,
+            'is_connected': False,  # Not fully filled under load
+        }
+    
+    # All checks passed - structure is connected
     return {
         'n_islands': n_islands,
         'main_island_label': main_label,

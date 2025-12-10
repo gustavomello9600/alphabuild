@@ -14,13 +14,15 @@ from .storage import (
     # Database functions
     initialize_selfplay_db,
     save_game,
-    save_game_step,
+    record_step,
     update_game_final,
     load_game,
     load_game_step,
     load_all_game_steps,
     list_games,
     get_game_count,
+    get_last_step,
+    get_incomplete_games,
     generate_game_id,
 )
 
@@ -52,13 +54,15 @@ __all__ = [
     'MCTSStats',
     'initialize_selfplay_db',
     'save_game',
-    'save_game_step',
+    'record_step',
     'update_game_final',
     'load_game',
     'load_game_step',
     'load_all_game_steps',
     'list_games',
     'get_game_count',
+    'get_last_step',
+    'get_incomplete_games',
     'generate_game_id',
     'calculate_connectivity_reward',
 ]

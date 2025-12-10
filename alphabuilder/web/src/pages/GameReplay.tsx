@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { Canvas } from '@react-three/fiber';
-import { OrbitControls, GizmoHelper, GizmoViewport } from '@react-three/drei';
+import { OrbitControls } from '@react-three/drei';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
     Play,
@@ -607,7 +607,7 @@ const MCTSStatsPanel = ({
 //    return Math.exp(-(fitness * LOG_SQUASH.SIGMA + LOG_SQUASH.MU + LOG_SQUASH.ALPHA * volumeFraction));
 // };
 
-const SimulationSidebar = ({
+const SimulationControls = ({
     currentStep,
     currentStepIndex,
     totalSteps,
@@ -626,107 +626,173 @@ const SimulationSidebar = ({
     onStepForward: () => void;
     onSeek: (step: number) => void;
 }) => {
-    // const value = currentStep?.value ?? 0;
-    // const volumeFraction = currentStep?.volume_fraction ?? 0.3;
-    // const estimatedCompliance = useMemo(() =>
-    //    recoverCompliance(value, volumeFraction),
-    //    [value, volumeFraction]
-    // );
+    const [localStepValue, setLocalStepValue] = useState((currentStepIndex + 1).toString());
+    const [isEditing, setIsEditing] = useState(false);
+
+    // Sync local state with prop only if not editing
+    useEffect(() => {
+        if (!isEditing) {
+            setLocalStepValue((currentStepIndex + 1).toString());
+        }
+    }, [currentStepIndex, isEditing]);
+
+    const handleCommitStep = (val: string) => {
+        setIsEditing(false);
+        let step = parseInt(val, 10);
+        if (isNaN(step)) {
+            setLocalStepValue((currentStepIndex + 1).toString());
+            return;
+        }
+        step = Math.max(1, Math.min(totalSteps, step));
+        onSeek(step - 1);
+        setLocalStepValue(step.toString());
+    };
+
+    const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+        if (e.key === 'Enter') {
+            handleCommitStep(localStepValue);
+            e.currentTarget.blur();
+        }
+    };
 
     return (
-        <motion.div
-            initial={{ opacity: 0, x: 40 }}
-            animate={{ opacity: 1, x: 0 }}
-            className="absolute right-0 top-0 bottom-0 w-80 bg-matter/90 backdrop-blur-xl border-l border-white/10 z-10 flex flex-col"
-        >
-            <div className="p-6 overflow-y-auto flex-1">
-                <h3 className="text-sm font-mono text-white/40 uppercase mb-6 tracking-wider">
-                    Controle do Replay
-                </h3>
-                {/* Phase Indicator */}
-                <div className="mb-6">
-                    <span className="text-xs text-white/40 uppercase mb-2 block">Fase Atual</span>
-                    <span
-                        className={`
-                            inline-flex items-center gap-2 text-sm font-bold px-3 py-2 rounded-lg
-                            ${currentStep?.phase === 'GROWTH'
-                                ? 'bg-green-500/20 text-green-400 border border-green-500/30'
-                                : 'bg-purple/20 text-purple border border-purple/30'
-                            }
-                        `}
+        <div className="absolute top-8 right-8 z-30 flex flex-col items-end gap-2 pointer-events-none">
+            {/* Phase Badge */}
+            <div className={`
+                flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-bold uppercase tracking-wider backdrop-blur-md border shadow-lg pointer-events-auto
+                ${currentStep?.phase === 'GROWTH'
+                    ? 'bg-green-500/10 text-green-400 border-green-500/20'
+                    : 'bg-purple/10 text-purple border-purple/20'
+                }
+            `}>
+                {currentStep?.phase === 'GROWTH' ? <Network size={14} /> : <Sparkles size={14} />}
+                {currentStep?.phase === 'GROWTH' ? 'Conexão (Growth)' : 'Refinamento (Fem)'}
+            </div>
+
+            {/* Controls Card */}
+            <div className="bg-black/80 backdrop-blur-xl border border-white/10 rounded-2xl p-4 shadow-2xl min-w-[320px] pointer-events-auto">
+                {/* Timeline */}
+                <div className="flex justify-between items-center mb-2 px-1">
+                    <span className="text-[10px] text-white/40 font-mono uppercase">Timeline</span>
+                    <div className="flex items-center gap-1 text-xs font-mono">
+                        <input
+                            type="text"
+                            inputMode="numeric"
+                            pattern="[0-9]*"
+                            value={localStepValue}
+                            onChange={(e) => setLocalStepValue(e.target.value)}
+                            onFocus={() => setIsEditing(true)}
+                            onBlur={() => handleCommitStep(localStepValue)}
+                            onKeyDown={handleKeyDown}
+                            className="w-12 bg-transparent text-cyan font-bold text-right border-b border-white/10 focus:border-cyan focus:outline-none transition-colors"
+                        />
+                        <span className="text-white/30">/</span>
+                        <span className="text-white/30">{totalSteps}</span>
+                    </div>
+                </div>
+                <input
+                    type="range"
+                    min="0"
+                    max={Math.max(0, totalSteps - 1)}
+                    value={currentStepIndex}
+                    onChange={(e) => onSeek(parseInt(e.target.value))}
+                    className="w-full h-1.5 bg-white/10 rounded-full cursor-pointer accent-cyan appearance-none mb-4"
+                />
+
+                {/* Buttons */}
+                <div className="flex gap-2">
+                    <button
+                        onClick={onStepBack}
+                        disabled={isPlaying}
+                        className={`p-2 rounded-xl transition-colors ${isPlaying ? 'bg-white/5 text-white/20' : 'bg-white/10 text-white hover:bg-white/20'}`}
                     >
-                        {currentStep?.phase === 'GROWTH' ? (
-                            <Network size={16} />
-                        ) : (
-                            <Sparkles size={16} />
-                        )}
-                        {currentStep?.phase === 'GROWTH' ? 'Conexão' : 'Refinamento'}
-                    </span>
-                </div>
-
-                {/* Timeline & Playback Controls */}
-                <div className="mb-6 p-4 rounded-xl bg-black/30 border border-white/5">
-                    <div className="flex justify-between items-center mb-3">
-                        <span className="text-xs text-white/40">Progresso</span>
-                        <div className="flex items-center gap-1 text-sm font-mono">
-                            <input
-                                type="number"
-                                min={1}
-                                max={totalSteps}
-                                value={currentStepIndex + 1}
-                                onChange={(e) => {
-                                    const step = Math.max(0, Math.min(totalSteps - 1, parseInt(e.target.value, 10) - 1));
-                                    if (!isNaN(step)) onSeek(step);
-                                }}
-                                className="w-12 text-right bg-transparent text-cyan font-bold border-b border-cyan/30 focus:border-cyan focus:outline-none"
-                            />
-                            <span className="text-white/40">/ {totalSteps}</span>
-                        </div>
-                    </div>
-
-                    <input
-                        type="range"
-                        min="0"
-                        max={Math.max(0, totalSteps - 1)}
-                        value={currentStepIndex}
-                        onChange={(e) => onSeek(parseInt(e.target.value))}
-                        className="w-full h-2 bg-white/10 rounded-full cursor-pointer accent-cyan appearance-none mb-3"
-                    />
-
-                    <div className="flex gap-2">
-                        <button
-                            onClick={onStepBack}
-                            disabled={isPlaying}
-                            className={`p-2 rounded-lg transition-colors ${isPlaying ? 'bg-white/5 text-white/20 cursor-not-allowed' : 'bg-white/10 text-white hover:bg-white/20'}`}
-                        >
-                            <SkipBack size={16} />
-                        </button>
-                        <button
-                            onClick={onPlayPause}
-                            className={`flex-1 font-bold py-2 rounded-lg flex items-center justify-center gap-2 transition-all
-                                ${!isPlaying
-                                    ? 'bg-gradient-to-r from-cyan to-cyan/80 text-black hover:shadow-[0_0_20px_rgba(0,240,255,0.3)]'
-                                    : 'bg-magenta/80 text-white hover:bg-magenta'
-                                }`}
-                        >
-                            {isPlaying ? <><Pause size={16} /> Pausar</> : <><Play size={16} /> Play</>}
-                        </button>
-                        <button
-                            onClick={onStepForward}
-                            disabled={isPlaying}
-                            className={`p-2 rounded-lg transition-colors ${isPlaying ? 'bg-white/5 text-white/20 cursor-not-allowed' : 'bg-white/10 text-white hover:bg-white/20'}`}
-                        >
-                            <SkipForward size={16} />
-                        </button>
-                    </div>
-                </div>
-
-                {/* Reward Breakdown Section */}
-                <div className="mb-6">
-                    <RewardBreakdown state={currentStep} />
+                        <SkipBack size={18} />
+                    </button>
+                    <button
+                        onClick={onPlayPause}
+                        className={`flex-1 font-bold py-2 rounded-xl flex items-center justify-center gap-2 transition-all text-sm
+                            ${!isPlaying
+                                ? 'bg-cyan/20 text-cyan hover:bg-cyan/30 border border-cyan/20'
+                                : 'bg-magenta/20 text-magenta hover:bg-magenta/30 border border-magenta/20'
+                            }`}
+                    >
+                        {isPlaying ? <Pause size={18} /> : <Play size={18} />}
+                        {isPlaying ? 'PAUSE' : 'PLAY'}
+                    </button>
+                    <button
+                        onClick={onStepForward}
+                        disabled={isPlaying}
+                        className={`p-2 rounded-xl transition-colors ${isPlaying ? 'bg-white/5 text-white/20' : 'bg-white/10 text-white hover:bg-white/20'}`}
+                    >
+                        <SkipForward size={18} />
+                    </button>
                 </div>
             </div>
-        </motion.div>
+        </div>
+    );
+};
+
+const RewardOverlay = ({ step }: { step: GameReplayState | null }) => {
+    const [expanded, setExpanded] = useState(false);
+
+    // Determine main value to show
+    const rc = step?.reward_components;
+    let rewardValue = 0;
+
+    if (step?.phase === 'GROWTH') {
+        const bonus = rc?.connectivity_bonus || 0;
+        const valueHead = step?.value || 0;
+        const islandPenalty = rc?.island_penalty || 0;
+        rewardValue = valueHead + bonus - islandPenalty;
+    } else {
+        rewardValue = rc?.total ?? step?.value ?? 0;
+    }
+
+    const isPositive = rewardValue >= 0;
+
+    return (
+        <div className="absolute bottom-8 right-8 z-30 flex flex-col items-end pointer-events-none">
+            <AnimatePresence>
+                {expanded && (
+                    <motion.div
+                        initial={{ opacity: 0, y: 20, scale: 0.95 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        exit={{ opacity: 0, y: 20, scale: 0.95 }}
+                        className="mb-3 w-[400px] pointer-events-auto"
+                    >
+                        <RewardBreakdown state={step} />
+                    </motion.div>
+                )}
+            </AnimatePresence>
+
+            <motion.button
+                layout
+                onClick={() => setExpanded(!expanded)}
+                className={`
+                    flex items-center gap-3 pl-5 pr-3 py-3 rounded-2xl shadow-2xl backdrop-blur-xl border transition-all group pointer-events-auto
+                    ${expanded
+                        ? 'bg-black/90 border-white/20'
+                        : 'bg-black/60 border-white/10 hover:bg-black/80'
+                    }
+                `}
+            >
+                <div className="flex flex-col items-end">
+                    <div className="text-[10px] text-white/40 uppercase font-bold tracking-wider mb-0.5">
+                        Reward
+                    </div>
+                    <div className={`font-mono text-2xl font-bold leading-none ${isPositive ? 'text-green-400' : 'text-red-400'}`}>
+                        {rewardValue > 0 ? '+' : ''}{rewardValue.toFixed(4)}
+                    </div>
+                </div>
+
+                <div className={`
+                    p-2 rounded-xl transition-colors ml-2
+                    ${expanded ? 'bg-white/10 text-white' : 'bg-white/5 text-white/40 group-hover:text-white group-hover:bg-white/10'}
+                `}>
+                    {expanded ? <ChevronDown size={20} /> : <ChevronUp size={20} />}
+                </div>
+            </motion.button>
+        </div>
     );
 };
 
@@ -930,9 +996,6 @@ export const GameReplay = () => {
                     <SupportVoxels step={replayState} />
 
                     <OrbitControls makeDefault target={[0, 16, 0]} />
-                    <GizmoHelper alignment="top-right" margin={[80, 80]}>
-                        <GizmoViewport axisColors={['#FF0055', '#00FF9D', '#00F0FF']} labelColor="white" />
-                    </GizmoHelper>
                 </Canvas>
             </div>
 
@@ -974,7 +1037,7 @@ export const GameReplay = () => {
                 currentStep={simState.currentStep}
             />
 
-            <SimulationSidebar
+            <SimulationControls
                 currentStep={replayState}
                 currentStepIndex={simState.currentStep}
                 totalSteps={simState.stepsLoaded > 0 ? simState.stepsLoaded : 0}
@@ -984,6 +1047,8 @@ export const GameReplay = () => {
                 onStepForward={handleStepForward}
                 onSeek={handleSeek}
             />
+
+            <RewardOverlay step={replayState} />
 
             <AnimatePresence>
                 {(loading || error) && (

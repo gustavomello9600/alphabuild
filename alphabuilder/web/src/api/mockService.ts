@@ -1,4 +1,4 @@
-import type { GameState, Phase, Project } from './types';
+import type { GameState, Phase, Project, Action, RewardComponents } from './types';
 
 // Define interface for the JSON structure
 interface MockEpisodeData {
@@ -31,6 +31,7 @@ interface MockEpisodeData {
 }
 
 export class MockService {
+    // ... (existing properties)
     private subscribers: ((state: GameState) => void)[] = [];
     private intervalId: any = null;
     private currentStepIndex = 0;
@@ -220,6 +221,27 @@ export class MockService {
             const fitness = frame.fitness ?? (frame as any).fitness_score ?? 0;
             const valueConf = (frame as any).value_confidence ?? fitness;
 
+            // [NEW] Mock Action Sequence and Rewards
+            const action_sequence: Action[] = [];
+            // Generate some dummy actions
+            const nActions = 2 + Math.floor(Math.random() * 3);
+            for (let i = 0; i < nActions; i++) {
+                action_sequence.push({
+                    type: frame.step % 2 === 0 ? 'ADD' : 'REMOVE',
+                    x: Math.floor(Math.random() * shape[1]),
+                    y: Math.floor(Math.random() * shape[2]),
+                    z: Math.floor(Math.random() * shape[3]),
+                    value_estimate: valueConf + (Math.random() * 0.1 - 0.05)
+                });
+            }
+
+            const reward_components: RewardComponents = {
+                base_reward: fitness,
+                connectivity_bonus: 0.1,
+                island_penalty: Math.random() < 0.3 ? 0.05 : 0.0,
+                total: fitness + 0.1
+            };
+
             return {
                 episode_id: data.episode_id,
                 step: frame.step,
@@ -236,7 +258,9 @@ export class MockService {
                     volume_fraction: volFrac
                 },
                 value_confidence: valueConf,
-                policy_heatmap: policyHeatmap
+                policy_heatmap: policyHeatmap,
+                action_sequence, // [NEW]
+                reward_components // [NEW]
             };
         });
     }

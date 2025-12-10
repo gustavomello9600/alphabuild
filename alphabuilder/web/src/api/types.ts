@@ -46,3 +46,28 @@ export interface Project {
     status: 'IN_PROGRESS' | 'COMPLETED' | 'FAILED';
     episode_id: string;
 }
+
+export interface Action {
+    type: 'ADD' | 'REMOVE';
+    x: number;
+    y: number;
+    z: number;
+    value_estimate?: number;
+    visit_count?: number;
+}
+
+export interface RewardComponents {
+    base_reward: number;
+    connectivity_bonus?: number;
+    island_penalty?: number;
+    loose_penalty?: number;
+    fem_reward?: number;
+    volume_penalty?: number;
+    validity_penalty?: number;
+    total: number;
+    // New metrics [v3.1]
+    n_islands?: number;
+    loose_voxels?: number;
+    disconnected_volume_fraction?: number;
+    connected_load_fraction?: number;
+}

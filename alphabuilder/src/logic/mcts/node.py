@@ -224,12 +224,42 @@ class MCTSNode:
     
     def get_visit_distribution(self) -> Dict[Action, int]:
         """
-        Get visit count distribution over children.
+        Get visit count distribution over children (Legacy: Shallow).
         
         Returns:
             Dict mapping actions to visit counts
         """
         return {action: child.visit_count for action, child in self.children.items()}
+
+    def collect_subtree_visits(self, accumulator: Optional[Dict[Action, int]] = None) -> Dict[Action, int]:
+        """
+        Recursively collect visit counts from all descendants (Deep).
+        
+        Args:
+            accumulator: Dictionary to accumulate counts (optional)
+            
+        Returns:
+            Dict mapping actions to visit counts across the entire subtree
+        """
+        if accumulator is None:
+            # Use a standard dict instead of defaultdict to avoid import changes if possible, 
+            # or just be careful. We'll use standard dict fetch/set.
+            accumulator = {}
+        
+        # Traverse children
+        for action, child in self.children.items():
+            # Add child's visits
+            # Note: We track the action that *led* to the child. 
+            # If multiple nodes result from same action (transpositions), this might sum them.
+            # But MCTS tree structure is typically strictly hierarchical here (no graph DAG yet).
+            
+            current_count = accumulator.get(action, 0)
+            accumulator[action] = current_count + child.visit_count
+            
+            # Recurse
+            child.collect_subtree_visits(accumulator)
+            
+        return accumulator
     
     def get_top_k_actions(self, k: int) -> List[Action]:
         """

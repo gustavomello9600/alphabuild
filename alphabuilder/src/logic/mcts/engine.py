@@ -8,7 +8,7 @@ Reference: AlphaBuilder v3.1 MCTS Specification (specs/mcts_spec.md)
 """
 
 import numpy as np
-from typing import Tuple, List, Dict, Optional, Callable, NamedTuple
+from typing import Tuple, List, Dict, Optional, Callable, NamedTuple, Any
 from functools import lru_cache
 from dataclasses import dataclass
 import hashlib
@@ -37,25 +37,24 @@ class MCTSConfig(NamedTuple):
     add_root_noise: bool = False
     root_dirichlet_alpha: float = 0.3
     root_exploration_fraction: float = 0.25
-    tree_search_batching: bool = False
-    max_search_depth: int = 1
 
 
 # Phase-specific configuration presets (from MCTS Spec Section 8)
 # NOTE: Reduced simulations for faster iteration on local hardware
 PHASE1_CONFIG = MCTSConfig(
-    num_simulations=80,   # Reduced from 320 for faster local runs
+    num_simulations=120,   # Increased for robust PV selection
     batch_size=32,
     c_puct=1.5,
-    phase="GROWTH",
-    tree_search_batching=True,
-    max_search_depth=4
+    top_k_expansion=32,     # Limit branching to allow depth > 2
+    min_volume_fraction=0.0, # Allow starting from empty grid
+    phase="GROWTH"
 )
 
 PHASE2_CONFIG = MCTSConfig(
     num_simulations=80,
     batch_size=8,
     c_puct=1.25,
+    top_k_expansion=8,      # Focused search (sims/8 = 10 visits/node -> reasonable depth)
     phase="REFINEMENT"
 )
 
@@ -66,6 +65,7 @@ class SearchResult(NamedTuple):
     visit_distribution: Dict[Action, int]  # Full visit counts
     root_value: float  # Mean value at root
     num_simulations: int  # Actual simulations performed
+    root: Any # MCTSNode
 
 
 # =============================================================================
@@ -187,6 +187,116 @@ def select_leaf(root: MCTSNode, c_puct: float) -> Tuple[MCTSNode, List[MCTSNode]
     return node, path
 
 
+def select_pv_sequences(
+    root: MCTSNode, 
+    max_actions: int = 32, 
+    max_depth: int = 4
+) -> List[Action]:
+    """
+    Selects a micro-batch of actions by extracting Principal Variation sequences.
+    
+    Algorithm: Breadth-then-Depth
+    1. Sort root children by visit count (Breadth).
+    2. For each top child (Head), greedily follow the best path up to max_depth (Depth).
+    3. Aggregate sequences until max_actions is reached.
+    
+    Args:
+        root: The MCTS root node
+        max_actions: Total number of actions to fill in the batch
+        max_depth: Maximum depth of any single sequence
+        
+    Returns:
+        List of Actions to be executed sequentially.
+    """
+    if not root.children:
+        return []
+
+    # 1. Identify Heads (Breadth)
+    # Sort children by visit count (primary) and Q-value (secondary)
+    root_children_sorted = sorted(
+        root.children.items(), 
+        key=lambda item: (item[1].visit_count, item[1].mean_value), 
+        reverse=True
+    )
+    
+    selected_actions: List[Action] = []
+    total_actions = 0
+    
+    # Spatial Lock: Prevent multiple actions on the same voxel in one batch
+    # This ensures 32 actions = 32 unique modifications
+    locked_voxels = set()
+    
+    # 2. Extract Deep Sequence for each Head
+    for action, child in root_children_sorted:
+        if total_actions >= max_actions:
+            break
+            
+        # Helper to check spatial conflict
+        # Action format: (channel, x, y, z)
+        def is_locked(act):
+            coords = (act[1], act[2], act[3])
+            return coords in locked_voxels
+
+        # Check Root Action
+        if is_locked(action):
+            continue
+            
+        # Start sequence with the root action (Head)
+        seq = [action]
+        # Lock this voxel for this batch
+        locked_voxels.add((action[1], action[2], action[3]))
+        
+        current_node = child
+        
+        # Extend sequence deeper (Depth)
+        # We start loop 1 level deep, so we go up to max_depth - 1 extensions
+        for _ in range(max_depth - 1):
+            if not current_node.children:
+                break
+                
+            # Greedy selection: Best child by visit count
+            # BUT we must filter out locked voxels first
+            
+            # Get valid children (not locked)
+            # Note: We sort all children, then pick the first valid one.
+            sorted_children = sorted(
+                current_node.children.items(),
+                key=lambda item: (item[1].visit_count, item[1].mean_value),
+                reverse=True
+            )
+            
+            best_action = None
+            best_child = None
+            
+            for child_act, child_node in sorted_children:
+                if not is_locked(child_act):
+                    best_action = child_act
+                    best_child = child_node
+                    break
+            
+            # If no valid child found (all locked), stop this sequence branch here
+            if best_action is None:
+                break
+            
+            seq.append(best_action)
+            locked_voxels.add((best_action[1], best_action[2], best_action[3]))
+            current_node = best_child
+        
+        # Add to batch
+        # Truncate if we overflow max_actions
+        remaining_slots = max_actions - total_actions
+        actions_to_add = seq[:remaining_slots]
+        
+        # If truncation removes some locked voxels, technically we should unlock them
+        # but since we process sequentially and greedily, it doesn't matter for this batch.
+        
+        selected_actions.extend(actions_to_add)
+        total_actions += len(actions_to_add)
+        
+    return selected_actions
+
+
+
 # =============================================================================
 # Expansion Phase
 # =============================================================================
@@ -242,123 +352,6 @@ def backup(path: List[MCTSNode], value: float) -> None:
     """
     for node in path:
         node.update(value)
-
-
-def extract_batch_from_tree(
-    root: MCTSNode,
-    batch_size: int,
-    max_depth: int
-) -> Tuple[List[Action], Dict[Action, int]]:
-    """
-    Extract a batch of actions by traversing the tree greedily based on visit counts.
-    
-    Instead of just taking the top-k children of root, we explore the tree
-    prioritizing identifying the 'best' nodes across multiple levels.
-    
-    Algorithm:
-    1. Priority Queue of candidates (initially root's children), ordered by visit count.
-    2. Pop best candidate.
-    3. Add its action (relative to parent?) -> Wait, we need absolute actions?
-    
-    PROBLEM: To apply a sequence of actions, we need their sequence order.
-    If we pick Action A (Level 1) and Action B (Level 2, child of A),
-    we must execute A then B.
-    
-    If we pick Action C (Level 1) as well, we have {A, C}.
-    But B depends on A.
-    
-    Return format for this project is `List[Action]`.
-    The `apply_micro_batch` function iterates this list and applies them.
-    If list is [A, B, C], it applies A, then B, then C.
-    
-    So we need to return a valid topological sort.
-    Since we extract from a tree, parents always come before children if we extract in order?
-    Actually if we use a PQ by visits:
-    - Root has children A (100 visits), C (80 visits).
-    - A has child B (50 visits).
-    
-    PQ: [(100, A), (80, C)]
-    Pop A. Result: [A].
-    Add children of A to PQ: [(80, C), (50, B)]
-    Pop C. Result: [A, C].
-    Add children of C...
-    Pop B. Result: [A, C, B].
-    
-    Applying A, C, B is valid?
-    A and C are siblings (independent branches from root).
-    Applying both means we are merging branches. THIS IS AN APPROXIMATION.
-    MCTS assumes mutually exclusive choices.
-    Here we assume actions are additive/independent enough to be combined.
-    
-    B is child of A. It assumes A was taken.
-    So sequence A -> B is correct.
-    Sequence C is independent.
-    So {A, C, B} -> apply A, apply C, apply B.
-    State becomes Root + A + C + B.
-    
-    Is this valid?
-    B was optimized on state Root+A.
-    Applying it on Root+A+C might be different if C interference with B.
-    But assuming spatial locality (micro-structure), interference is continuous.
-    
-    So yes, this topological sort (Parent before Child) is naturally handled
-    if we process PQ carefully. But standard PQ pops by score. B (50) could be less than C (80).
-    So we pick C before B.
-    Start: [A, C, B].
-    Dependence: B needs A.
-    A is in list. Result order: A, C, B.
-    
-    Args:
-        root: Root node
-        batch_size: Max actions to return
-        max_depth: limit tree depth
-    
-    Returns:
-        Tuple of (actions list, visit distribution for logging)
-    """
-    import heapq
-    
-    if not root.children:
-        return [], {}
-    
-    # Candidate tuple: (-visit_count, tie_breaker_uid, action, node, depth)
-    # We use negative visits for Max-Heap behavior with standard heapq (min-heap)
-    # tie_breaker necessary because MCTSNode comparisons might not be safe
-    pq = []
-    uid = 0
-    
-    # Initialize with root children
-    for action, child in root.children.items():
-        # Depth 1 (children of root)
-        heapq.heappush(pq, (-child.visit_count, uid, action, child, 1))
-        uid += 1
-    
-    selected_actions = []
-    visit_dist_map = {} # Only for top-level visualization? Or all?
-    # Spec says "visit_distribution" is used for logging visits.
-    # Usually relative to root.
-    # We can just return root's distribution logic for logging, 
-    # but that misses the "depth" aspect in logs.
-    # For now, let's keep visit_dist as just root children for compatibility,
-    # or empty if we are doing tree batching (logs might look weird).
-    
-    visits_recorded = {}
-    
-    while len(selected_actions) < batch_size and pq:
-        neg_visits, _, action, node, depth = heapq.heappop(pq)
-        visits = -neg_visits
-        
-        # Add to selection
-        selected_actions.append(action)
-        visits_recorded[action] = visits
-        
-        # If we can go deeper, add children
-        if depth < max_depth and node.is_expanded:
-            for child_action, child_node in node.children.items():
-                heapq.heappush(pq, (-child_node.visit_count, uid, child_action, child_node, depth + 1))
-                uid += 1
-                
-    return selected_actions, visits_recorded
 
 
 # =============================================================================
@@ -491,25 +484,20 @@ def run_mcts_search(
         backup(path, value)
     
     # Extract results
-    if config.tree_search_batching:
-        # Use tree-based batch extraction (Depth > 1)
-        top_actions, batch_visit_dist = extract_batch_from_tree(
-            root, config.batch_size, config.max_search_depth
-        )
-        # Use root visit distribution for general logging, but maybe we should mix?
-        # SearchResult expects visit_distribution to be Dict[Action, int]
-        # We can pass the batch_visit_dist for specific logging of selected nodes
-        visit_dist = root.get_visit_distribution() 
-    else:
-        # Standard top-k from root (Depth 1)
-        visit_dist = root.get_visit_distribution()
-        top_actions = root.get_top_k_actions(config.batch_size)
+    # visit_dist = root.get_visit_distribution() # Legacy: Shallow
+    visit_dist = root.collect_subtree_visits() # New: Deep Recursive (All Search Nodes)
+    
+    # Get top actions (root-level only for 'actions' return, usually)
+    # But for 'actions' list we usually want the alternatives.
+    # The 'actions' field in SearchResult is typically top-k root actions.
+    top_actions = root.get_top_k_actions(config.batch_size)
     
     return SearchResult(
         actions=top_actions,
         visit_distribution=visit_dist,
         root_value=root.mean_value,
-        num_simulations=config.num_simulations
+        num_simulations=config.num_simulations,
+        root=root
     )
 
 
@@ -530,7 +518,8 @@ class AlphaBuilderMCTS:
         predict_fn: Callable[[np.ndarray], Tuple[float, np.ndarray, np.ndarray]],
         num_simulations: int = 80,
         batch_size: int = 8,
-        c_puct: float = 1.25
+        c_puct: float = 1.25,
+        top_k_expansion: Optional[int] = None
     ):
         """
         Initialize MCTS wrapper.
@@ -540,12 +529,14 @@ class AlphaBuilderMCTS:
             num_simulations: Number of MCTS simulations per search
             batch_size: Number of top actions to return (micro-batch size)
             c_puct: PUCT exploration constant
+            top_k_expansion: Max children to expand (pruning)
         """
         self.predict_fn = predict_fn
         self.config = MCTSConfig(
             num_simulations=num_simulations,
             batch_size=batch_size,
             c_puct=c_puct,
+            top_k_expansion=top_k_expansion,
             add_root_noise=True  # Enable noise for tree reuse
         )
         self.root: Optional[MCTSNode] = None
@@ -582,6 +573,11 @@ class AlphaBuilderMCTS:
             root_node=self.root,
             eval_cache=self.eval_cache
         )
+        
+        # Persist the root for subsequent calls (e.g. sequence extraction)
+        self.root = result.root
+        
+        return result
         
         # Update our root reference to the (potentially new) root of the search
         # Actually run_mcts_search doesn't return the root explicitly, 

@@ -36,6 +36,8 @@ export interface MCTSStats {
     refutation: boolean;
 }
 
+import type { RewardComponents } from './types';
+
 export interface GameStep {
     step: number;
     phase: string;
@@ -58,7 +60,10 @@ export interface GameStep {
     max_displacement?: number;
     island_penalty?: number;
     loose_voxels?: number;
+    reward_components?: RewardComponents | null;
 }
+
+
 
 export interface GameData {
     game_id: string;
@@ -193,6 +198,7 @@ export interface GameReplayState {
     compliance_fem?: number;
     island_penalty?: number;
     loose_voxels?: number;
+    reward_components?: RewardComponents | null;
 }
 
 export class SelfPlayReplayService {
@@ -296,6 +302,7 @@ export class SelfPlayReplayService {
                 compliance_fem: step.compliance_fem,
                 island_penalty: step.island_penalty,
                 loose_voxels: step.loose_voxels,
+                reward_components: step.reward_components || null,
             };
         });
     }
