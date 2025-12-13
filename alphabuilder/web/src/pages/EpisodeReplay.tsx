@@ -485,7 +485,7 @@ const ReplayControlPanel = ({
 
                 {/* Metrics / Reward Breakdown */}
                 <div className="space-y-4 mb-8">
-                    <RewardBreakdown state={state} />
+                    <RewardBreakdown state={state} maxSteps={totalSteps} />
                 </div>
 
                 {/* Playback Controls */}

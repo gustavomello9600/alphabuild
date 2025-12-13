@@ -181,6 +181,23 @@ function parseBinaryStream(buffer: ArrayBuffer) {
         const island_penalty = view.getFloat32(cursor + 16, true);
         cursor += 20;
 
+        // Parse reward_components (length int32 + bytes)
+        const rcLength = view.getInt32(cursor, true);
+        cursor += 4;
+
+        let reward_components = undefined;
+        if (rcLength > 0) {
+            // Read bytes
+            // Since we can't easily decode bytes to string in worker without TextDecoder (available?)
+            // TextDecoder IS available in workers in modern browsers.
+            const decoder = new TextDecoder('utf-8');
+            // We need a view on the specific bytes
+            const jsonView = new Uint8Array(buffer, cursor, rcLength);
+            const jsonStr = decoder.decode(jsonView);
+            reward_components = JSON.parse(jsonStr);
+            cursor += rcLength;
+        }
+
         // Compute Visual Buffers immediately
         const { opaqueMatrix, opaqueColor, overlayMatrix, overlayColor, mctsMatrix, mctsColor } = computeVisuals(
             tensorData,
@@ -209,6 +226,7 @@ function parseBinaryStream(buffer: ArrayBuffer) {
             is_connected,
             compliance_fem: compliance_fem || undefined,
             island_penalty: island_penalty || undefined,
+            reward_components, // [NEW]
             mcts_stats: {
                 num_simulations: numSimulations,
                 nodes_expanded: 0,

@@ -4,6 +4,8 @@ import numpy as np
 from alphabuilder.src.logic.selfplay.reward import (
     calculate_raw_score,
     calculate_reward,
+    calculate_compliance_score,
+    calculate_volume_bonus,
     get_phase1_reward,
     check_structure_connectivity,
     get_phase2_terminal_reward,
@@ -11,6 +13,12 @@ from alphabuilder.src.logic.selfplay.reward import (
     analyze_structure_islands,
     calculate_island_penalty,
     get_reward_with_island_penalty,
+    # New constants
+    COMPLIANCE_BASE,
+    COMPLIANCE_SLOPE,
+    VOLUME_REFERENCE,
+    VOLUME_SENSITIVITY,
+    # Legacy constants
     MU_SCORE,
     SIGMA_SCORE,
     ALPHA_VOL
@@ -18,22 +26,47 @@ from alphabuilder.src.logic.selfplay.reward import (
 
 class TestRewardFunctions:
 
-    def test_calculate_raw_score(self):
-        """Test random score calculation."""
-        compliance = 0.5
-        vol_frac = 0.2
-        expected_score = -np.log(compliance) - ALPHA_VOL * vol_frac
-        assert calculate_raw_score(compliance, vol_frac) == pytest.approx(expected_score)
+    def test_calculate_compliance_score(self):
+        """Test log10-based compliance scoring."""
+        # C=10 (log10=1) should give 0.80
+        assert calculate_compliance_score(10) == pytest.approx(0.80, abs=0.01)
+        # C=1000 (log10=3) should give 0.48
+        assert calculate_compliance_score(1000) == pytest.approx(0.48, abs=0.01)
+        # C=1M (log10=6) should give 0.00
+        assert calculate_compliance_score(1_000_000) == pytest.approx(0.00, abs=0.01)
+        # C=0 or negative should return max score
+        assert calculate_compliance_score(0) == pytest.approx(0.85, abs=0.01)
 
-    def test_calculate_reward_valid_structure(self):
-        """Test normalized reward for a valid structure."""
-        compliance = 0.5
-        vol_frac = 0.2
-        raw_score = calculate_raw_score(compliance, vol_frac)
-        expected_reward = np.tanh((raw_score - MU_SCORE) / SIGMA_SCORE)
-        
-        reward = calculate_reward(compliance, vol_frac, is_valid=True)
-        assert reward == pytest.approx(expected_reward)
+    def test_calculate_volume_bonus(self):
+        """Test volume bonus/penalty calculation."""
+        # V=0.10 (reference) should give 0.0
+        assert calculate_volume_bonus(0.10) == pytest.approx(0.0, abs=0.01)
+        # V=0.05 should give +0.10 bonus
+        assert calculate_volume_bonus(0.05) == pytest.approx(0.10, abs=0.01)
+        # V=0.20 should give -0.20 penalty
+        assert calculate_volume_bonus(0.20) == pytest.approx(-0.20, abs=0.01)
+
+    def test_calculate_reward_targets(self):
+        """Test that reward matches user targets at V=0.1."""
+        targets = [
+            (10, 0.80),
+            (100, 0.70),
+            (1000, 0.50),
+            (10000, 0.30),
+            (100000, 0.10),
+            (1000000, 0.00)
+        ]
+        for compliance, target in targets:
+            reward = calculate_reward(compliance, 0.1, is_valid=True)
+            assert reward == pytest.approx(target, abs=0.10), f"C={compliance} failed"
+
+    def test_calculate_reward_volume_monotonic(self):
+        """Lower volume should ALWAYS give higher reward."""
+        for c in [100, 1000, 10000]:
+            r_low = calculate_reward(c, 0.05, True)
+            r_mid = calculate_reward(c, 0.10, True)
+            r_high = calculate_reward(c, 0.20, True)
+            assert r_low > r_mid > r_high, f"Volume should be inversely proportional at C={c}"
 
     def test_calculate_reward_invalid_structure(self):
         """Test penalty for invalid structure."""
@@ -62,17 +95,12 @@ class TestRewardFunctions:
         assert reward == -1.0
         assert reason == "MAX_STEPS_REACHED"
 
-    def test_estimate_reward_components(self):
-        """Test reverse estimation of components."""
-        value = 0.5
-        vol_frac = 0.3
-        
-        components = estimate_reward_components(value, vol_frac)
-        
-        # Verify if recalculating forward gives back the value
-        est_raw = components['estimated_raw_score']
-        recalc_value = np.tanh((est_raw - MU_SCORE) / SIGMA_SCORE)
-        assert recalc_value == pytest.approx(value)
+    def test_legacy_raw_score(self):
+        """Test legacy raw score for backward compatibility."""
+        compliance = 0.5
+        vol_frac = 0.2
+        expected_score = -np.log(compliance) - ALPHA_VOL * vol_frac
+        assert calculate_raw_score(compliance, vol_frac) == pytest.approx(expected_score)
 
 class TestIslandAnalysis:
 

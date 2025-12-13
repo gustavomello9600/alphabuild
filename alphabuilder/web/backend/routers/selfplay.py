@@ -318,14 +318,6 @@ def get_selfplay_game_steps_binary(
         mcts_add_bytes = s.mcts_visit_add.astype(np.float32).tobytes()
         mcts_rem_bytes = s.mcts_visit_remove.astype(np.float32).tobytes()
         
-        total_data_size = (
-            len(tensor_bytes) + 
-            len(policy_add_bytes) + 
-            len(policy_rem_bytes) + 
-            len(mcts_add_bytes) + 
-            len(mcts_rem_bytes)
-        )
-        
         phase_code = 0 if s.phase.value == 'GROWTH' else 1
         D, H, W = game.resolution
         
@@ -336,15 +328,6 @@ def get_selfplay_game_steps_binary(
             # channel, x, y, z, visits (5 ints) + q_value (1 float)
             selected_actions_bytes += struct.pack('<5if', a.channel, a.x, a.y, a.z, a.visits, a.q_value)
         
-        total_data_size = (
-            len(tensor_bytes) + 
-            len(policy_add_bytes) + 
-            len(policy_rem_bytes) + 
-            len(mcts_add_bytes) + 
-            len(mcts_rem_bytes) +
-            len(selected_actions_bytes)
-        )
-        
         # Extension block: n_islands(i), loose_voxels(i), is_connected(i), compliance_fem(f), island_penalty(f)
         extension_bytes = struct.pack(
             '<3i2f',
@@ -354,6 +337,13 @@ def get_selfplay_game_steps_binary(
             float(getattr(s, 'compliance_fem', 0.0) or 0.0),
             float(getattr(s, 'island_penalty', 0.0) or 0.0)
         )
+
+        # [NEW] Reward Components JSON block
+        rc_json_bytes = b""
+        rc = getattr(s, 'reward_components', None)
+        if rc:
+            rc_json_bytes = json.dumps(rc).encode('utf-8')
+        rc_header = struct.pack('<i', len(rc_json_bytes))
         
         total_data_size = (
             len(tensor_bytes) + 
@@ -362,7 +352,9 @@ def get_selfplay_game_steps_binary(
             len(mcts_add_bytes) + 
             len(mcts_rem_bytes) +
             len(selected_actions_bytes) +
-            len(extension_bytes)
+            len(extension_bytes) +
+            len(rc_header) + 
+            len(rc_json_bytes)
         )
         
         header = struct.pack(
@@ -385,5 +377,7 @@ def get_selfplay_game_steps_binary(
         output_buffer.extend(mcts_rem_bytes)
         output_buffer.extend(selected_actions_bytes)
         output_buffer.extend(extension_bytes)
+        output_buffer.extend(rc_header)
+        output_buffer.extend(rc_json_bytes)
         
     return Response(content=bytes(output_buffer), media_type="application/octet-stream")

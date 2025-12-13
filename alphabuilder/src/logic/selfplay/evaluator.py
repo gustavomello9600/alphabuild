@@ -39,19 +39,24 @@ class FEMResult:
 def evaluate_fem(
     density: np.ndarray,
     load_config: Dict[str, Any],
-    E: float = 1.0,
-    nu: float = 0.3,
-    force_magnitude: float = -1.0
+    E: float = 100.0,  # Match harvest data: Young's modulus = 100
+    nu: float = 0.25,  # Match harvest data: Poisson's ratio = 0.25
+    force_magnitude: float = -2.0  # Match harvest data: traction = (0, -2.0, 0)
 ) -> FEMResult:
     """
     Evaluate a density grid using FEM to get compliance and max displacement.
     
+    Uses the same FEM parameters as the harvest data optimization (optimization.py):
+    - E = 100, nu = 0.25
+    - Surface traction load at right boundary (x=Lx) in load region
+    - Fixed displacement BC at left boundary (x=0)
+    
     Args:
         density: Density grid (nx, ny, nz) with values in [0, 1]
         load_config: Dictionary with 'x', 'y', 'z_start', 'z_end' keys
-        E: Young's modulus (can be normalized to 1.0)
-        nu: Poisson's ratio
-        force_magnitude: Applied force (negative for downward)
+        E: Young's modulus (default 100 to match harvest)
+        nu: Poisson's ratio (default 0.25 to match harvest)
+        force_magnitude: Applied traction force (default -2.0 to match harvest)
         
     Returns:
         FEMResult with compliance, max_displacement, and validity
@@ -101,28 +106,34 @@ def evaluate_fem(
         )
         V = functionspace(domain, v_element)
         
-        # Scalar function space for density (DG0 - one value per cell)
-        s0_element = basix.ufl.element("DG", domain.topology.cell_name(), 0)
-        S0 = functionspace(domain, s0_element)
+        # Scalar function space for density (CG1 - like FEniTop's rho_phys_field)
+        # Using CG1 instead of DG0 provides proper interpolation across element boundaries
+        # This matches FEniTop's approach and produces consistent compliance values
+        s_element = basix.ufl.element("Lagrange", domain.topology.cell_name(), 1)
+        S = functionspace(domain, s_element)
         
-        # Material field
-        rho = Function(S0)
+        # Material field (CG1)
+        rho = Function(S)
         
-        # Map density grid to DG0 field
-        # For structured mesh, cells are ordered (z, y, x) typically
-        # We need to flatten in the right order
-        num_cells = domain.topology.index_map(domain.topology.dim).size_local
+        # Map density grid to CG1 field using node coordinates
+        # This samples the voxel grid at node locations, providing smooth interpolation
+        coords = S.tabulate_dof_coordinates()
+        x_idx = np.floor(coords[:, 0]).astype(int)
+        y_idx = np.floor(coords[:, 1]).astype(int)
+        z_idx = np.floor(coords[:, 2]).astype(int)
         
-        if num_cells == nx * ny * nz:
-            # Flatten density in Fortran order (z varies fastest) to match DOLFINx
-            rho.x.array[:] = density.flatten(order='F')
-        else:
-            # Fallback: uniform density
-            rho.x.array[:] = vol_frac
+        # Clip to valid range
+        x_idx = np.clip(x_idx, 0, nx - 1)
+        y_idx = np.clip(y_idx, 0, ny - 1)
+        z_idx = np.clip(z_idx, 0, nz - 1)
         
-        # SIMP penalization
-        E_min = 1e-9
-        E_eff = E_min + (E - E_min) * (rho ** 3)  # SIMP p=3
+        # Sample density at node locations
+        rho.x.array[:] = density[x_idx, y_idx, z_idx]
+        
+        # SIMP penalization (p=3, same as harvest) - FEniTop formula
+        p = 3.0
+        eps = 1e-6  # Match FEniTop epsilon
+        E_eff = (eps + (1 - eps) * rho**p) * E
         
         # Lame parameters
         mu = E_eff / (2 * (1 + nu))
@@ -142,27 +153,43 @@ def evaluate_fem(
         # Bilinear form
         a = ufl.inner(sigma(u), epsilon(v)) * ufl.dx
         
-        # Load (point load at load region)
-        lx = min(load_config.get('x', nx-1), nx-1)
-        ly = min(load_config.get('y', ny//2), ny-1)
-        lz_s = max(0, load_config.get('z_start', 0))
-        lz_e = min(nz, load_config.get('z_end', nz))
+        # Load region parameters (match harvest data)
+        ly = float(load_config.get('y', ny // 2))
+        lz_s = float(load_config.get('z_start', 0))
+        lz_e = float(load_config.get('z_end', nz))
         lz_center = (lz_s + lz_e) / 2.0
+        load_half_width = 1.0
         
-        # Define load region using subdomain
-        def load_region(x):
+        # Surface traction at right boundary (x=Lx) in load region
+        # This matches the harvest data setup exactly
+        def right_load_boundary(x):
+            """Right face (x=Lx) within load region."""
             return (
-                (x[0] >= lx - 1) & (x[0] <= lx + 1) &
-                (x[1] >= ly - 1) & (x[1] <= ly + 1) &
-                (x[2] >= lz_s) & (x[2] <= lz_e)
+                np.isclose(x[0], Lx) &
+                (x[1] >= ly - load_half_width - 0.5) & (x[1] <= ly + load_half_width + 0.5) &
+                (x[2] >= lz_center - load_half_width - 0.5) & (x[2] <= lz_center + load_half_width + 0.5)
             )
         
-        # Body force in load region (simplified approach)
-        # For now, use a uniform body force
-        f = Constant(domain, np.array([0.0, force_magnitude, 0.0], dtype=PETSc.ScalarType))
-        L = ufl.dot(f, v) * ufl.dx
+        # Locate facets for traction BC
+        fdim = domain.topology.dim - 1
+        load_facets = mesh.locate_entities_boundary(domain, fdim, right_load_boundary)
         
-        # Boundary condition (fix X=0 plane)
+        # Create facet tags for load region
+        facet_indices = np.array(load_facets, dtype=np.int32)
+        facet_markers = np.ones_like(facet_indices, dtype=np.int32)  # Tag = 1 for load region
+        sorted_indices = np.argsort(facet_indices)
+        facet_tags = mesh.meshtags(domain, fdim, facet_indices[sorted_indices], facet_markers[sorted_indices])
+        
+        # Define exterior facet measure with tags
+        ds = ufl.Measure("ds", domain=domain, subdomain_data=facet_tags)
+        
+        # Traction vector (0, force_magnitude, 0) - matches harvest: (0, -2.0, 0)
+        T = Constant(domain, np.array([0.0, force_magnitude, 0.0], dtype=PETSc.ScalarType))
+        
+        # Linear form: surface traction on load region (tag=1)
+        L = ufl.dot(T, v) * ds(1)
+        
+        # Boundary condition (fix X=0 plane) - same as harvest
         def left_boundary(x):
             return np.isclose(x[0], 0.0)
         

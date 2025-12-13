@@ -1,10 +1,15 @@
 """
 Reward Function Module for AlphaBuilder Self-Play MCTS.
 
-Implements the reward function specification that mirrors the training normalization.
-This ensures mathematical consistency between the Value Head predictions and MCTS rewards.
+Implements an additive reward formula:
+  R = compliance_score(C) + volume_bonus(V) - island_penalty
 
-Reference: MCTS Spec Section 7 (Reward Function Specification)
+Where:
+- Compliance score uses log10 mapping: C=10→0.80, C=1M→0.00
+- Volume is ALWAYS inversely proportional: lower V = higher reward
+- Island penalty is applied as before
+
+Reference: Updated reward specification (Dec 2024)
 """
 
 import numpy as np
@@ -12,14 +17,26 @@ from typing import Optional, Tuple, Dict, Any
 from scipy import ndimage
 
 # =============================================================================
-# Normalization Constants (Mirrored from Training)
+# New Formula Constants
 # =============================================================================
-# These MUST match the constants in alphabuilder/src/logic/harvest/config.py
 
-MU_SCORE = -6.65        # Mean of raw score distribution
-SIGMA_SCORE = 2.0       # Std dev for Tanh smoothing
-ALPHA_VOL = 12.0        # Volume penalty weight (20% more than compliance)
-EPSILON = 1e-9          # Numerical stability
+# Compliance scoring (log10 mapping)
+COMPLIANCE_BASE = 0.80       # Base score at C=10 (log10(10)=1)
+COMPLIANCE_SLOPE = 0.16      # Score decrease per log10 unit
+COMPLIANCE_MIN = -0.50       # Minimum compliance score (very bad structure)
+COMPLIANCE_MAX = 0.85        # Maximum compliance score (excellent structure)
+
+# Volume scoring (always inversely proportional)
+VOLUME_REFERENCE = 0.10      # Reference volume (V=0.10 gives no bonus/penalty)
+VOLUME_SENSITIVITY = 2.0     # Bonus/penalty per 0.1 volume change
+VOLUME_BONUS_MAX = 0.30      # Max bonus for very low V
+VOLUME_PENALTY_MAX = 0.60    # Max penalty for very high V
+
+# Legacy constants (kept for backward compatibility in estimate_reward_components)
+MU_SCORE = -6.65
+SIGMA_SCORE = 2.0
+ALPHA_VOL = 12.0
+EPSILON = 1e-9
 
 # Displacement limits for collapse detection
 DEFAULT_DISPLACEMENT_LIMIT = 10.0  # meters (very generous for small structures)
@@ -29,18 +46,57 @@ DEFAULT_DISPLACEMENT_LIMIT = 10.0  # meters (very generous for small structures)
 # Core Reward Functions
 # =============================================================================
 
-def calculate_raw_score(compliance: float, vol_frac: float) -> float:
+def calculate_compliance_score(compliance: float) -> float:
     """
-    Calculate the raw score before normalization.
+    Calculate the compliance component of the reward using log10 mapping.
     
-    S_raw = -ln(C + ε) - α·V_frac
+    Mapping:
+    - C=10 (log10=1) → 0.80
+    - C=1,000,000 (log10=6) → 0.00
     
     Args:
         compliance: Energy of deformation (Joules). Lower is better.
+        
+    Returns:
+        Compliance score in [COMPLIANCE_MIN, COMPLIANCE_MAX]
+    """
+    if compliance <= 0:
+        return COMPLIANCE_MAX
+    
+    log_c = np.log10(max(compliance, 1.0))
+    score = COMPLIANCE_BASE - COMPLIANCE_SLOPE * (log_c - 1.0)
+    
+    return float(np.clip(score, COMPLIANCE_MIN, COMPLIANCE_MAX))
+
+
+def calculate_volume_bonus(vol_frac: float) -> float:
+    """
+    Calculate the volume bonus/penalty.
+    
+    Volume is ALWAYS inversely proportional to reward:
+    - V < VOLUME_REFERENCE → positive bonus (lean structure)
+    - V > VOLUME_REFERENCE → negative penalty (heavy structure)
+    
+    Args:
         vol_frac: Volume fraction (0.0 to 1.0). Lower is better.
         
     Returns:
-        Raw score (higher is better after log inversion)
+        Volume adjustment in [-VOLUME_PENALTY_MAX, VOLUME_BONUS_MAX]
+    """
+    # Linear relationship: (reference - actual) * sensitivity
+    adjustment = (VOLUME_REFERENCE - vol_frac) * VOLUME_SENSITIVITY
+    
+    return float(np.clip(adjustment, -VOLUME_PENALTY_MAX, VOLUME_BONUS_MAX))
+
+
+def calculate_raw_score(compliance: float, vol_frac: float) -> float:
+    """
+    DEPRECATED: Legacy raw score calculation for backward compatibility.
+    
+    S_raw = -ln(C + ε) - α·V_frac
+    
+    Note: This function is kept for backward compatibility with 
+    estimate_reward_components. New code should use calculate_reward directly.
     """
     return -np.log(compliance + EPSILON) - ALPHA_VOL * vol_frac
 
@@ -53,12 +109,13 @@ def calculate_reward(
     displacement_limit: float = DEFAULT_DISPLACEMENT_LIMIT
 ) -> float:
     """
-    Calculate the normalized reward for MCTS.
+    Calculate the reward for MCTS using the additive formula.
     
-    R = tanh((S_raw - μ) / σ)
+    R = compliance_score(C) + volume_bonus(V)
     
-    This function mirrors the normalization used during training to ensure
-    the MCTS speaks the same language as the Value Head.
+    Where:
+    - compliance_score: log10 mapping from C=10→0.80 to C=1M→0.00
+    - volume_bonus: linear inverse relationship (lower V = higher bonus)
     
     Args:
         compliance: Energy of deformation (Joules)
@@ -68,10 +125,10 @@ def calculate_reward(
         displacement_limit: Threshold for collapse detection
         
     Returns:
-        Normalized reward in range [-1, 1]
+        Reward in range [-1, 1]
         - Returns -1.0 for catastrophic failures (collapse, disconnection)
-        - Returns 0.0 for average structures (raw_score ≈ μ)
-        - Returns positive for better structures
+        - Returns ~0.80 for excellent structures (C=10, V=0.10)
+        - Returns ~0.00 for poor structures (C=1M, V=0.10)
     """
     # 1. Hard constraint: structural validity
     if not is_valid:
@@ -81,13 +138,16 @@ def calculate_reward(
     if max_displacement is not None and max_displacement > displacement_limit:
         return -1.0
     
-    # 3. Calculate raw score
-    raw_score = calculate_raw_score(compliance, vol_frac)
+    # 3. Calculate compliance score (log10 mapping)
+    compliance_score = calculate_compliance_score(compliance)
     
-    # 4. Normalize with Tanh
-    normalized_reward = np.tanh((raw_score - MU_SCORE) / SIGMA_SCORE)
+    # 4. Calculate volume bonus (always inverse: lower V = higher bonus)
+    volume_bonus = calculate_volume_bonus(vol_frac)
     
-    return float(normalized_reward)
+    # 5. Combine and clamp to [-1, 1]
+    reward = compliance_score + volume_bonus
+    
+    return float(np.clip(reward, -1.0, 1.0))
 
 
 # =============================================================================

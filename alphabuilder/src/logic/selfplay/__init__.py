@@ -27,10 +27,18 @@ from .storage import (
 )
 
 from .reward import (
-    # Constants
+    # New formula constants
+    COMPLIANCE_BASE,
+    COMPLIANCE_SLOPE,
+    VOLUME_REFERENCE,
+    VOLUME_SENSITIVITY,
+    # Legacy constants (backward compatibility)
     MU_SCORE,
     SIGMA_SCORE,
     ALPHA_VOL,
+    # New helper functions
+    calculate_compliance_score,
+    calculate_volume_bonus,
     # Core functions
     calculate_raw_score,
     calculate_reward,

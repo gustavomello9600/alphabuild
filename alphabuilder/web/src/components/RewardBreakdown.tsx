@@ -9,6 +9,12 @@ interface RewardBreakdownProps {
 
 // Backend constants (matching src/logic/selfplay/reward.py)
 const CONSTANTS = {
+    // New formula constants
+    COMPLIANCE_BASE: 0.80,
+    COMPLIANCE_SLOPE: 0.16,
+    VOLUME_REFERENCE: 0.10,
+    VOLUME_SENSITIVITY: 2.0,
+    // Legacy constants (for display only)
     MU_SCORE: -6.65,
     SIGMA_SCORE: 2.0,
     ALPHA_VOL: 12.0,
@@ -142,14 +148,19 @@ export const RewardBreakdown: React.FC<RewardBreakdownProps> = ({ state, maxStep
     // lambda = t / T_max
     const lambda = maxSteps ? Math.min(1.0, currentStep / maxSteps) : 1.0;
 
-    // Calculate basics for transparent display
-    // S_raw = -ln(C + eps) - alpha * V
-    // S_fem = tanh((S_raw - mu) / sigma)
-    const raw_val = rc.fem_reward !== undefined ? (-Math.log(C + CONSTANTS.EPSILON) - CONSTANTS.ALPHA_VOL * V) : 0;
-    const s_fem = rc.fem_reward || 0;
+    // NEW FORMULA: compliance_score + volume_bonus
+    // compliance_score = 0.80 - 0.16 * (log10(C) - 1)
+    // volume_bonus = (0.10 - V) * 2.0
+    const log_c = Math.log10(Math.max(C, 1));
+    const compliance_score = Math.max(-0.5, Math.min(0.85, CONSTANTS.COMPLIANCE_BASE - CONSTANTS.COMPLIANCE_SLOPE * (log_c - 1)));
+    const volume_bonus = Math.max(-0.6, Math.min(0.3, (CONSTANTS.VOLUME_REFERENCE - V) * CONSTANTS.VOLUME_SENSITIVITY));
+    const physics_score = Math.max(-1, Math.min(1, compliance_score + volume_bonus));
+
+    // s_fem comes from backend (should match physics_score when valid)
+    const s_fem = rc.fem_reward || physics_score;
     const islandPenalty = rc.island_penalty || 0;
 
-    // Final Mixed Value Formula:
+    // Final Mixed Value Formula (unchanged):
     // V_guided = (1 - λ) * V_net + λ * S_FEM - Penalty
     const mixed_value = (1 - lambda) * valueHead + lambda * s_fem;
     const total_reward = Math.max(-1, Math.min(1, mixed_value - islandPenalty));
@@ -208,70 +219,73 @@ export const RewardBreakdown: React.FC<RewardBreakdownProps> = ({ state, maxStep
                 {/* Final */}
                 {renderMathBlock("Final Reward", "Clamp(Mixed - Penalty)", total_reward, true)}
 
-                            {/* Intermediate Calculations (Expandable) */}
-                            <div className="mt-2 border-t border-gray-700 pt-2">
-                                <button 
-                                    onClick={() => setExpanded(!expanded)}
-                                    className="w-full text-left text-[10px] text-gray-400 hover:text-gray-200 flex justify-between items-center focus:outline-none"
-                                >
-                                    <span className="font-bold">Intermediate Calculations</span>
-                                    <span>{expanded ? '▼' : '▶'}</span>
-                                </button>
-                                
-                                {expanded && (
-                                    <div className="mt-2 p-2 bg-black/40 rounded border border-gray-800 space-y-3 text-[10px] font-mono text-gray-300">
-                                        {/* 1. Raw Physics Score */}
-                                        <div>
-                                            <div className="text-gray-500 mb-0.5 font-bold">1. Raw Physics Score (S_raw)</div>
-                                            <div className="pl-2 border-l-2 border-gray-700 space-y-0.5">
-                                                <div className="text-gray-500">Formula: -ln(C + ε) - α·V</div>
-                                                <div>= -ln({C.toExponential(2)}) - {CONSTANTS.ALPHA_VOL}·{V.toFixed(3)}</div>
-                                                <div className="text-cyan-400 font-bold">= {raw_val.toFixed(4)}</div>
-                                            </div>
-                                        </div>
-                                        
-                                        {/* 2. Normalization */}
-                                        <div>
-                                            <div className="text-gray-500 mb-0.5 font-bold">2. Normalization (Z-Score)</div>
-                                            <div className="pl-2 border-l-2 border-gray-700 space-y-0.5">
-                                                <div className="text-gray-500">Formula: (S_raw - μ) / σ</div>
-                                                <div>= ({raw_val.toFixed(2)} - ({CONSTANTS.MU_SCORE})) / {CONSTANTS.SIGMA_SCORE}</div>
-                                                <div className="text-cyan-400 font-bold">= {((raw_val - CONSTANTS.MU_SCORE) / CONSTANTS.SIGMA_SCORE).toFixed(4)}</div>
-                                            </div>
-                                        </div>
-                        
-                                        {/* 3. Tanh Activation */}
-                                        <div>
-                                            <div className="text-gray-500 mb-0.5 font-bold">3. Tanh Activation (S_FEM)</div>
-                                            <div className="pl-2 border-l-2 border-gray-700 space-y-0.5">
-                                                <div className="text-gray-500">Formula: tanh(Z_score)</div>
-                                                <div className="text-cyan-400 font-bold">= {s_fem.toFixed(4)}</div>
-                                            </div>
-                                        </div>
-                                        
-                                        {/* 4. Mixing */}
-                                        <div>
-                                            <div className="text-gray-500 mb-0.5 font-bold">4. Mixing (λ={lambda.toFixed(2)})</div>
-                                            <div className="pl-2 border-l-2 border-gray-700 space-y-0.5">
-                                                    <div className="text-gray-500">Formula: (1-λ)·V_net + λ·S_FEM</div>
-                                                    <div>= {(1-lambda).toFixed(2)}·({valueHead.toFixed(2)}) + {lambda.toFixed(2)}·({s_fem.toFixed(2)})</div>
-                                                    <div className="text-cyan-400 font-bold">= {mixed_value.toFixed(4)}</div>
-                                            </div>
-                                        </div>
-                                        
-                                            {/* 5. Clamping */}
-                                            <div>
-                                            <div className="text-gray-500 mb-0.5 font-bold">5. Penalties & Clamping</div>
-                                            <div className="pl-2 border-l-2 border-gray-700 space-y-0.5">
-                                                    <div>Unclamped = {mixed_value.toFixed(4)} - {islandPenalty.toFixed(4)} = {(mixed_value - islandPenalty).toFixed(4)}</div>
-                                                    <div className={total_reward !== (mixed_value - islandPenalty) ? "text-yellow-400 font-bold" : "text-green-400"}>
-                                                    Final = {total_reward.toFixed(4)} {total_reward !== (mixed_value - islandPenalty) ? '(CLAMPED)' : ''}
-                                                    </div>
-                                            </div>
-                                        </div>
+                {/* Intermediate Calculations (Expandable) */}
+                <div className="mt-2 border-t border-gray-700 pt-2">
+                    <button
+                        onClick={() => setExpanded(!expanded)}
+                        className="w-full text-left text-[10px] text-gray-400 hover:text-gray-200 flex justify-between items-center focus:outline-none"
+                    >
+                        <span className="font-bold">Intermediate Calculations</span>
+                        <span>{expanded ? '▼' : '▶'}</span>
+                    </button>
+
+                    {expanded && (
+                        <div className="mt-2 p-2 bg-black/40 rounded border border-gray-800 space-y-3 text-[10px] font-mono text-gray-300">
+                            {/* 1. Compliance Score */}
+                            <div>
+                                <div className="text-gray-500 mb-0.5 font-bold">1. Compliance Score</div>
+                                <div className="pl-2 border-l-2 border-gray-700 space-y-0.5">
+                                    <div className="text-gray-500">Formula: 0.80 - 0.16 × (log₁₀(C) - 1)</div>
+                                    <div>= 0.80 - 0.16 × ({log_c.toFixed(2)} - 1)</div>
+                                    <div className="text-cyan-400 font-bold">= {compliance_score.toFixed(4)}</div>
+                                </div>
+                            </div>
+
+                            {/* 2. Volume Bonus */}
+                            <div>
+                                <div className="text-gray-500 mb-0.5 font-bold">2. Volume Bonus (V=0.10 is neutral)</div>
+                                <div className="pl-2 border-l-2 border-gray-700 space-y-0.5">
+                                    <div className="text-gray-500">Formula: (0.10 - V) × 2.0</div>
+                                    <div>= (0.10 - {V.toFixed(3)}) × 2.0</div>
+                                    <div className={`font-bold ${volume_bonus >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                        = {volume_bonus > 0 ? '+' : ''}{volume_bonus.toFixed(4)} {volume_bonus > 0 ? '(bonus)' : volume_bonus < 0 ? '(penalty)' : '(neutral)'}
                                     </div>
-                                )}
-                            </div>            </div>
+                                </div>
+                            </div>
+
+                            {/* 3. Physics Score */}
+                            <div>
+                                <div className="text-gray-500 mb-0.5 font-bold">3. Physics Score (S_FEM)</div>
+                                <div className="pl-2 border-l-2 border-gray-700 space-y-0.5">
+                                    <div className="text-gray-500">Formula: Compliance + Volume Bonus</div>
+                                    <div>= {compliance_score.toFixed(4)} + ({volume_bonus.toFixed(4)})</div>
+                                    <div className="text-cyan-400 font-bold">= {physics_score.toFixed(4)}</div>
+                                </div>
+                            </div>
+
+                            {/* 4. Mixing */}
+                            <div>
+                                <div className="text-gray-500 mb-0.5 font-bold">4. Mixing (λ={lambda.toFixed(2)})</div>
+                                <div className="pl-2 border-l-2 border-gray-700 space-y-0.5">
+                                    <div className="text-gray-500">Formula: (1-λ)·V_net + λ·S_FEM</div>
+                                    <div>= {(1 - lambda).toFixed(2)}·({valueHead.toFixed(2)}) + {lambda.toFixed(2)}·({s_fem.toFixed(2)})</div>
+                                    <div className="text-cyan-400 font-bold">= {mixed_value.toFixed(4)}</div>
+                                </div>
+                            </div>
+
+                            {/* 5. Clamping */}
+                            <div>
+                                <div className="text-gray-500 mb-0.5 font-bold">5. Penalties & Clamping</div>
+                                <div className="pl-2 border-l-2 border-gray-700 space-y-0.5">
+                                    <div>Unclamped = {mixed_value.toFixed(4)} - {islandPenalty.toFixed(4)} = {(mixed_value - islandPenalty).toFixed(4)}</div>
+                                    <div className={total_reward !== (mixed_value - islandPenalty) ? "text-yellow-400 font-bold" : "text-green-400"}>
+                                        Final = {total_reward.toFixed(4)} {total_reward !== (mixed_value - islandPenalty) ? '(CLAMPED)' : ''}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>            </div>
 
             {/* Validity Warning - Only override if truly disconnected/invalid */}
             {/* Logic: validity_penalty is -1 if disconnected. But sometimes it might be -1 artifact? */}

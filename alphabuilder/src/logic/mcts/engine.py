@@ -52,12 +52,13 @@ PHASE1_CONFIG = MCTSConfig(
 )
 
 # Standard Config for Phase 2 (Refinement)
+# Uses same micro-batch size (32 actions) and max_depth (4) as Phase 1
 PHASE2_CONFIG = MCTSConfig(
     num_simulations=160,
     c_puct=0.8,
     batch_size=8,
-    action_batch_size=8,
-    top_k_expansion=3, # More focused search
+    action_batch_size=32,
+    top_k_expansion=32,  # Must be >= action_batch_size to allow full PV extraction
     min_volume_fraction=0.05,
     max_volume_fraction=0.9,
     phase="REFINEMENT"
