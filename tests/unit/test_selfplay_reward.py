@@ -82,6 +82,9 @@ class TestIslandAnalysis:
         # Create a bar connecting support (x=0) to load (assume load at x=4)
         density[:, 2, 2] = 1.0 
         
+        # Fill the load pad area (3x3 at x=4) to satisfy strict check
+        density[4, 1:4, 1:4] = 1.0
+        
         load_config = {'x': 4, 'y': 2, 'z_start': 0, 'z_end': 5}
         
         analysis = analyze_structure_islands(density, load_config)
@@ -94,13 +97,15 @@ class TestIslandAnalysis:
         """Test disconnected structure."""
         density = np.zeros((5, 5, 5))
         density[0, 2, 2] = 1.0 # Support
-        density[4, 2, 2] = 1.0 # Load
-        # Missing middle
+        
+        # Load pad filled (so we fail on disconnect, not on empty load)
+        density[4, 1:4, 1:4] = 1.0 
         
         load_config = {'x': 4, 'y': 2, 'z_start': 0, 'z_end': 5}
         
         analysis = analyze_structure_islands(density, load_config)
         
+        # Load pad is one component (size 9). Support is another (size 1).
         assert analysis['n_islands'] == 2
         assert analysis['is_connected'] == False
         assert analysis['loose_voxels'] > 0

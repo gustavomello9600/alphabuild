@@ -58,28 +58,8 @@ const CHANNEL = {
     FORCE_Z: 6,
 };
 
-// MCTS Wireframe component for a single voxel
-const MCTSWireframe = ({
-    position,
-    intensity,
-    isAdd
-}: {
-    position: THREE.Vector3;
-    intensity: number;
-    isAdd: boolean;
-}) => {
-    // Color interpolation: gray at 0, green/red at 1
-    const baseColor = isAdd ? new THREE.Color('#00FF9D') : new THREE.Color('#FF0055');
-    const grayColor = new THREE.Color('#666666');
-    const color = grayColor.clone().lerp(baseColor, intensity);
 
-    return (
-        <lineSegments position={position}>
-            <edgesGeometry args={[new THREE.BoxGeometry(0.95, 0.95, 0.95)]} />
-            <lineBasicMaterial color={color} linewidth={2} />
-        </lineSegments>
-    );
-};
+
 
 const VoxelGridMCTS = ({
     step,
@@ -90,13 +70,11 @@ const VoxelGridMCTS = ({
 }) => {
     const opaqueRef = useRef<THREE.InstancedMesh>(null);
     const overlayRef = useRef<THREE.InstancedMesh>(null);
+    const wireframeRef = useRef<THREE.InstancedMesh>(null);
     const opacityAttrRef = useRef<THREE.InstancedBufferAttribute | null>(null);
     const dummy = useMemo(() => new THREE.Object3D(), []);
 
-    // Use state for wireframes to ensure render sync
-    const [wireframes, setWireframes] = useState<Array<{ pos: THREE.Vector3, intensity: number, isAdd: boolean }>>([]);
-
-    // Shader for per-instance opacity
+    // Initial Shader setup for opacity
     useEffect(() => {
         if (!overlayRef.current) return;
         const material = overlayRef.current.material as THREE.MeshStandardMaterial;
@@ -122,175 +100,156 @@ const VoxelGridMCTS = ({
         material.needsUpdate = true;
     }, []);
 
+    // Update Instances when step changes
     useEffect(() => {
         if (!opaqueRef.current || !overlayRef.current || !step) return;
 
-        const [C, D, H, W] = step.tensor.shape;
-        const spatialSize = D * H * W;
-        const tensorData = step.tensor.data;
+        // Check if visuals exist
+        if (step.visuals && step.visuals.opaqueMatrix) {
+            const { opaqueMatrix, opaqueColor, overlayMatrix, overlayColor, mctsMatrix, mctsColor } = step.visuals;
 
-        let opaqueCount = 0;
-        let overlayCount = 0;
-        const newWireframes: Array<{ pos: THREE.Vector3, intensity: number, isAdd: boolean }> = [];
+            // 1. OPAQUE
+            const opaqueCount = opaqueMatrix.length / 16;
+            opaqueRef.current.count = opaqueCount;
+            if (opaqueCount > 0) {
+                if (!opaqueRef.current.instanceColor || opaqueRef.current.instanceColor.count !== 20000) {
+                    opaqueRef.current.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(20000 * 3), 3);
+                }
+                opaqueRef.current.instanceMatrix.array.set(opaqueMatrix);
+                opaqueRef.current.instanceMatrix.needsUpdate = true;
+                opaqueRef.current.instanceColor.array.set(opaqueColor);
+                opaqueRef.current.instanceColor.needsUpdate = true;
+            }
 
-        // Initialize opacity buffer
-        const maxInstances = 20000;
-        if (!opacityAttrRef.current) {
-            const arr = new Float32Array(maxInstances).fill(1.0);
-            opacityAttrRef.current = new THREE.InstancedBufferAttribute(arr, 1);
-            opacityAttrRef.current.setUsage(THREE.DynamicDrawUsage);
-            overlayRef.current.geometry.setAttribute('instanceOpacity', opacityAttrRef.current);
-        }
-
-        // Normalize MCTS visits for visualization
-        const maxVisitAdd = Math.max(...Array.from(step.mcts.visit_add), 1);
-        const maxVisitRem = Math.max(...Array.from(step.mcts.visit_remove), 1);
-
-        // Pre-process selected actions for fast lookup
-        // Map "x,y,z" -> Action
-        const selectedActionMap = new Map<string, typeof step.selected_actions[0]>();
-        if (viewMode === 'decision') {
-            step.selected_actions.forEach(a => {
-                selectedActionMap.set(`${a.x},${a.y},${a.z}`, a);
-            });
-        }
-
-        for (let d = 0; d < D; d++) {
-            for (let h = 0; h < H; h++) {
-                for (let w = 0; w < W; w++) {
-                    const idx = d * (H * W) + h * W + w;
-                    // Density is channel 0
-                    const density = tensorData[idx];
-                    const pos = new THREE.Vector3(d - D / 2, h + 0.5, w - W / 2);
-
-                    // Check for load (force channels)
-                    let hasLoad = false;
-                    if (C >= 7) {
-                        const fx = tensorData[CHANNEL.FORCE_X * spatialSize + idx];
-                        const fy = tensorData[CHANNEL.FORCE_Y * spatialSize + idx];
-                        const fz = tensorData[CHANNEL.FORCE_Z * spatialSize + idx];
-                        hasLoad = Math.abs(fx) > 0.01 || Math.abs(fy) > 0.01 || Math.abs(fz) > 0.01;
-                    }
-
-                    // Base structure (always render solid voxels + load voxels)
-                    const isVisible = density > 0.5 || hasLoad;
-                    if (isVisible) {
-                        dummy.position.copy(pos);
-                        dummy.updateMatrix();
-                        opaqueRef.current.setMatrixAt(opaqueCount, dummy.matrix);
-
-                        if (hasLoad) {
-                            // Load voxels in magenta/orange
-                            opaqueRef.current.setColorAt(opaqueCount, new THREE.Color('#FF6B00'));
-                        } else {
-                            // Gray color for structure
-                            const gray = Math.max(0.2, density);
-                            opaqueRef.current.setColorAt(opaqueCount, new THREE.Color().setHSL(0, 0, gray * 0.95));
+            // 2. OVERLAY
+            const showOverlay = viewMode === 'policy' || viewMode === 'combined' || viewMode === 'decision';
+            if (showOverlay) {
+                if (viewMode === 'decision') {
+                    // DECISION (Local)
+                    const actions = step.selected_actions || [];
+                    const dCount = actions.length;
+                    overlayRef.current.count = dCount;
+                    if (dCount > 0) {
+                        const mat = overlayRef.current.instanceMatrix.array as Float32Array;
+                        if (!overlayRef.current.instanceColor || overlayRef.current.instanceColor.count !== 20000) {
+                            overlayRef.current.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(20000 * 3), 3);
                         }
-                        opaqueCount++;
-                    }
+                        const col = overlayRef.current.instanceColor.array as Float32Array;
 
-                    // Process based on view mode
-                    if (viewMode === 'structure') continue;
-
-                    const policyAdd = step.policy.add[idx];
-                    const policyRem = step.policy.remove[idx];
-                    const mctsAdd = step.mcts.visit_add[idx] / maxVisitAdd;
-                    const mctsRem = step.mcts.visit_remove[idx] / maxVisitRem;
-
-                    // MCTS modes use wireframe
-                    if (viewMode === 'mcts' || viewMode === 'combined') {
-                        // MCTS Add wireframe (green) - only on empty spaces
-                        if (mctsAdd > 0.01 && density <= 0.5) {
-                            newWireframes.push({ pos: pos.clone(), intensity: mctsAdd, isAdd: true });
+                        if (!opacityAttrRef.current) {
+                            const arr = new Float32Array(20000).fill(1.0);
+                            opacityAttrRef.current = new THREE.InstancedBufferAttribute(arr, 1);
+                            overlayRef.current.geometry.setAttribute('instanceOpacity', opacityAttrRef.current);
                         }
-                        // MCTS Remove wireframe (red) - only on filled spaces
-                        if (mctsRem > 0.01 && density > 0.5) {
-                            newWireframes.push({ pos: pos.clone(), intensity: mctsRem, isAdd: false });
-                        }
-                    }
+                        const opa = opacityAttrRef.current.array as Float32Array;
 
-                    // Policy overlay (filled cubes with transparency)
-                    if (viewMode === 'policy' || viewMode === 'combined') {
-                        if (policyAdd > 0.01 && density <= 0.5) {
-                            dummy.position.copy(pos);
+                        const [C, D, H, W] = step.tensor.shape;
+
+                        actions.forEach((a, i) => {
+                            const x = a.x - D / 2;
+                            const y = a.y + 0.5;
+                            const z = a.z - W / 2;
+
+                            dummy.position.set(x, y, z);
                             dummy.updateMatrix();
-                            overlayRef.current!.setMatrixAt(overlayCount, dummy.matrix);
-                            overlayRef.current!.setColorAt(overlayCount, new THREE.Color('#00FF9D'));
-                            if (opacityAttrRef.current) {
-                                opacityAttrRef.current.setX(overlayCount, Math.min(1, policyAdd * 2));
-                            }
-                            overlayCount++;
-                        } else if (policyRem > 0.01 && density > 0.5) {
-                            dummy.position.copy(pos);
-                            dummy.updateMatrix();
-                            overlayRef.current!.setMatrixAt(overlayCount, dummy.matrix);
-                            overlayRef.current!.setColorAt(overlayCount, new THREE.Color('#FF0055'));
-                            if (opacityAttrRef.current) {
-                                opacityAttrRef.current.setX(overlayCount, Math.min(1, policyRem * 2));
-                            }
-                            overlayCount++;
-                        }
-                    }
+                            dummy.matrix.toArray(mat, i * 16);
 
-                    // Decision mode (selected actions)
-                    if (viewMode === 'decision') {
-                        const key = `${d},${h},${w}`;
-                        if (selectedActionMap.has(key)) {
-                            const action = selectedActionMap.get(key)!;
-                            dummy.position.copy(pos);
-                            dummy.updateMatrix();
-                            overlayRef.current!.setMatrixAt(overlayCount, dummy.matrix);
-                            overlayRef.current!.setColorAt(
-                                overlayCount,
-                                new THREE.Color(action.channel === 0 ? '#00FF9D' : '#FF0055')
-                            );
-                            if (opacityAttrRef.current) {
-                                opacityAttrRef.current.setX(overlayCount, 0.9);
+                            if (a.channel === 0) {
+                                col[i * 3] = 0.0; col[i * 3 + 1] = 1.0; col[i * 3 + 2] = 0.61;
+                            } else {
+                                col[i * 3] = 1.0; col[i * 3 + 1] = 0.0; col[i * 3 + 2] = 0.33;
                             }
-                            overlayCount++;
+                            opa[i] = 1.0;
+                        });
+                        overlayRef.current.instanceMatrix.needsUpdate = true;
+                        overlayRef.current.instanceColor.needsUpdate = true;
+                        opacityAttrRef.current.needsUpdate = true;
+                    }
+                } else {
+                    // POLICY (Worker)
+                    const overlayCount = overlayMatrix.length / 16;
+                    overlayRef.current.count = overlayCount;
+                    if (overlayCount > 0) {
+                        overlayRef.current.instanceMatrix.array.set(overlayMatrix);
+                        overlayRef.current.instanceMatrix.needsUpdate = true;
+
+                        if (!overlayRef.current.instanceColor || overlayRef.current.instanceColor.count !== 20000) {
+                            overlayRef.current.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(20000 * 3), 3);
                         }
+                        if (!opacityAttrRef.current) {
+                            const arr = new Float32Array(20000).fill(1.0);
+                            opacityAttrRef.current = new THREE.InstancedBufferAttribute(arr, 1);
+                            overlayRef.current.geometry.setAttribute('instanceOpacity', opacityAttrRef.current);
+                        }
+
+                        const rgb = overlayRef.current.instanceColor.array as Float32Array;
+                        const alpha = opacityAttrRef.current.array as Float32Array;
+
+                        for (let i = 0; i < overlayCount; i++) {
+                            rgb[i * 3] = overlayColor[i * 4];
+                            rgb[i * 3 + 1] = overlayColor[i * 4 + 1];
+                            rgb[i * 3 + 2] = overlayColor[i * 4 + 2];
+                            alpha[i] = overlayColor[i * 4 + 3];
+                        }
+                        overlayRef.current.instanceColor.needsUpdate = true;
+                        opacityAttrRef.current.needsUpdate = true;
                     }
                 }
+            } else {
+                overlayRef.current.count = 0;
+            }
+
+            // 3. MCTS
+            if ((viewMode === 'mcts' || viewMode === 'combined') && wireframeRef.current) {
+                if (mctsMatrix && mctsColor) {
+                    const count = mctsMatrix.length / 16;
+                    wireframeRef.current.count = count;
+                    if (count > 0) {
+                        if (!wireframeRef.current.instanceColor || wireframeRef.current.instanceColor.count !== 10000) {
+                            wireframeRef.current.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(10000 * 3), 3);
+                        }
+                        wireframeRef.current.instanceMatrix.array.set(mctsMatrix);
+                        wireframeRef.current.instanceMatrix.needsUpdate = true;
+                        wireframeRef.current.instanceColor.array.set(mctsColor);
+                        wireframeRef.current.instanceColor.needsUpdate = true;
+                    }
+                } else {
+                    wireframeRef.current.count = 0;
+                }
+            } else if (wireframeRef.current) {
+                wireframeRef.current.count = 0;
             }
         }
-
-        // Update meshes
-        opaqueRef.current.count = opaqueCount;
-        opaqueRef.current.instanceMatrix.needsUpdate = true;
-        if (opaqueRef.current.instanceColor) opaqueRef.current.instanceColor.needsUpdate = true;
-
-        overlayRef.current.count = overlayCount;
-        overlayRef.current.instanceMatrix.needsUpdate = true;
-        if (overlayRef.current.instanceColor) overlayRef.current.instanceColor.needsUpdate = true;
-        if (opacityAttrRef.current) opacityAttrRef.current.needsUpdate = true;
-
-        // Update wireframes state
-        setWireframes(newWireframes);
     }, [step, viewMode]);
 
     return (
         <group>
+            {/* Opaque Structure */}
             <instancedMesh ref={opaqueRef} args={[undefined, undefined, 20000]}>
                 <boxGeometry args={[0.9, 0.9, 0.9]} />
-                <meshStandardMaterial roughness={0.2} metalness={0.8} />
+                <meshStandardMaterial roughness={0.5} metalness={0.5} emissive="#222222" />
             </instancedMesh>
-            <instancedMesh ref={overlayRef} args={[undefined, undefined, 10000]}>
+
+            {/* Policy Overlay */}
+            <instancedMesh ref={overlayRef} args={[undefined, undefined, 20000]}>
                 <boxGeometry args={[0.92, 0.92, 0.92]} />
                 <meshStandardMaterial
                     roughness={0.3}
-                    metalness={0.5}
+                    metalness={0.2}
                     transparent={true}
                     depthWrite={false}
                 />
             </instancedMesh>
+
             {/* MCTS Wireframes */}
-            {wireframes.map((wf: { pos: THREE.Vector3, intensity: number, isAdd: boolean }, i: number) => (
-                <MCTSWireframe key={i} position={wf.pos} intensity={wf.intensity} isAdd={wf.isAdd} />
-            ))}
+            <instancedMesh ref={wireframeRef} args={[undefined, undefined, 10000]}>
+                <boxGeometry args={[0.95, 0.95, 0.95]} />
+                <meshBasicMaterial wireframe color="white" transparent opacity={0.5} />
+            </instancedMesh>
         </group>
     );
 };
+
 
 // Support colors helper
 const SUPPORT_COLORS = {

@@ -9,7 +9,7 @@ import json
 from alphabuilder.src.logic.selfplay.storage import (
     initialize_selfplay_db,
     save_game,
-    save_game_step,
+    record_step,
     load_game,
     load_all_game_steps,
     list_games,
@@ -19,6 +19,8 @@ from alphabuilder.src.logic.selfplay.storage import (
     SelectedAction,
     MCTSStats
 )
+from typing import Dict, List, Any
+from dataclasses import dataclass
 
 @pytest.fixture
 def temp_db():
@@ -73,34 +75,54 @@ class TestSelfPlayStorage:
             resolution=resolution
         ))
         
-        step = GameStep(
+        # Mock State
+        @dataclass
+        class MockState:
+            game_id: str
+            current_step: int
+            phase: Phase
+            density: np.ndarray
+        
+        state = MockState(
             game_id=game_id,
-            step=1,
+            current_step=1,
             phase=Phase.GROWTH,
-            density=np.zeros(resolution),
+            density=np.zeros(resolution)
+        )
+        
+        # Mock Result
+        @dataclass
+        class MockResult:
+            visit_distribution: Dict
+            actions: List
+            num_simulations: int
+            root: Any = None
+            
+        result = MockResult(
+            visit_distribution={(0, 1, 1, 1): 10},
+            actions=[(0, 1, 1, 1)],
+            num_simulations=100
+        )
+        
+        # Call record_step
+        record_step(
+            db_path=temp_db,
+            state=state,
+            result=result,
+            value=0.7,
             policy_add=np.zeros(resolution),
             policy_remove=np.zeros(resolution),
-            mcts_visit_add=np.zeros(resolution),
-            mcts_visit_remove=np.zeros(resolution),
-            mcts_q_add=np.zeros(resolution),
-            mcts_q_remove=np.zeros(resolution),
-            selected_actions=[
-                SelectedAction(0, 1, 1, 1, 10, 0.5)
-            ],
-            value=0.7,
-            mcts_stats=MCTSStats(100, 100, 5, 0, 0.5, False),
-            
-            # New fields to verify
-            n_islands=2,
-            loose_voxels=5,
-            is_connected=False,
+            island_analysis={
+                'n_islands': 2,
+                'loose_voxels': 5,
+                'is_connected': False
+            },
             compliance_fem=123.45,
             max_displacement=10.0,
             island_penalty=0.1,
-            volume_fraction=0.25
+            volume_fraction=0.25,
+            executed_actions=[(0, 1, 1, 1)] # Simulate PV sequence
         )
-        
-        save_game_step(temp_db, step)
         
         loaded_steps = load_all_game_steps(temp_db, game_id, resolution)
         assert len(loaded_steps) == 1
@@ -115,6 +137,10 @@ class TestSelfPlayStorage:
         assert loaded.island_penalty == pytest.approx(0.1)
         assert loaded.volume_fraction == pytest.approx(0.25)
         
+        # Check visits from visit_distribution or executed_actions
+        # record_step logic: if executed_actions provided, it records them.
+        # But visit count logic tries to find them in tree or uses visit_dist fallback.
+        # Our mock visit_dist has counts.
         assert loaded.selected_actions[0].visits == 10
 
     def test_list_games(self, temp_db):

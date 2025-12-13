@@ -31,6 +31,7 @@ from alphabuilder.src.logic.selfplay.storage import initialize_selfplay_db
 from alphabuilder.src.neural.inference import AlphaBuilderInference
 from alphabuilder.src.logic.selfplay.runner import (
     run_episode,
+    resume_episode,
     EpisodeConfig
 )
 
@@ -42,7 +43,8 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pt")
     parser.add_argument("--resolution", type=str, default="64x32x8")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
-    parser.add_argument("--device", type=str, default="auto", help="Device: auto, xpu, cuda, cpu")
+    parser.add_argument("--device", type=str, default="auto", help="Device: auto, xpu, cuda, cpu, npu")
+    parser.add_argument("--resume", type=str, default=None, help="Resume game by ID")
     return parser.parse_args()
 
 
@@ -74,15 +76,26 @@ def main():
     
     # Run episodes
     results = []
-    for i in range(args.episodes):
+    
+    # Resume mode
+    if args.resume:
         print(f"\n\n{'#'*60}")
-        print(f"# Episode {i+1}/{args.episodes}")
+        print(f"# Resuming Episode: {args.resume}")
         print(f"{'#'*60}")
         
-        game_id, score, steps = run_episode(model, db_path, config)
+        game_id, score, steps = resume_episode(model, db_path, args.resume, config)
         results.append((game_id, score, steps))
-        
-        gc.collect()
+    else:
+        # New episodes
+        for i in range(args.episodes):
+            print(f"\n\n{'#'*60}")
+            print(f"# Episode {i+1}/{args.episodes}")
+            print(f"{'#'*60}")
+            
+            game_id, score, steps = run_episode(model, db_path, config)
+            results.append((game_id, score, steps))
+            
+            gc.collect()
     
     # Summary
     print(f"\n\n{'='*60}")

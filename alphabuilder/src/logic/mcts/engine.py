@@ -25,12 +25,11 @@ class MCTSConfig(NamedTuple):
     """Configuration for MCTS search."""
     num_simulations: int = 80
     batch_size: int = 8
+    action_batch_size: int = 1 # Number of actions to execute/return
     c_puct: float = 1.25
     density_threshold: float = 0.5
     top_k_expansion: Optional[int] = None  # None = expand all valid
     min_prior_threshold: float = 1e-6
-    max_volume_fraction: float = 0.3
-    min_volume_fraction: float = 0.01
     max_volume_fraction: float = 0.3
     min_volume_fraction: float = 0.01
     phase: str = "REFINEMENT"  # "GROWTH" or "REFINEMENT"
@@ -40,21 +39,27 @@ class MCTSConfig(NamedTuple):
 
 
 # Phase-specific configuration presets (from MCTS Spec Section 8)
-# NOTE: Reduced simulations for faster iteration on local hardware
+# Optimization: batch_size=8 matches GPU sweet spot
 PHASE1_CONFIG = MCTSConfig(
-    num_simulations=120,   # Increased for robust PV selection
-    batch_size=32,
-    c_puct=1.5,
-    top_k_expansion=32,     # Limit branching to allow depth > 2
-    min_volume_fraction=0.0, # Allow starting from empty grid
+    num_simulations=160, # Increased sims to leverage higher throughput
+    c_puct=1.2,
+    batch_size=8,
+    action_batch_size=32,
+    top_k_expansion=32,  # Must be >= action_batch_size to allow full PV extraction
+    min_volume_fraction=0.05,
+    max_volume_fraction=0.9,
     phase="GROWTH"
 )
 
+# Standard Config for Phase 2 (Refinement)
 PHASE2_CONFIG = MCTSConfig(
-    num_simulations=80,
+    num_simulations=160,
+    c_puct=0.8,
     batch_size=8,
-    c_puct=1.25,
-    top_k_expansion=8,      # Focused search (sims/8 = 10 visits/node -> reasonable depth)
+    action_batch_size=8,
+    top_k_expansion=3, # More focused search
+    min_volume_fraction=0.05,
+    max_volume_fraction=0.9,
     phase="REFINEMENT"
 )
 
@@ -365,7 +370,8 @@ def run_mcts_search(
     predict_fn: Callable[[np.ndarray], Tuple[float, np.ndarray, np.ndarray]],
     config: MCTSConfig = MCTSConfig(),
     root_node: Optional[MCTSNode] = None,
-    eval_cache: Optional[Dict[str, Tuple[float, np.ndarray, np.ndarray]]] = None
+    eval_cache: Optional[Dict[str, Tuple[float, np.ndarray, np.ndarray]]] = None,
+    predict_batch_fn: Optional[Callable[[List[np.ndarray]], Tuple[List[float], List[np.ndarray], List[np.ndarray]]]] = None
 ) -> SearchResult:
     """
     Run MCTS search from given root state.
@@ -435,53 +441,171 @@ def run_mcts_search(
 
     
     # Simulation loop
-    for sim in range(config.num_simulations):
-        # 1. Selection
-        leaf, path = select_leaf(root, config.c_puct)
+    if predict_batch_fn is not None and config.batch_size > 1:
+        # Batch MCTS
+        num_batches = (config.num_simulations + config.batch_size - 1) // config.batch_size
         
-        # Compute leaf state by applying actions from root
-        actions = leaf.actions_from_root()
-        leaf_density = apply_actions(root_density, actions)
-        
-        # 2. Check terminal
-        is_terminal, reason = is_terminal_state(
-            leaf_density,
-            max_volume_fraction=config.max_volume_fraction,
-            min_volume_fraction=config.min_volume_fraction,
-            threshold=config.density_threshold,
-            bc_masks=bc_masks
-        )
-        
-        if is_terminal:
-            # Terminal value based on reason
-            if reason == "max_volume_exceeded":
-                value = -0.5  # Penalty but not catastrophic
-            elif reason == "structure_too_small":
-                value = -1.0  # Catastrophic failure
-            else:
-                value = 0.0  # Neutral terminal
-        else:
-            # 3. Expansion & Evaluation
-            leaf_state = build_state_tensor(leaf_density, bc_masks, forces)
-            state_hash = compute_state_hash(leaf_density)
+        for _ in range(num_batches):
+            # 1. Selection Phase (Parallel-ish)
+            batch_leaves = []
+            batch_paths = []
+            batch_states = []
+            batch_state_hashes = []
+            batch_indices = [] # Indices in the inference batch
             
-            # Check cache
-            if state_hash in eval_cache:
-                value, policy_add, policy_remove = eval_cache[state_hash]
-            else:
-                value, policy_add, policy_remove = predict_fn(leaf_state)
-                eval_cache[state_hash] = (value, policy_add, policy_remove)
+            # Temporary list to hold items that don't need inference (terminal/cached)
+            ready_to_backup = [] # List of (path, value)
             
-            # Get legal moves for leaf
-            valid_add, valid_remove = get_legal_moves(
-                leaf_density, config.density_threshold, bc_masks=bc_masks
+            current_batch_size = 0
+            
+            # Select B leaves with Virtual Loss
+            for __ in range(config.batch_size):
+                leaf, path = select_leaf(root, config.c_puct)
+                
+                # Apply Virtual Loss immediately to discourage re-selection
+                for node in path:
+                    node.apply_virtual_loss()
+                
+                # Compute leaf state
+                actions = leaf.actions_from_root()
+                leaf_density = apply_actions(root_density, actions)
+                
+                # Check terminal
+                is_terminal, reason = is_terminal_state(
+                    leaf_density,
+                    max_volume_fraction=config.max_volume_fraction,
+                    min_volume_fraction=config.min_volume_fraction,
+                    threshold=config.density_threshold,
+                    bc_masks=bc_masks
+                )
+                
+                if is_terminal:
+                    if reason == "max_volume_exceeded":
+                        value = -0.5
+                    elif reason == "structure_too_small":
+                        value = -1.0
+                    else:
+                        value = 0.0
+                    # Will backup after loop
+                    ready_to_backup.append((path, value))
+                    continue
+                
+                # Evaluation Prep
+                state_hash = compute_state_hash(leaf_density)
+                if state_hash in eval_cache:
+                    value, p_add, p_remove = eval_cache[state_hash]
+                    
+                    # Already evaluated, verify expansion
+                    leaf_state = build_state_tensor(leaf_density, bc_masks, forces) # Need this? Maybe not if cached.
+                    # But we need valid moves if not expanded.
+                    # If in cache, it might still need expansion if we just cached the prediction?
+                    # `eval_cache` stores prediction results.
+                    # If node is new instance (not expanded), we need to expand it.
+                    
+                    valid_add, valid_remove = get_legal_moves(
+                        leaf_density, config.density_threshold, bc_masks=bc_masks
+                    )
+                    expand_node(leaf, p_add, p_remove, valid_add, valid_remove, config)
+                    
+                    ready_to_backup.append((path, value))
+                else:
+                    # Needs inference
+                    leaf_state = build_state_tensor(leaf_density, bc_masks, forces)
+                    
+                    batch_leaves.append(leaf)
+                    batch_paths.append(path)
+                    batch_states.append(leaf_state)
+                    batch_state_hashes.append(state_hash)
+                    
+            # 2. Inference Phase
+            if batch_states:
+                values, pols_add, pols_remove = predict_batch_fn(batch_states)
+                
+                # 3. Expansion & Backup Phase
+                for i, (val, p_a, p_r) in enumerate(zip(values, pols_add, pols_remove)):
+                    leaf = batch_leaves[i]
+                    path = batch_paths[i]
+                    sha = batch_state_hashes[i]
+                    
+                    # Cache
+                    eval_cache[sha] = (val, p_a, p_r)
+                    
+                    # Reconstruct density for valid moves (expensive? optimized in get_legal_moves?)
+                    # We didn't store density to save memory/complexity, need to re-derive or store in temp list
+                    # Storing 4-8 density arrays is fine.
+                    # Let's re-optimize: store density in the selection loop?
+                    # Yes, minimal overhead for small batch.
+                    # But for now, re-computing actions is safer than passing mutable arrays around.
+                    # Actually, we need density for get_legal_moves.
+                    actions = leaf.actions_from_root()
+                    leaf_density = apply_actions(root_density, actions)
+                    
+                    valid_add, valid_remove = get_legal_moves(
+                        leaf_density, config.density_threshold, bc_masks=bc_masks
+                    )
+                    
+                    expand_node(leaf, p_a, p_r, valid_add, valid_remove, config)
+                    
+                    ready_to_backup.append((path, val))
+            
+            # 4. Finalize Backup & Revert Virtual Loss
+            # Note: We must revert VL for ALL selected paths, including terminal ones
+            # The ready_to_backup list contains all paths we touched.
+            
+            for path, value in ready_to_backup:
+                for node in path:
+                    node.revert_virtual_loss()
+                backup(path, value)
+
+    else:
+        # Sequential MCTS (Original)
+        for sim in range(config.num_simulations):
+            # 1. Selection
+            leaf, path = select_leaf(root, config.c_puct)
+            
+            # Compute leaf state by applying actions from root
+            actions = leaf.actions_from_root()
+            leaf_density = apply_actions(root_density, actions)
+            
+            # 2. Check terminal
+            is_terminal, reason = is_terminal_state(
+                leaf_density,
+                max_volume_fraction=config.max_volume_fraction,
+                min_volume_fraction=config.min_volume_fraction,
+                threshold=config.density_threshold,
+                bc_masks=bc_masks
             )
             
-            # Expand leaf
-            expand_node(leaf, policy_add, policy_remove, valid_add, valid_remove, config)
-        
-        # 4. Backup
-        backup(path, value)
+            if is_terminal:
+                # Terminal value based on reason
+                if reason == "max_volume_exceeded":
+                    value = -0.5  # Penalty but not catastrophic
+                elif reason == "structure_too_small":
+                    value = -1.0  # Catastrophic failure
+                else:
+                    value = 0.0  # Neutral terminal
+            else:
+                # 3. Expansion & Evaluation
+                leaf_state = build_state_tensor(leaf_density, bc_masks, forces)
+                state_hash = compute_state_hash(leaf_density)
+                
+                # Check cache
+                if state_hash in eval_cache:
+                    value, policy_add, policy_remove = eval_cache[state_hash]
+                else:
+                    value, policy_add, policy_remove = predict_fn(leaf_state)
+                    eval_cache[state_hash] = (value, policy_add, policy_remove)
+                
+                # Get legal moves for leaf
+                valid_add, valid_remove = get_legal_moves(
+                    leaf_density, config.density_threshold, bc_masks=bc_masks
+                )
+                
+                # Expand leaf
+                expand_node(leaf, policy_add, policy_remove, valid_add, valid_remove, config)
+            
+            # 4. Backup
+            backup(path, value)
     
     # Extract results
     # visit_dist = root.get_visit_distribution() # Legacy: Shallow
@@ -490,7 +614,7 @@ def run_mcts_search(
     # Get top actions (root-level only for 'actions' return, usually)
     # But for 'actions' list we usually want the alternatives.
     # The 'actions' field in SearchResult is typically top-k root actions.
-    top_actions = root.get_top_k_actions(config.batch_size)
+    top_actions = root.get_top_k_actions(config.action_batch_size)
     
     return SearchResult(
         actions=top_actions,
@@ -518,8 +642,10 @@ class AlphaBuilderMCTS:
         predict_fn: Callable[[np.ndarray], Tuple[float, np.ndarray, np.ndarray]],
         num_simulations: int = 80,
         batch_size: int = 8,
+        action_batch_size: int = 1,
         c_puct: float = 1.25,
-        top_k_expansion: Optional[int] = None
+        top_k_expansion: Optional[int] = None,
+        predict_batch_fn: Optional[Callable[[List[np.ndarray]], Tuple[List[float], List[np.ndarray], List[np.ndarray]]]] = None
     ):
         """
         Initialize MCTS wrapper.
@@ -530,11 +656,14 @@ class AlphaBuilderMCTS:
             batch_size: Number of top actions to return (micro-batch size)
             c_puct: PUCT exploration constant
             top_k_expansion: Max children to expand (pruning)
+            predict_batch_fn: Optional batch prediction function for parallel search
         """
         self.predict_fn = predict_fn
+        self.predict_batch_fn = predict_batch_fn
         self.config = MCTSConfig(
             num_simulations=num_simulations,
             batch_size=batch_size,
+            action_batch_size=action_batch_size,
             c_puct=c_puct,
             top_k_expansion=top_k_expansion,
             add_root_noise=True  # Enable noise for tree reuse

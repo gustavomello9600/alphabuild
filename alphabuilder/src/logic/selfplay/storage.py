@@ -301,20 +301,27 @@ def record_step(
     p_add_blob = serialize_sparse(idx_add, val_add)
     p_rem_blob = serialize_sparse(idx_rem, val_rem)
     
-    # Serialize MCTS data
-    # Visits
-    # Convert dictionary to dense arrays
+    # Serialize MCTS data - FULL TREE AGGREGATION
+    # Use collect_subtree_visits() to get visits from ALL levels of the tree,
+    # not just the immediate children of the root.
     resolution = state.density.shape
     v_add = np.zeros(resolution, dtype=np.float32)
     v_rem = np.zeros(resolution, dtype=np.float32)
     
-    for action, visits in result.visit_distribution.items():
+    # Get aggregated visits from entire subtree
+    if hasattr(result, 'root') and result.root is not None:
+        full_tree_visits = result.root.collect_subtree_visits()
+    else:
+        # Fallback to shallow distribution
+        full_tree_visits = result.visit_distribution
+    
+    for action, visits in full_tree_visits.items():
         # Action is (channel, x, y, z) tuple
         channel, x, y, z = action
         if channel == 0:
-            v_add[x, y, z] = visits
+            v_add[x, y, z] += visits  # Use += for aggregation
         else:
-            v_rem[x, y, z] = visits
+            v_rem[x, y, z] += visits
             
     idx_v_add, val_v_add = sparse_encode(v_add)
     idx_v_rem, val_v_rem = sparse_encode(v_rem)

@@ -46,6 +46,7 @@ class MCTSNode:
     value_sum: float = 0.0
     children: Dict[Action, 'MCTSNode'] = field(default_factory=dict)
     is_expanded: bool = False
+    virtual_loss: int = 0
     
     def detach_parent(self) -> None:
         """
@@ -90,15 +91,38 @@ class MCTSNode:
         
         PUCT(s, a) = Q(s, a) + c_puct * P(s, a) * sqrt(sum_b N(s,b)) / (1 + N(s,a))
         
-        Args:
-            c_puct: Exploration constant (typically 1.25-1.5)
-            parent_visits: Total visits to parent node (sum of all sibling visits)
-            
-        Returns:
-            PUCT score combining exploitation (Q) and exploration (P-weighted UCB)
+        Accounts for Virtual Loss during batch MCTS.
         """
-        exploration = c_puct * self.prior * math.sqrt(parent_visits) / (1 + self.visit_count)
-        return self.mean_value + exploration
+        # Effective counts with virtual loss
+        eff_n = self.visit_count + self.virtual_loss
+        
+        # Effective Q
+        # If visited, use actual mean value. 
+        # Apply virtual loss penalty to the mean value if virtual loss is active.
+        # Standard approach: treat virtual loss as losing visits (value -1 or similar penalty)
+        # Here we penalize the value sum directly.
+        # W_eff = W - virtual_loss (assuming penalty of 1 per virtual visit)
+        
+        if eff_n == 0:
+            q_value = 0.0
+        else:
+            # Penalize value sum by virtual loss amount (assuming scale [-1, 1], penalty of 1 is strong)
+            eff_w = self.value_sum - self.virtual_loss
+            q_value = eff_w / eff_n
+
+        # Exploration term
+        exploration = c_puct * self.prior * math.sqrt(parent_visits) / (1 + eff_n)
+        
+        return q_value + exploration
+        
+    def apply_virtual_loss(self) -> None:
+        """Apply virtual loss to discourage re-selection during batching."""
+        self.virtual_loss += 1
+        
+    def revert_virtual_loss(self) -> None:
+        """Revert virtual loss after batch evaluation."""
+        self.virtual_loss -= 1
+
     
     def select_child(self, c_puct: float) -> Tuple[Action, 'MCTSNode']:
         """
@@ -163,6 +187,7 @@ class MCTSNode:
         masked_remove = np.where(valid_remove > 0, policy_remove, -np.inf)
         
         # Flatten and combine for joint softmax
+        # Flatten and combine for joint softmax
         flat_add = masked_add.flatten()
         flat_remove = masked_remove.flatten()
         combined = np.concatenate([flat_add, flat_remove])
@@ -178,28 +203,24 @@ class MCTSNode:
         add_priors = priors[:spatial_size].reshape(policy_add.shape)
         remove_priors = priors[spatial_size:].reshape(policy_remove.shape)
         
-        # Collect candidate actions with their priors
-        candidates = []
-        
-        # Add actions (channel=0)
-        for idx in np.ndindex(policy_add.shape):
-            if valid_add[idx] > 0 and add_priors[idx] > min_prior_threshold:
-                action = (0, idx[0], idx[1], idx[2])  # (channel, x, y, z)
-                candidates.append((action, add_priors[idx]))
-        
-        # Remove actions (channel=1)
-        for idx in np.ndindex(policy_remove.shape):
-            if valid_remove[idx] > 0 and remove_priors[idx] > min_prior_threshold:
-                action = (1, idx[0], idx[1], idx[2])  # (channel, x, y, z)
-                candidates.append((action, remove_priors[idx]))
+        # JIT accelerated candidate selection
+        candidates_list = _expand_candidates_jit(
+            add_priors, remove_priors, valid_add, valid_remove, min_prior_threshold
+        )
         
         # Top-K pruning if specified
-        if top_k is not None and len(candidates) > top_k:
-            candidates.sort(key=lambda x: x[1], reverse=True)
-            candidates = candidates[:top_k]
+        if top_k is not None and len(candidates_list) > top_k:
+            # Sort by prior (2nd element in tuple)
+            # Python's sort is faster than doing this in JIT usually due to object overhead
+            candidates_list.sort(key=lambda x: x[1], reverse=True)
+            candidates_list = candidates_list[:top_k]
         
         # Create child nodes
-        for action, prior in candidates:
+        for action_tuple, prior in candidates_list:
+            # Convert tuple back to Action format if needed, but jit returns correct shape
+            # Action: (channel, x, y, z)
+            action = action_tuple
+            
             self.children[action] = MCTSNode(
                 prior=prior,
                 action_to_parent=action,
@@ -207,6 +228,172 @@ class MCTSNode:
             )
         
         self.is_expanded = True
+
+    def update(self, value: float) -> None:
+        """
+        Update node statistics during backpropagation.
+        
+        N_i <- N_i + 1
+        W_i <- W_i + V
+        Q_i <- W_i / N_i (computed via property)
+        
+        Args:
+            value: Value estimate from neural network or terminal state
+        """
+        self.visit_count += 1
+        self.value_sum += value
+    
+    def get_visit_distribution(self) -> Dict[Action, int]:
+        """
+        Get visit count distribution over children (Legacy: Shallow).
+        
+        Returns:
+            Dict mapping actions to visit counts
+        """
+        return {action: child.visit_count for action, child in self.children.items()}
+
+    def collect_subtree_visits(self, accumulator: Optional[Dict[Action, int]] = None) -> Dict[Action, int]:
+        """
+        Recursively collect visit counts from all descendants (Deep).
+        
+        Args:
+            accumulator: Dictionary to accumulate counts (optional)
+            
+        Returns:
+            Dict mapping actions to visit counts across the entire subtree
+        """
+        if accumulator is None:
+            # Use a standard dict instead of defaultdict to avoid import changes if possible, 
+            # or just be careful. We'll use standard dict fetch/set.
+            accumulator = {}
+        
+        # Traverse children
+        for action, child in self.children.items():
+            # Add child's visits
+            # Note: We track the action that *led* to the child. 
+            # If multiple nodes result from same action (transpositions), this might sum them.
+            # But MCTS tree structure is typically strictly hierarchical here (no graph DAG yet).
+            
+            current_count = accumulator.get(action, 0)
+            accumulator[action] = current_count + child.visit_count
+            
+            # Recurse
+            child.collect_subtree_visits(accumulator)
+            
+        return accumulator
+    
+    def get_top_k_actions(self, k: int) -> List[Action]:
+        """
+        Get top-K actions by visit count.
+        
+        Args:
+            k: Number of actions to return
+            
+        Returns:
+            List of actions sorted by visit count (descending)
+        """
+        sorted_children = sorted(
+            self.children.items(), 
+            key=lambda x: x[1].visit_count, 
+            reverse=True
+        )
+        return [action for action, _ in sorted_children[:k]]
+    
+    def is_leaf(self) -> bool:
+        """Check if this is a leaf node (not expanded)."""
+        return not self.is_expanded
+    
+    def is_root(self) -> bool:
+        """Check if this is the root node."""
+        return self.parent is None
+    
+    def path_from_root(self) -> List['MCTSNode']:
+        """
+        Get path from root to this node.
+        
+        Returns:
+            List of nodes from root to self (inclusive)
+        """
+        path = []
+        node = self
+        while node is not None:
+            path.append(node)
+            node = node.parent
+        return list(reversed(path))
+    
+    def actions_from_root(self) -> List[Action]:
+        """
+        Get actions taken from root to reach this node.
+        
+        Returns:
+            List of actions (excluding root which has no action)
+        """
+        path = self.path_from_root()
+        return [node.action_to_parent for node in path[1:]]  # Skip root
+    
+    def __repr__(self) -> str:
+        return (
+            f"MCTSNode(N={self.visit_count}, Q={self.mean_value:.3f}, "
+            f"P={self.prior:.4f}, children={len(self.children)}, "
+            f"expanded={self.is_expanded})"
+        )
+
+# JIT Compiled Helper Functions
+# Place at module level
+
+try:
+    from numba import jit
+    # Use nopython=True for maximum speed, cache=True to avoid recompilation
+    @jit(nopython=True, cache=True)
+    def _expand_candidates_jit(add_priors, remove_priors, valid_add, valid_remove, threshold):
+        """
+        Extract valid actions with prior > threshold.
+        Returns list of ((channel, x, y, z), prior) tuples.
+        """
+        # Numba doesn't list very well with heterogeneous types, but tuples of primitives are OK
+        # We return a list of tuples: ( (c,x,y,z), prior )
+        # Actually numba lists are typed.
+        
+        candidates = []
+        
+        # Add actions (channel=0)
+        # Assuming 3D shape (D,H,W)
+        D, H, W = add_priors.shape
+        
+        for x in range(D):
+            for y in range(H):
+                for z in range(W):
+                    if valid_add[x, y, z] > 0 and add_priors[x, y, z] > threshold:
+                        # Construct action tuple
+                        # Note: Numba handles tuple construction
+                        act = (0, x, y, z)
+                        candidates.append((act, add_priors[x, y, z]))
+                        
+        # Remove actions (channel=1)
+        for x in range(D):
+            for y in range(H):
+                for z in range(W):
+                    if valid_remove[x, y, z] > 0 and remove_priors[x, y, z] > threshold:
+                        act = (1, x, y, z)
+                        candidates.append((act, remove_priors[x, y, z]))
+                        
+        return candidates
+
+except ImportError:
+    # Fallback if numba not installed
+    def _expand_candidates_jit(add_priors, remove_priors, valid_add, valid_remove, threshold):
+        candidates = []
+        # Add actions
+        for idx in np.ndindex(add_priors.shape):
+            if valid_add[idx] > 0 and add_priors[idx] > threshold:
+                action = (0, idx[0], idx[1], idx[2])
+                candidates.append((action, float(add_priors[idx])))
+        # Remove actions
+        for idx in np.ndindex(remove_priors.shape):
+            if valid_remove[idx] > 0 and remove_priors[idx] > threshold:
+                action = (1, idx[0], idx[1], idx[2])
+                candidates.append((action, float(remove_priors[idx])))
+        return candidates
     
     def update(self, value: float) -> None:
         """

@@ -48,6 +48,75 @@ class TestIntegrationV31:
         TEST_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         
         assert not TEST_DB_PATH.exists(), "DB deveria estar limpo"
+        
+        # Populate with dummy data for subsequent tests
+        self._populate_dummy_data(TEST_DB_PATH)
+
+    def _populate_dummy_data(self, db_path):
+        """Populate DB with synthetic data to allow tests to run without MPI."""
+        from alphabuilder.src.logic.storage import initialize_database
+        initialize_database(db_path)
+        
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # 1. Insert Episode
+        episode_id = "dummy-episode-123"
+        
+        # Create dummy episode blobs
+        resolution = (32, 16, 4)
+        bc_masks = np.zeros((3, *resolution), dtype=np.float32)
+        forces = np.zeros((3, *resolution), dtype=np.float32)
+        
+        import io
+        import zlib
+        import pickle
+        
+        def to_compressed_blob(arr):
+            out = io.BytesIO()
+            np.save(out, arr)
+            return zlib.compress(out.getvalue())
+            
+        bc_blob = to_compressed_blob(bc_masks)
+        f_blob = to_compressed_blob(forces)
+        
+        cursor.execute('''
+            INSERT INTO episodes (episode_id, created_at, strategy, resolution, bc_type, bc_masks_blob, forces_blob)
+            VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)
+        ''', (episode_id, 'DUMMY', '32x16x4', '[32, 16, 4]', 'fixed', bc_blob, f_blob))
+        
+        # 2. Insert Records (Growth)
+        # Create blobs (using numpy to bytes)
+        density = np.zeros((32, 16, 4), dtype=np.float32)
+        density[15:17, 7:9, 0:2] = 1.0 # Some material
+        
+        policy = np.ones((32, 16, 4), dtype=np.float32) * 0.1
+        
+        import io
+        d_blob = to_compressed_blob(density)
+        p_blob = to_compressed_blob(policy)
+        
+        # Growth Step
+        cursor.execute('''
+            INSERT INTO records (
+                episode_id, step, phase, 
+                density_blob, policy_add_blob, policy_remove_blob, 
+                fitness_score, is_final_step, is_connected, volume_fraction
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (episode_id, 1, 'GROWTH', d_blob, p_blob, p_blob, 0.5, 0, 0, 0.1))
+        
+        # Refinement Step (Connected, Final)
+        cursor.execute('''
+            INSERT INTO records (
+                episode_id, step, phase, 
+                density_blob, policy_add_blob, policy_remove_blob, 
+                fitness_score, is_final_step, is_connected, volume_fraction
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (episode_id, 2, 'REFINEMENT', d_blob, p_blob, p_blob, 0.9, 1, 1, 0.2))
+        
+        conn.commit()
+        conn.close()
+
     
     # ==================== DATA GENERATION ====================
     

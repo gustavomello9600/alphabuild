@@ -186,8 +186,14 @@ export interface GameReplayState {
     mcts: {
         visit_add: Float32Array;
         visit_remove: Float32Array;
-        q_add: Float32Array;
-        q_remove: Float32Array;
+    };
+    visuals?: {
+        opaqueMatrix: Float32Array;
+        opaqueColor: Float32Array;
+        overlayMatrix: Float32Array;
+        overlayColor: Float32Array;
+        mctsMatrix?: Float32Array;
+        mctsColor?: Float32Array;
     };
     selected_actions: SelectedAction[];
     mcts_stats: MCTSStats;
@@ -198,12 +204,18 @@ export interface GameReplayState {
     compliance_fem?: number;
     island_penalty?: number;
     loose_voxels?: number;
+    connected_load_fraction?: number;
     reward_components?: RewardComponents | null;
 }
+
+
+// Worker Setup
+import ReplayWorker from '../workers/replay.worker?worker';
 
 export class SelfPlayReplayService {
     private subscribers: ReplayCallback[] = [];
     private intervalId: ReturnType<typeof setInterval> | null = null;
+    private worker: Worker;
 
     // State
     private gameId: string | null = null;
@@ -215,9 +227,38 @@ export class SelfPlayReplayService {
     private currentStepIndex = 0;
     private isPlaying = false;
 
+    // Pending requests
+    private pendingResolves = new Map<string, (steps: GameReplayState[]) => void>();
+    private pendingRejects = new Map<string, (err: any) => void>();
+
     // Constants
-    private readonly FETCH_CHUNK_SIZE = 25;
-    private readonly PREFETCH_THRESHOLD = 10;
+    private readonly FETCH_CHUNK_SIZE = 10; // Reduced to avoid timeout on visual computation
+    private readonly PREFETCH_THRESHOLD = 5;
+
+    constructor() {
+        this.worker = new ReplayWorker();
+        this.worker.onmessage = this.handleWorkerMessage.bind(this);
+    }
+
+    private handleWorkerMessage(e: MessageEvent) {
+        const { type, payload } = e.data;
+        if (type === 'ERROR') {
+            console.error('ReplayWorker Error:', payload);
+            return;
+        }
+        if (type === 'CHUNK_LOADED') {
+            const steps = payload as GameReplayState[];
+            steps.forEach(s => {
+                this.framesMap.set(s.step, s);
+            });
+            this.pruneCache();
+
+            // Notify if we are waiting for current frame
+            if (this.framesMap.has(this.currentStepIndex)) {
+                this.notifySubscribers(this.framesMap.get(this.currentStepIndex)!);
+            }
+        }
+    }
 
     /**
      * Load game data
@@ -228,41 +269,70 @@ export class SelfPlayReplayService {
         this.deprecated = deprecated;
 
         try {
-            // 1. Fetch Metadata
+            // 1. Fetch Metadata (Keep on main thread for now as it's small JSON)
             this.metadata = await fetchGameMetadata(gameId, deprecated);
 
-            // 2. Fetch Initial Chunk
-            await this.loadChunk(0, this.FETCH_CHUNK_SIZE);
+            // 2. Fetch Initial Chunk via Worker
+            this.requestChunk(0, this.FETCH_CHUNK_SIZE);
 
             this.currentStepIndex = 0;
+            // Wait a bit? Or just let the worker callback update call us.
+            // We can resolve immediately to unblock UI, loading state handled by UI?
+            // Existing UI waits for load() promise.
+            // We should probably wait for at least first frame.
 
-            if (this.framesMap.has(0)) {
-                this.notifySubscribers(this.framesMap.get(0)!);
-            }
+            await this.waitForFrame(0);
+
         } catch (err) {
             console.error("Error loading game:", err);
             throw err;
         }
     }
 
-    private async loadChunk(start: number, count: number): Promise<void> {
-        if (!this.gameId) return;
+    private async waitForFrame(step: number, timeout = 10000): Promise<void> {
+        return new Promise((resolve, reject) => {
+            if (this.framesMap.has(step)) {
+                resolve();
+                return;
+            }
 
-        const end = start + count;
-        // console.log(`Fetching SP chunk ${start} - ${end}`);
+            const checkInterval = setInterval(() => {
+                if (this.framesMap.has(step)) {
+                    clearInterval(checkInterval);
+                    resolve();
+                }
+            }, 100);
 
-        const steps = await fetchGameSteps(this.gameId, start, end, this.deprecated);
-        const processed = this.processSteps(steps);
-
-        processed.forEach(f => {
-            this.framesMap.set(f.step, f);
+            setTimeout(() => {
+                clearInterval(checkInterval);
+                reject(new Error("Timeout waiting for frame"));
+            }, timeout);
         });
+    }
 
-        this.pruneCache();
+    private requestChunk(start: number, count: number): void {
+        if (!this.gameId) return;
+        const end = start + count;
+
+        // Check if we already have these?
+        // Simple check: if we have the start, maybe skip.
+        if (this.framesMap.has(start)) return;
+
+        this.worker.postMessage({
+            type: 'LOAD_CHUNK',
+            payload: {
+                gameId: this.gameId,
+                start,
+                end,
+                isDeprecated: this.deprecated,
+                apiBase: 'http://localhost:8000' // Hardcoded for now or get from env
+            }
+        });
     }
 
     private pruneCache() {
-        const KEEP_WINDOW = 100;
+        const KEEP_WINDOW = 200; // Keep more frames in memory now that they are binary efficient?
+        // Actually Float32Arrays are still big.
         const minStep = this.currentStepIndex - KEEP_WINDOW;
         const maxStep = this.currentStepIndex + KEEP_WINDOW;
 
@@ -273,39 +343,7 @@ export class SelfPlayReplayService {
         }
     }
 
-    private processSteps(steps: GameStep[]): GameReplayState[] {
-        return steps.map(step => {
-            const tensorData = new Float32Array(step.tensor_data);
-            const shape = step.tensor_shape as [number, number, number, number];
-
-            return {
-                game_id: this.gameId!,
-                step: step.step,
-                phase: step.phase as 'GROWTH' | 'REFINEMENT',
-                tensor: { shape, data: tensorData },
-                value: step.value,
-                policy: {
-                    add: new Float32Array(step.policy_add),
-                    remove: new Float32Array(step.policy_remove),
-                },
-                mcts: {
-                    visit_add: new Float32Array(step.mcts_visit_add),
-                    visit_remove: new Float32Array(step.mcts_visit_remove),
-                    q_add: new Float32Array(step.mcts_q_add),
-                    q_remove: new Float32Array(step.mcts_q_remove),
-                },
-                selected_actions: step.selected_actions,
-                mcts_stats: step.mcts_stats,
-                volume_fraction: step.volume_fraction || 0,
-                is_connected: step.is_connected || false,
-                n_islands: step.n_islands || 1,
-                compliance_fem: step.compliance_fem,
-                island_penalty: step.island_penalty,
-                loose_voxels: step.loose_voxels,
-                reward_components: step.reward_components || null,
-            };
-        });
-    }
+    // ProcessSteps logic moved to Worker (binary parsing)
 
     play(): void {
         if (this.isPlaying || !this.metadata) return;
@@ -316,7 +354,7 @@ export class SelfPlayReplayService {
         }
 
         this.isPlaying = true;
-        this.intervalId = setInterval(async () => {
+        this.intervalId = setInterval(() => {
             if (!this.metadata) return;
 
             if (this.currentStepIndex >= this.metadata.total_steps - 1) {
@@ -328,20 +366,22 @@ export class SelfPlayReplayService {
 
             // Check buffering
             if (!this.framesMap.has(this.currentStepIndex)) {
+                // Buffer underrun
                 this.pause();
-                await this.loadChunk(this.currentStepIndex, this.FETCH_CHUNK_SIZE);
-                this.play();
+                this.requestChunk(this.currentStepIndex, this.FETCH_CHUNK_SIZE);
+                // Try resuming after a bit?
+                this.waitForFrame(this.currentStepIndex).then(() => this.play()).catch(() => { });
                 return;
             }
 
             // Prefetch
             const nextChunkStart = this.currentStepIndex + this.PREFETCH_THRESHOLD;
             if (nextChunkStart < this.metadata.total_steps && !this.framesMap.has(nextChunkStart)) {
-                this.loadChunk(nextChunkStart, this.FETCH_CHUNK_SIZE).catch(console.error);
+                this.requestChunk(nextChunkStart, this.FETCH_CHUNK_SIZE);
             }
 
             this.notifySubscribers(this.framesMap.get(this.currentStepIndex)!);
-        }, 500);
+        }, 100); // 100ms = 10fps, faster playback possible now?
     }
 
     pause(): void {
@@ -380,9 +420,13 @@ export class SelfPlayReplayService {
             this.notifySubscribers(this.framesMap.get(index)!);
         } else {
             this.pause();
-            await this.loadChunk(index, this.FETCH_CHUNK_SIZE);
-            if (this.framesMap.has(index)) {
+            this.requestChunk(index, this.FETCH_CHUNK_SIZE);
+            // We don't await here to keep UI responsive, but we could show loading
+            try {
+                await this.waitForFrame(index);
                 this.notifySubscribers(this.framesMap.get(index)!);
+            } catch (e) {
+                // Ignore timeout
             }
         }
     }

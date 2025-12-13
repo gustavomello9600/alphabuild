@@ -367,10 +367,10 @@ class TestEngine:
             batch_size=2
         )
         
-        actions, visit_dist = mcts.get_action_batch(density, bc_masks, forces)
+        result = mcts.get_action_batch(density, bc_masks, forces)
         
-        assert len(actions) <= 2
-        assert isinstance(visit_dist, dict)
+        assert len(result.actions) <= 2
+        assert isinstance(result.visit_distribution, dict)
 
 
 # =============================================================================

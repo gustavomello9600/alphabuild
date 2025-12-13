@@ -303,6 +303,47 @@ def run_episode(
 
         return val, p_add, p_remove
 
+    def hybrid_batch_predictor(state_tensors: List[np.ndarray]) -> Tuple[List[float], List[np.ndarray], List[np.ndarray]]:
+        # 1. Run batch inference (efficient NPU call)
+        net_vals, ps_add, ps_remove = model.predict_batch(state_tensors)
+        
+        final_vals = []
+        
+        # 2. Iterate and apply hybrid logic
+        for i, (net_val, state_tensor) in enumerate(zip(net_vals, state_tensors)):
+            density_grid = state_tensor[0]
+            masks = (state_tensor[1], state_tensor[2], state_tensor[3])
+            force_vecs = (state_tensor[4], state_tensor[5], state_tensor[6])
+            
+            # Connectivity Bonus
+            connectivity_bonus, _ = calculate_connectivity_reward(
+                density_grid, masks, force_vecs
+            )
+            
+            # Island Penalty
+            island_analysis = analyze_structure_islands(density_grid, load_config)
+            n_islands = island_analysis['n_islands']
+            loose_voxels = island_analysis['loose_voxels']
+            total_voxels = int((density_grid > 0.5).sum())
+            
+            island_penalty = calculate_island_penalty(n_islands, loose_voxels, total_voxels)
+            
+            # Catastrophic failure check in Phase 2
+            if state.phase == Phase.REFINEMENT and not island_analysis['is_connected']:
+                final_vals.append(-1.0)
+                continue
+
+            if config.use_guided_value:
+                bonus_to_apply = connectivity_bonus if state.phase == Phase.GROWTH else 0.0
+                guided_val = net_val + bonus_to_apply - island_penalty
+                val = max(-1.0, min(1.0, guided_val))
+            else:
+                val = net_val
+            
+            final_vals.append(val)
+            
+        return final_vals, ps_add, ps_remove
+
     mcts_wrapper = AlphaBuilderMCTS(
         predict_fn=hybrid_predictor,
         num_simulations=PHASE1_CONFIG.num_simulations,
@@ -321,6 +362,7 @@ def run_episode(
         mcts_wrapper.config = mcts_wrapper.config._replace(
             num_simulations=current_config.num_simulations,
             batch_size=current_config.batch_size,
+            action_batch_size=current_config.action_batch_size,
             c_puct=current_config.c_puct,
             top_k_expansion=current_config.top_k_expansion,
             min_volume_fraction=current_config.min_volume_fraction,
@@ -397,7 +439,7 @@ def run_episode(
         # Prioritizes deep lookAhead (up to 4 steps) over breadth
         pv_actions = select_pv_sequences(
             mcts_wrapper.root,
-            max_actions=current_config.batch_size,
+            max_actions=current_config.action_batch_size,
             max_depth=4
         )
         
@@ -635,6 +677,8 @@ def resume_episode(
         raise ValueError(f"Could not load step {last_step} for game {game_id}")
     
     # Reconstruct EpisodeState from saved data
+    # NOTE: The density saved in DB is the state BEFORE actions were applied (for training correctness).
+    # We need to apply the last step's actions to get the actual post-action state.
     state = EpisodeState(
         density=last_game_step.density.copy(),
         bc_masks=game_info.bc_masks.copy(),
@@ -646,10 +690,30 @@ def resume_episode(
         game_id=game_id
     )
     
+    # Apply the last step's actions to reconstruct S_{n+1} from S_n
+    # The actions were recorded but not yet applied to the saved density
+    if last_game_step.selected_actions:
+        print(f"  Replaying {len(last_game_step.selected_actions)} actions from step {last_step}...")
+        for action in last_game_step.selected_actions:
+            # SelectedAction is a dataclass with channel, x, y, z attributes
+            if action.channel == 0:  # Add
+                state.density[action.x, action.y, action.z] = 1.0
+            else:  # Remove
+                state.density[action.x, action.y, action.z] = 0.0
+    
     print(f"Restored state at step {last_step}:")
     print(f"  Phase: {state.phase.value}")
     print(f"  Density voxels: {np.sum(state.density > 0.5)}")
     print(f"  Volume fraction: {np.mean(state.density > 0.5):.4f}")
+    
+    # Phase correction: Ensure phase matches step count
+    # Phase 1 (GROWTH) should end by max_phase1_steps
+    print(f"  [DEBUG] Phase={state.phase}, current_step={state.current_step}, max_phase1_steps={config.max_phase1_steps}")
+    if state.phase == Phase.GROWTH and state.current_step >= config.max_phase1_steps:
+        print(f"  Correcting phase: Step {state.current_step} >= max_phase1_steps ({config.max_phase1_steps})")
+        state.phase = Phase.REFINEMENT
+        print(f"  Phase corrected to: {state.phase.value}")
+    
     print(f"  Continuing from step {state.current_step}...")
     
     # Load config from saved game
@@ -691,12 +755,56 @@ def resume_episode(
 
         return val, p_add, p_remove
 
+    def hybrid_batch_predictor(state_tensors: List[np.ndarray]) -> Tuple[List[float], List[np.ndarray], List[np.ndarray]]:
+        """Batch version of hybrid_predictor for efficient NPU inference."""
+        # 1. Run batch inference (efficient NPU call)
+        net_vals, ps_add, ps_remove = model.predict_batch(state_tensors)
+        
+        final_vals = []
+        
+        # 2. Iterate and apply hybrid logic
+        for i, (net_val, state_tensor) in enumerate(zip(net_vals, state_tensors)):
+            density_grid = state_tensor[0]
+            masks = (state_tensor[1], state_tensor[2], state_tensor[3])
+            force_vecs = (state_tensor[4], state_tensor[5], state_tensor[6])
+            
+            # Connectivity Bonus
+            connectivity_bonus = calculate_connectivity_reward(
+                density_grid, masks, force_vecs
+            )
+            
+            # Island Penalty
+            island_analysis = analyze_structure_islands(density_grid, load_config)
+            n_islands = island_analysis['n_islands']
+            loose_voxels = island_analysis['loose_voxels']
+            total_voxels = int((density_grid > 0.5).sum())
+            
+            island_penalty = calculate_island_penalty(n_islands, loose_voxels, total_voxels)
+            
+            # Catastrophic failure check in Phase 2
+            if state.phase == Phase.REFINEMENT and not island_analysis['is_connected']:
+                final_vals.append(-1.0)
+                continue
+
+            if config.use_guided_value:
+                bonus_to_apply = connectivity_bonus if state.phase == Phase.GROWTH else 0.0
+                guided_val = net_val + bonus_to_apply - island_penalty
+                val = max(-1.0, min(1.0, guided_val))
+            else:
+                val = net_val
+            
+            final_vals.append(val)
+            
+        return final_vals, ps_add, ps_remove
+
     mcts_wrapper = AlphaBuilderMCTS(
         predict_fn=hybrid_predictor,
         num_simulations=PHASE1_CONFIG.num_simulations,
         batch_size=PHASE1_CONFIG.batch_size,
+        action_batch_size=PHASE1_CONFIG.action_batch_size,
         c_puct=PHASE1_CONFIG.c_puct,
-        top_k_expansion=PHASE1_CONFIG.top_k_expansion
+        top_k_expansion=PHASE1_CONFIG.top_k_expansion,
+        predict_batch_fn=hybrid_batch_predictor
     )
     
     while state.current_step < config.max_steps:
@@ -707,6 +815,7 @@ def resume_episode(
         mcts_wrapper.config = mcts_wrapper.config._replace(
             num_simulations=current_config.num_simulations,
             batch_size=current_config.batch_size,
+            action_batch_size=current_config.action_batch_size,
             c_puct=current_config.c_puct,
             top_k_expansion=current_config.top_k_expansion,
             min_volume_fraction=current_config.min_volume_fraction,
@@ -771,7 +880,7 @@ def resume_episode(
 
         pv_actions = select_pv_sequences(
             mcts_wrapper.root,
-            max_actions=current_config.batch_size,
+            max_actions=current_config.action_batch_size,
             max_depth=4
         )
         

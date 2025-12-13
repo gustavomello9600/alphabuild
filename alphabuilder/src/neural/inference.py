@@ -118,7 +118,8 @@ class AlphaBuilderInference:
     def __init__(
         self,
         checkpoint_path: Union[str, Path],
-        device: str = 'auto'
+        device: str = 'auto',
+        model_config: dict = None
     ):
         """
         Initialize inference model.
@@ -138,7 +139,34 @@ class AlphaBuilderInference:
             else:
                 device = 'cpu'
         
-        self.device = torch.device(device)
+        self.device_str = device.lower()
+        
+        if self.device_str == 'npu' or self.device_str == 'auto':
+            from .openvino_inference import AlphaBuilderOpenVINO
+            
+            # Default to AUTO/GPU with THROUGHPUT hint if not specified
+            model_config = model_config or {}
+            if 'performance_hint' not in model_config:
+                model_config['performance_hint'] = 'THROUGHPUT'
+
+            self.backend = AlphaBuilderOpenVINO(checkpoint_path, device='AUTO', model_config=model_config)
+            # We can't really set self.device to torch.device object here easily as it's not a torch device
+            # But let's keep it for compatibility if needed, though NPU backend handles everything
+            self.device = torch.device('cpu') 
+            self.is_npu = True
+            
+            # Mimic attributes expected by repr or inspection
+            self.config = getattr(self.backend, 'config', {})
+            self.epoch = getattr(self.backend, 'epoch', -1)
+            self.val_loss = getattr(self.backend, 'val_loss', 0.0)
+            self.use_swin = getattr(self.backend, 'use_swin', False)
+            
+            # Assuming logger is defined elsewhere or will be added
+            # logger.info(f"Initialized AlphaBuilderOpenVINO backend on device {self.backend.device}")
+            return
+        else:
+            self.is_npu = False
+            self.device = torch.device(device)
         
         # Load checkpoint
         checkpoint = torch.load(
@@ -260,6 +288,14 @@ class AlphaBuilderInference:
             - policy_add: Heatmap of where to add material
             - policy_remove: Heatmap of where to remove material
         """
+
+        if self.is_npu:
+            # NPU Backend handles its own preprocessing/inference/postprocessing logic internally for simplicity, 
+            # OR we should delegate to it.
+            # The OpenVINO class we wrote implements predict(state) -> (val, padd, prem)
+            # The signature here matches.
+            return self.backend.predict(state)
+
         # Preprocess
         tensor, original_shape = self.preprocess(state)
         

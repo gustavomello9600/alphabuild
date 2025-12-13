@@ -1,6 +1,6 @@
 # 📊 Relatório de Qualidade de Dados de Treino
 
-**Gerado em:** 2025-12-09 12:34:51
+**Gerado em:** 2025-12-13 03:46:17
 **Banco de Dados:** `episodios_de_testes_de_integracao.db`
 
 ---

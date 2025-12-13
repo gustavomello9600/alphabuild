@@ -1,0 +1,54 @@
+name: alphabuilder_intel
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  # Core System & Build Tools
+  - python=3.10
+  - pip
+  - binutils
+  - ld_impl_linux-64
+  
+  # MPI Stack
+  # Critical: Use MPICH from conda-forge as the single MPI source for both FENiCSx and PyTorch
+  - mpi
+  - mpich
+  - mpi4py
+  
+  # Intel Performance Libraries (MKL/TBB)
+  # Standardizing these helps avoid runtime linking errors with IPEX
+  - libblas=*=*mkl
+  - liblapack=*=*mkl
+  - tbb
+  
+  # Scientific Computing
+  - fenics-dolfinx
+  - petsc
+  - slepc
+  - pyvista
+  - matplotlib
+  - scipy
+  - numpy
+  - pandas
+  
+  # Pip packages + PyTorch XPU
+  # We define the extra index here to ensure pip solves dependencies in one go
+  - pip:
+    # Intel XPU Stack (PyTorch 2.5.1 + IPEX 2.5.10)
+    - --index-url https://download.pytorch.org/whl/cpu
+    - --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/us/
+    - torch==2.5.1
+    - torchvision==0.20.1
+    - torchaudio==2.5.1
+    - intel-extension-for-pytorch==2.5.10+xpu
+    
+    # Other Packages
+    - monai
+    - einops
+    - tqdm
+    - fastapi
+    - uvicorn[standard]
+    - plotly
+    - streamlit-drawable-canvas
+    - pytest
+    - pytest-cov

@@ -2,7 +2,11 @@ from fastapi import APIRouter, HTTPException
 from pathlib import Path
 import sqlite3
 import json
+import json
+import struct
 import numpy as np
+import math
+from fastapi import Response
 from typing import Optional, List
 from pydantic import BaseModel
 import sys
@@ -258,3 +262,128 @@ def get_selfplay_game_steps(
         ))
         
     return step_data
+
+@router.get("/games/{game_id}/steps/binary")
+def get_selfplay_game_steps_binary(
+    game_id: str,
+    start: int = 0,
+    end: int = 50,
+    deprecated: bool = False
+):
+    """
+    Get range of steps for a self-play game in binary format.
+    Format per step:
+    [Header (Int32 * 10)]
+    - step_index
+    - phase (0=growth, 1=refinement)
+    - dims (D, H, W)
+    - data_length_bytes (Total bytes following header)
+    - value (Float32)
+    - mcts_sims (Int32)
+    - ... reserved ...
+    
+    [Data Body]
+    - Tensor Data (Float32 array)
+    - Policy Add (Float32 array)
+    - Policy Remove (Float32 array)
+    - MCTS Visit Add (Float32 array)
+    - MCTS Visit Remove (Float32 array)
+    """
+    if not SELFPLAY_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Self-play module not available")
+    
+    db_path = get_selfplay_db_path(deprecated)
+    if not db_path.exists():
+        raise HTTPException(status_code=404, detail="Self-play database not found")
+        
+    game = sp_load_game(db_path, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail=f"Game {game_id} not found")
+
+    steps = load_game_steps_range(db_path, game_id, game.resolution, start, end)
+    
+    output_buffer = bytearray()
+    
+    for s in steps:
+        # Reconstruct full state tensor (7, D, H, W)
+        state_tensor = np.concatenate([
+            s.density[None],
+            game.bc_masks,
+            game.forces
+        ], axis=0).astype(np.float32)
+        
+        tensor_bytes = state_tensor.tobytes()
+        policy_add_bytes = s.policy_add.astype(np.float32).tobytes()
+        policy_rem_bytes = s.policy_remove.astype(np.float32).tobytes()
+        mcts_add_bytes = s.mcts_visit_add.astype(np.float32).tobytes()
+        mcts_rem_bytes = s.mcts_visit_remove.astype(np.float32).tobytes()
+        
+        total_data_size = (
+            len(tensor_bytes) + 
+            len(policy_add_bytes) + 
+            len(policy_rem_bytes) + 
+            len(mcts_add_bytes) + 
+            len(mcts_rem_bytes)
+        )
+        
+        phase_code = 0 if s.phase.value == 'GROWTH' else 1
+        D, H, W = game.resolution
+        
+        # Pack selected_actions
+        num_actions = len(s.selected_actions)
+        selected_actions_bytes = struct.pack('<i', num_actions)
+        for a in s.selected_actions:
+            # channel, x, y, z, visits (5 ints) + q_value (1 float)
+            selected_actions_bytes += struct.pack('<5if', a.channel, a.x, a.y, a.z, a.visits, a.q_value)
+        
+        total_data_size = (
+            len(tensor_bytes) + 
+            len(policy_add_bytes) + 
+            len(policy_rem_bytes) + 
+            len(mcts_add_bytes) + 
+            len(mcts_rem_bytes) +
+            len(selected_actions_bytes)
+        )
+        
+        # Extension block: n_islands(i), loose_voxels(i), is_connected(i), compliance_fem(f), island_penalty(f)
+        extension_bytes = struct.pack(
+            '<3i2f',
+            getattr(s, 'n_islands', 1),
+            getattr(s, 'loose_voxels', 0),
+            1 if getattr(s, 'is_connected', False) else 0,
+            float(getattr(s, 'compliance_fem', 0.0) or 0.0),
+            float(getattr(s, 'island_penalty', 0.0) or 0.0)
+        )
+        
+        total_data_size = (
+            len(tensor_bytes) + 
+            len(policy_add_bytes) + 
+            len(policy_rem_bytes) + 
+            len(mcts_add_bytes) + 
+            len(mcts_rem_bytes) +
+            len(selected_actions_bytes) +
+            len(extension_bytes)
+        )
+        
+        header = struct.pack(
+            '<10i', 
+            s.step,
+            phase_code,
+            D, H, W,
+            total_data_size,
+            int(s.mcts_stats.num_simulations),
+            int(s.value * 10000),
+            int(getattr(s, 'connected_load_fraction', 0.0) * 10000),  # Slot 9: connectivity bonus
+            int(getattr(s, 'volume_fraction', 0.0) * 10000)  # Slot 10: volume fraction
+        )
+        
+        output_buffer.extend(header)
+        output_buffer.extend(tensor_bytes)
+        output_buffer.extend(policy_add_bytes)
+        output_buffer.extend(policy_rem_bytes)
+        output_buffer.extend(mcts_add_bytes)
+        output_buffer.extend(mcts_rem_bytes)
+        output_buffer.extend(selected_actions_bytes)
+        output_buffer.extend(extension_bytes)
+        
+    return Response(content=bytes(output_buffer), media_type="application/octet-stream")
