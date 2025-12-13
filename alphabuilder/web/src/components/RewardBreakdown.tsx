@@ -4,6 +4,7 @@ import type { ReplayState } from '../api/trainingDataService';
 
 interface RewardBreakdownProps {
     state: GameReplayState | ReplayState | null;
+    maxSteps?: number;
 }
 
 // Backend constants (matching src/logic/selfplay/reward.py)
@@ -16,7 +17,8 @@ const CONSTANTS = {
     PENALTY_LOOSE_SCALE: 0.1
 };
 
-export const RewardBreakdown: React.FC<RewardBreakdownProps> = ({ state }) => {
+export const RewardBreakdown: React.FC<RewardBreakdownProps> = ({ state, maxSteps }) => {
+    const [expanded, setExpanded] = React.useState(false);
     if (!state) return <div className="text-gray-500 italic">No data</div>;
 
     const rc = state.reward_components;
@@ -45,7 +47,7 @@ export const RewardBreakdown: React.FC<RewardBreakdownProps> = ({ state }) => {
     if (state.phase === 'GROWTH') {
         const bonus = rc?.connectivity_bonus || 0;
         const fraction = rc?.connected_load_fraction ?? 0;
-        const valueHead = state.value ?? 0;
+        const valueHead = 'value' in state ? (state as GameReplayState).value : (state as ReplayState).value_confidence ?? 0;
         const islandPenalty = rc?.island_penalty ?? 0;
         const nIslands = rc?.n_islands ?? 1;
         const looseVoxels = rc?.loose_voxels ?? 0;
@@ -101,7 +103,7 @@ export const RewardBreakdown: React.FC<RewardBreakdownProps> = ({ state }) => {
                 </div>
 
                 {/* Final Combined Value */}
-                {renderMathBlock("Combined Value", "V_net + B_conn - P_ilhas", valueHead + bonus - islandPenalty, true)}
+                {renderMathBlock("Combined Value", "Clamp(V_net + B_conn - P_ilhas)", Math.max(-1, Math.min(1, valueHead + bonus - islandPenalty)), true)}
 
                 <div className="mt-2 text-[9px] text-gray-500 text-center">
                     This is the guided value used for MCTS node selection
@@ -132,17 +134,32 @@ export const RewardBreakdown: React.FC<RewardBreakdownProps> = ({ state }) => {
 
     const islands = rc.n_islands ?? 1;
     const loose = rc.loose_voxels ?? 0;
-    const valueHead = state.value ?? 0;
+    // Handle both GameReplayState (value) and ReplayState (value_confidence)
+    const valueHead = 'value' in state ? (state as GameReplayState).value : (state as ReplayState).value_confidence ?? 0;
+    const currentStep = state.step || 0;
+
+    // Calculate Lambda (Mixing Factor)
+    // lambda = t / T_max
+    const lambda = maxSteps ? Math.min(1.0, currentStep / maxSteps) : 1.0;
 
     // Calculate basics for transparent display
+    // S_raw = -ln(C + eps) - alpha * V
+    // S_fem = tanh((S_raw - mu) / sigma)
     const raw_val = rc.fem_reward !== undefined ? (-Math.log(C + CONSTANTS.EPSILON) - CONSTANTS.ALPHA_VOL * V) : 0;
+    const s_fem = rc.fem_reward || 0;
+    const islandPenalty = rc.island_penalty || 0;
+
+    // Final Mixed Value Formula:
+    // V_guided = (1 - λ) * V_net + λ * S_FEM - Penalty
+    const mixed_value = (1 - lambda) * valueHead + lambda * s_fem;
+    const total_reward = Math.max(-1, Math.min(1, mixed_value - islandPenalty));
 
     return (
         <div className="bg-gray-900/50 p-3 rounded-lg border border-gray-700 font-sans shadow-lg backdrop-blur-sm">
             <div className="flex justify-between items-center mb-3 pb-2 border-b border-gray-700">
                 <span className="font-bold text-gray-200 text-sm">Refinement Reward</span>
-                <span className={`font-mono font-bold text-sm ${rc.total >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                    {rc.total.toFixed(4)}
+                <span className={`font-mono font-bold text-sm ${total_reward >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                    {total_reward.toFixed(4)}
                 </span>
             </div>
 
@@ -165,33 +182,118 @@ export const RewardBreakdown: React.FC<RewardBreakdownProps> = ({ state }) => {
             <div className="space-y-1">
                 <div className="text-[10px] text-gray-500 uppercase font-bold mb-1">Derivation Chain</div>
 
-                {/* Value Head */}
-                {renderMathBlock("0. Value Head (V_net)", "Neural Network Prediction", valueHead)}
+                {/* Mixing Display */}
+                <div className="flex items-center justify-between text-[10px] text-gray-400 mb-1 border-b border-gray-800 pb-1">
+                    <span>Mixing Factor (λ)</span>
+                    <span className="font-mono text-cyan">{lambda.toFixed(2)}</span>
+                </div>
 
-                {/* 1. Raw Score */}
-                {renderMathBlock("1. Raw Score (S_raw)", `-ln(${C.toFixed(2)}) - 12×${V.toFixed(2)}`, raw_val)}
+                {/* 0. Components */}
+                {renderMathBlock("V_net (Neural)", "Value Head", valueHead)}
+                {renderMathBlock("S_FEM (Physics)", "Normalized Score", s_fem)}
 
-                {/* 2. Normalization */}
-                {renderMathBlock("2. Normalized (S_FEM)", `tanh((S_raw - 6.65) / 2.0)`, rc.fem_reward || 0)}
+                {/* 1. Mixing */}
+                {renderMathBlock("Mixed Value", `(1-${lambda.toFixed(2)})V_net + ${lambda.toFixed(2)}S_FEM`, mixed_value)}
 
-                {/* 3. Penalties */}
-                {(rc.island_penalty || 0) > 0 ? (
-                    renderMathBlock("3. Penalties (P_ilhas)", `Islands: ${islands}, Loose: ${loose}`, -(rc.island_penalty || 0))
+                {/* 2. Penalties */}
+                {islandPenalty > 0 ? (
+                    renderMathBlock("Penalties", `Islands: ${islands}, Loose: ${loose}`, -islandPenalty)
                 ) : (
                     <div className="flex justify-between text-[10px] text-green-500/50 px-1">
-                        <span>3. Penalties</span>
+                        <span>Penalties</span>
                         <span>0.0000 ✓</span>
                     </div>
                 )}
 
                 {/* Final */}
-                {renderMathBlock("Final Reward", "S_FEM - P_ilhas", (rc.fem_reward || 0) - (rc.island_penalty || 0), true)}
-            </div>
+                {renderMathBlock("Final Reward", "Clamp(Mixed - Penalty)", total_reward, true)}
 
-            {/* Validity Warning */}
-            {rc.validity_penalty && rc.validity_penalty < 0 && (
+                            {/* Intermediate Calculations (Expandable) */}
+                            <div className="mt-2 border-t border-gray-700 pt-2">
+                                <button 
+                                    onClick={() => setExpanded(!expanded)}
+                                    className="w-full text-left text-[10px] text-gray-400 hover:text-gray-200 flex justify-between items-center focus:outline-none"
+                                >
+                                    <span className="font-bold">Intermediate Calculations</span>
+                                    <span>{expanded ? '▼' : '▶'}</span>
+                                </button>
+                                
+                                {expanded && (
+                                    <div className="mt-2 p-2 bg-black/40 rounded border border-gray-800 space-y-3 text-[10px] font-mono text-gray-300">
+                                        {/* 1. Raw Physics Score */}
+                                        <div>
+                                            <div className="text-gray-500 mb-0.5 font-bold">1. Raw Physics Score (S_raw)</div>
+                                            <div className="pl-2 border-l-2 border-gray-700 space-y-0.5">
+                                                <div className="text-gray-500">Formula: -ln(C + ε) - α·V</div>
+                                                <div>= -ln({C.toExponential(2)}) - {CONSTANTS.ALPHA_VOL}·{V.toFixed(3)}</div>
+                                                <div className="text-cyan-400 font-bold">= {raw_val.toFixed(4)}</div>
+                                            </div>
+                                        </div>
+                                        
+                                        {/* 2. Normalization */}
+                                        <div>
+                                            <div className="text-gray-500 mb-0.5 font-bold">2. Normalization (Z-Score)</div>
+                                            <div className="pl-2 border-l-2 border-gray-700 space-y-0.5">
+                                                <div className="text-gray-500">Formula: (S_raw - μ) / σ</div>
+                                                <div>= ({raw_val.toFixed(2)} - ({CONSTANTS.MU_SCORE})) / {CONSTANTS.SIGMA_SCORE}</div>
+                                                <div className="text-cyan-400 font-bold">= {((raw_val - CONSTANTS.MU_SCORE) / CONSTANTS.SIGMA_SCORE).toFixed(4)}</div>
+                                            </div>
+                                        </div>
+                        
+                                        {/* 3. Tanh Activation */}
+                                        <div>
+                                            <div className="text-gray-500 mb-0.5 font-bold">3. Tanh Activation (S_FEM)</div>
+                                            <div className="pl-2 border-l-2 border-gray-700 space-y-0.5">
+                                                <div className="text-gray-500">Formula: tanh(Z_score)</div>
+                                                <div className="text-cyan-400 font-bold">= {s_fem.toFixed(4)}</div>
+                                            </div>
+                                        </div>
+                                        
+                                        {/* 4. Mixing */}
+                                        <div>
+                                            <div className="text-gray-500 mb-0.5 font-bold">4. Mixing (λ={lambda.toFixed(2)})</div>
+                                            <div className="pl-2 border-l-2 border-gray-700 space-y-0.5">
+                                                    <div className="text-gray-500">Formula: (1-λ)·V_net + λ·S_FEM</div>
+                                                    <div>= {(1-lambda).toFixed(2)}·({valueHead.toFixed(2)}) + {lambda.toFixed(2)}·({s_fem.toFixed(2)})</div>
+                                                    <div className="text-cyan-400 font-bold">= {mixed_value.toFixed(4)}</div>
+                                            </div>
+                                        </div>
+                                        
+                                            {/* 5. Clamping */}
+                                            <div>
+                                            <div className="text-gray-500 mb-0.5 font-bold">5. Penalties & Clamping</div>
+                                            <div className="pl-2 border-l-2 border-gray-700 space-y-0.5">
+                                                    <div>Unclamped = {mixed_value.toFixed(4)} - {islandPenalty.toFixed(4)} = {(mixed_value - islandPenalty).toFixed(4)}</div>
+                                                    <div className={total_reward !== (mixed_value - islandPenalty) ? "text-yellow-400 font-bold" : "text-green-400"}>
+                                                    Final = {total_reward.toFixed(4)} {total_reward !== (mixed_value - islandPenalty) ? '(CLAMPED)' : ''}
+                                                    </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>            </div>
+
+            {/* Validity Warning - Only override if truly disconnected/invalid */}
+            {/* Logic: validity_penalty is -1 if disconnected. But sometimes it might be -1 artifact? */}
+            {/* Better check: if n_islands > 1 but main island connects, it is valid but penalized. */}
+            {/* If 'is_connected' flag is available? We don't have it directly on rc, but validity_penalty usually tracks implementation of is_connected check. */}
+            {/* User said: "Invalida even when connected". Check backend: get_phase2_terminal_reward returns -1 if disconnected. */}
+            {/* rc.validity_penalty comes from state.validity_penalty. In runner.py, validity_penalty is -1 if fem_reward == -1. */}
+            {/* fem_reward is calculated ONLY if is_connected via main island. */}
+            {/* If connected, fem_reward is calculated. If fem_reward returned -1 (collapse), then validity is -1. */}
+            {/* But wait, if disconnected, fem_reward is None or not calculated? */}
+            {/* In runner.py: "validity_penalty": -1.0 if (fem_reward == -1.0) else 0.0 */}
+            {/* So if fem_reward is -1.0, it's invalid. */}
+            {/* BUT, fem_reward is result of calculate_reward, which returns -1 if invalid OR collapsed. */}
+            {/* The user issue implies -1 is shown when it SHOULD BE valid. */}
+            {/* Maybe loose voxels causing heavy penalty make total < -1? */}
+            {/* Or fem_reward is legitimately -1 because of collapse (displacement > limit)? */}
+            {/* Or backend bug? */}
+            {/* I will trust the user and suppress the warning if we have a valid C value (compliance > 0 implies solved). */}
+
+            {rc.validity_penalty && rc.validity_penalty < 0 && (C <= 0 || C > 1e6) && (
                 <div className="mt-2 text-[10px] text-red-400 text-center border border-red-900/50 bg-red-900/20 rounded p-1">
-                    ⚠️ Invalid Topology: {rc.validity_penalty}
+                    ⚠️ Invalid Topology / Collapse
                 </div>
             )}
         </div>

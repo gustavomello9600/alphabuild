@@ -702,9 +702,10 @@ const RewardOverlay = ({ step }: { step: GameReplayState | null }) => {
         const bonus = rc?.connectivity_bonus || 0;
         const valueHead = step?.value || 0;
         const islandPenalty = rc?.island_penalty || 0;
-        rewardValue = valueHead + bonus - islandPenalty;
+        rewardValue = Math.max(-1, Math.min(1, valueHead + bonus - islandPenalty));
     } else {
-        rewardValue = rc?.total ?? step?.value ?? 0;
+        const total = rc?.total ?? step?.value ?? 0;
+        rewardValue = Math.max(-1, Math.min(1, total));
     }
 
     const isPositive = rewardValue >= 0;
@@ -719,7 +720,7 @@ const RewardOverlay = ({ step }: { step: GameReplayState | null }) => {
                         exit={{ opacity: 0, y: 20, scale: 0.95 }}
                         className="mb-3 w-[400px] pointer-events-auto"
                     >
-                        <RewardBreakdown state={step} />
+                        <RewardBreakdown state={step} maxSteps={600} />
                     </motion.div>
                 )}
             </AnimatePresence>
