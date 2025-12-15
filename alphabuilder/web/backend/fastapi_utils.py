@@ -60,6 +60,7 @@ class Frame(BaseModel):
     # New fields for replay
     action_sequence: Optional[List[Action]] = None
     reward_components: Optional[RewardComponents] = None
+    displacement_map: Optional[str] = None  # Base64 encoded float32 array
 
 class EpisodeMetadata(BaseModel):
     """Metadata for an episode, sufficient for initialization without loading all frames."""

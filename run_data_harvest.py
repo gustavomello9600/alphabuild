@@ -281,7 +281,8 @@ def main():
                 "threshold": found_threshold,
                 "beta": current_frame.get('beta', 1),
                 "current_compliance": current_compliance,
-                "current_vol": current_vol
+                "current_vol": current_vol,
+                "displacement_map": current_frame.get('displacement_map', None)
             })
             record_idx += 1
             
@@ -308,7 +309,8 @@ def main():
                     policy_remove=policy_remove,
                     fitness_score=rec['target_value'],
                     is_final_step=is_final,
-                    is_connected=is_conn
+                    is_connected=is_conn,
+                    displacement_map=rec.get('displacement_map', None)
                 )
                 save_step(db_path, step_record)
 

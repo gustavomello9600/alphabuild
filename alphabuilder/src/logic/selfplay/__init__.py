@@ -23,7 +23,9 @@ from .storage import (
     get_game_count,
     get_last_step,
     get_incomplete_games,
+    get_incomplete_games,
     generate_game_id,
+    backpropagate_value_targets,
 )
 
 from .reward import (
@@ -51,7 +53,10 @@ from .reward import (
     analyze_structure_islands,
     calculate_island_penalty,
     get_reward_with_island_penalty,
+    calculate_island_penalty,
+    get_reward_with_island_penalty,
     calculate_connectivity_reward,
+    reverse_engineer_compliance,
 )
 
 __all__ = [
@@ -72,6 +77,9 @@ __all__ = [
     'get_last_step',
     'get_incomplete_games',
     'generate_game_id',
+    'backpropagate_value_targets',
+    'backpropagate_value_targets',
     'calculate_connectivity_reward',
+    'reverse_engineer_compliance',
 ]
 

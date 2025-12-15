@@ -15,6 +15,7 @@ export interface GameSummary {
     final_compliance: number | null;
     final_volume: number | null;
     total_steps: number;
+    initial_cantilever_problem_real_scale_factor: number;
     created_at: string;
 }
 
@@ -61,6 +62,7 @@ export interface GameStep {
     island_penalty?: number;
     loose_voxels?: number;
     reward_components?: RewardComponents | null;
+    displacement_map?: Float32Array; // [NEW]
 }
 
 
@@ -75,6 +77,7 @@ export interface GameData {
     final_compliance: number | null;
     final_volume: number | null;
     total_steps: number;
+    initial_cantilever_problem_real_scale_factor: number;
     steps: GameStep[];
 }
 
@@ -88,6 +91,7 @@ export interface GameMetadata {
     final_compliance: number | null;
     final_volume: number | null;
     total_steps: number;
+    initial_cantilever_problem_real_scale_factor: number;
     bc_masks: number[];
     forces: number[];
     value_history?: number[];
@@ -202,10 +206,12 @@ export interface GameReplayState {
     is_connected: boolean;
     n_islands: number;
     compliance_fem?: number;
+    max_displacement?: number;
     island_penalty?: number;
     loose_voxels?: number;
     connected_load_fraction?: number;
     reward_components?: RewardComponents | null;
+    displacement_map?: Float32Array; // [NEW]
 }
 
 

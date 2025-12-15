@@ -18,8 +18,11 @@ import {
     BarChart3,
     ChevronDown,
     ChevronUp,
+    Activity,
     Network,
     Sparkles,
+    Move,
+    TrendingUp,
 } from 'lucide-react';
 import * as THREE from 'three';
 
@@ -33,7 +36,7 @@ import { RewardBreakdown } from '../components/RewardBreakdown';
 // View Modes
 // =============================================================================
 
-type ViewMode = 'structure' | 'policy' | 'mcts' | 'combined' | 'decision';
+type ViewMode = 'structure' | 'policy' | 'mcts' | 'combined' | 'decision' | 'deformation' | 'strain';
 
 const VIEW_MODE_CONFIG: Record<ViewMode, { icon: typeof Box; label: string; shortcut: string }> = {
     structure: { icon: Box, label: 'Estrutura', shortcut: '1' },
@@ -41,6 +44,8 @@ const VIEW_MODE_CONFIG: Record<ViewMode, { icon: typeof Box; label: string; shor
     mcts: { icon: GitBranch, label: 'MCTS', shortcut: '3' },
     combined: { icon: Layers, label: 'Policy + MCTS', shortcut: '4' },
     decision: { icon: Target, label: 'Decisão', shortcut: '5' },
+    deformation: { icon: Move, label: 'Deslocamento', shortcut: 'D' },
+    strain: { icon: TrendingUp, label: 'Deformação', shortcut: 'S' },
 };
 
 // =============================================================================
@@ -115,9 +120,134 @@ const VoxelGridMCTS = ({
                 if (!opaqueRef.current.instanceColor || opaqueRef.current.instanceColor.count !== 20000) {
                     opaqueRef.current.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(20000 * 3), 3);
                 }
+
+                // Set Matrices
                 opaqueRef.current.instanceMatrix.array.set(opaqueMatrix);
                 opaqueRef.current.instanceMatrix.needsUpdate = true;
-                opaqueRef.current.instanceColor.array.set(opaqueColor);
+
+                // Set Colors (Standard or Deformation)
+                if (viewMode === 'deformation' && step.displacement_map) {
+                    const [, D, H, W] = step.tensor.shape;
+                    const colors = opaqueRef.current.instanceColor.array as Float32Array;
+
+                    // FIRST PASS: Calculate Max Displacement only from VISIBLE voxels
+                    // (not the entire array which may have spurious values in empty cells)
+                    let maxDisp = 0.000001;
+                    for (let i = 0; i < opaqueCount; i++) {
+                        const offset = i * 16;
+                        const x = opaqueMatrix[offset + 12];
+                        const y = opaqueMatrix[offset + 13];
+                        const z = opaqueMatrix[offset + 14];
+
+                        const d = Math.round(x + D / 2);
+                        const h = Math.round(y - 0.5);
+                        const w = Math.round(z + W / 2);
+
+                        if (d >= 0 && d < D && h >= 0 && h < H && w >= 0 && w < W) {
+                            const idx = d * (H * W) + h * W + w;
+                            const disp = step.displacement_map[idx];
+                            if (disp > maxDisp) maxDisp = disp;
+                        }
+                    }
+
+                    // SECOND PASS: Apply colors
+                    for (let i = 0; i < opaqueCount; i++) {
+                        const offset = i * 16;
+                        const x = opaqueMatrix[offset + 12];
+                        const y = opaqueMatrix[offset + 13];
+                        const z = opaqueMatrix[offset + 14];
+
+                        const d = Math.round(x + D / 2);
+                        const h = Math.round(y - 0.5);
+                        const w = Math.round(z + W / 2);
+
+                        if (d >= 0 && d < D && h >= 0 && h < H && w >= 0 && w < W) {
+                            const idx = d * (H * W) + h * W + w;
+                            const disp = step.displacement_map[idx];
+
+                            // Blue -> Red Heatmap
+                            const val = Math.min(1.0, disp / maxDisp);
+                            const hue = (1.0 - val) * 0.66;
+                            const color = new THREE.Color().setHSL(hue, 1.0, 0.5);
+
+                            colors[i * 3] = color.r;
+                            colors[i * 3 + 1] = color.g;
+                            colors[i * 3 + 2] = color.b;
+                        } else {
+                            colors[i * 3] = opaqueColor[i * 3];
+                            colors[i * 3 + 1] = opaqueColor[i * 3 + 1];
+                            colors[i * 3 + 2] = opaqueColor[i * 3 + 2];
+                        }
+                    }
+                } else if (viewMode === 'strain' && step.displacement_map) {
+                    // Strain visualization: gradient of displacement field
+                    const [, D, H, W] = step.tensor.shape;
+                    const colors = opaqueRef.current.instanceColor.array as Float32Array;
+                    const dispMap = step.displacement_map;
+
+                    // Helper to get displacement at grid position (with bounds check)
+                    const getDisp = (d: number, h: number, w: number): number => {
+                        if (d < 0 || d >= D || h < 0 || h >= H || w < 0 || w >= W) return 0;
+                        return dispMap[d * (H * W) + h * W + w] || 0;
+                    };
+
+                    // FIRST PASS: Calculate max strain from visible voxels
+                    let maxStrain = 0.000001;
+                    for (let i = 0; i < opaqueCount; i++) {
+                        const offset = i * 16;
+                        const x = opaqueMatrix[offset + 12];
+                        const y = opaqueMatrix[offset + 13];
+                        const z = opaqueMatrix[offset + 14];
+
+                        const d = Math.round(x + D / 2);
+                        const h = Math.round(y - 0.5);
+                        const w = Math.round(z + W / 2);
+
+                        if (d >= 0 && d < D && h >= 0 && h < H && w >= 0 && w < W) {
+                            // Calculate strain as gradient magnitude (central difference)
+                            const dDispDx = (getDisp(d + 1, h, w) - getDisp(d - 1, h, w)) / 2;
+                            const dDispDy = (getDisp(d, h + 1, w) - getDisp(d, h - 1, w)) / 2;
+                            const dDispDz = (getDisp(d, h, w + 1) - getDisp(d, h, w - 1)) / 2;
+                            const strain = Math.sqrt(dDispDx * dDispDx + dDispDy * dDispDy + dDispDz * dDispDz);
+                            if (strain > maxStrain) maxStrain = strain;
+                        }
+                    }
+
+                    // SECOND PASS: Apply strain colors
+                    for (let i = 0; i < opaqueCount; i++) {
+                        const offset = i * 16;
+                        const x = opaqueMatrix[offset + 12];
+                        const y = opaqueMatrix[offset + 13];
+                        const z = opaqueMatrix[offset + 14];
+
+                        const d = Math.round(x + D / 2);
+                        const h = Math.round(y - 0.5);
+                        const w = Math.round(z + W / 2);
+
+                        if (d >= 0 && d < D && h >= 0 && h < H && w >= 0 && w < W) {
+                            const dDispDx = (getDisp(d + 1, h, w) - getDisp(d - 1, h, w)) / 2;
+                            const dDispDy = (getDisp(d, h + 1, w) - getDisp(d, h - 1, w)) / 2;
+                            const dDispDz = (getDisp(d, h, w + 1) - getDisp(d, h, w - 1)) / 2;
+                            const strain = Math.sqrt(dDispDx * dDispDx + dDispDy * dDispDy + dDispDz * dDispDz);
+
+                            // Blue -> Red Heatmap (same as displacement)
+                            const val = Math.min(1.0, strain / maxStrain);
+                            const hue = (1.0 - val) * 0.66;
+                            const color = new THREE.Color().setHSL(hue, 1.0, 0.5);
+
+                            colors[i * 3] = color.r;
+                            colors[i * 3 + 1] = color.g;
+                            colors[i * 3 + 2] = color.b;
+                        } else {
+                            colors[i * 3] = opaqueColor[i * 3];
+                            colors[i * 3 + 1] = opaqueColor[i * 3 + 1];
+                            colors[i * 3 + 2] = opaqueColor[i * 3 + 2];
+                        }
+                    }
+                } else {
+                    // Standard Colors
+                    opaqueRef.current.instanceColor.array.set(opaqueColor);
+                }
                 opaqueRef.current.instanceColor.needsUpdate = true;
             }
 
@@ -143,7 +273,7 @@ const VoxelGridMCTS = ({
                         }
                         const opa = opacityAttrRef.current.array as Float32Array;
 
-                        const [C, D, H, W] = step.tensor.shape;
+                        const [, D, , W] = step.tensor.shape;
 
                         actions.forEach((a, i) => {
                             const x = a.x - D / 2;
@@ -251,12 +381,12 @@ const VoxelGridMCTS = ({
 };
 
 
-// Support colors helper
+// Support colors helper - Purple palette (distinctive, outside heatmap gradient)
 const SUPPORT_COLORS = {
-    FULL_CLAMP: '#00F0FF',  // Cyan - Fully fixed (XYZ)
-    RAIL_XY: '#7000FF',     // Purple - Rail constraint (XY fixed, Z free)
-    ROLLER_Y: '#00FF9D',    // Green - Roller (only Y fixed)
-    PARTIAL: '#3B82F6',     // Blue - Other partial constraints
+    FULL_CLAMP: '#9D4EDD',  // Vivid purple - Fully fixed (XYZ)
+    RAIL_XY: '#7B2CBF',     // Deep purple - Rail constraint (XY fixed, Z free)
+    ROLLER_Y: '#5A189A',    // Dark purple - Roller (only Y fixed)
+    PARTIAL: '#3C096C',     // Very dark purple - Other partial constraints
 };
 
 function getSupportColor(maskX: number, maskY: number, maskZ: number): string | null {
@@ -395,6 +525,8 @@ const ViewModeSwitcher = ({
             if (e.key === '3') setMode('mcts');
             if (e.key === '4') setMode('combined');
             if (e.key === '5') setMode('decision');
+            if (e.key === 'd' || e.key === 'D') setMode('deformation');
+            if (e.key === 's' || e.key === 'S') setMode('strain');
         };
         window.addEventListener('keydown', handler);
         return () => window.removeEventListener('keydown', handler);
@@ -691,7 +823,7 @@ const SimulationControls = ({
     );
 };
 
-const RewardOverlay = ({ step }: { step: GameReplayState | null }) => {
+const RewardOverlay = ({ step, scaleFactor }: { step: GameReplayState | null, scaleFactor?: number }) => {
     const [expanded, setExpanded] = useState(false);
 
     // Determine main value to show
@@ -704,8 +836,19 @@ const RewardOverlay = ({ step }: { step: GameReplayState | null }) => {
         const islandPenalty = rc?.island_penalty || 0;
         rewardValue = Math.max(-1, Math.min(1, valueHead + bonus - islandPenalty));
     } else {
-        const total = rc?.total ?? step?.value ?? 0;
-        rewardValue = Math.max(-1, Math.min(1, total));
+        // Phase 2: Show MCTS Mixed Value (Guided Value)
+        // Formula: (1 - λ) * V_net + λ * S_FEM - Penalty
+        const valueHead = step?.value || 0;
+        const s_fem = rc?.fem_reward || valueHead; // Fallback if no FEM
+        const islandPenalty = rc?.island_penalty || 0;
+
+        // Calculate Lambda (Mixing Factor)
+        const currentStep = step?.step || 0;
+        const maxSteps = 600; // Assuming 600 from context or pass as prop
+        const lambda = Math.min(1.0, currentStep / maxSteps);
+
+        const mixed_value = (1 - lambda) * valueHead + lambda * s_fem;
+        rewardValue = Math.max(-1, Math.min(1, mixed_value - islandPenalty));
     }
 
     const isPositive = rewardValue >= 0;
@@ -720,7 +863,7 @@ const RewardOverlay = ({ step }: { step: GameReplayState | null }) => {
                         exit={{ opacity: 0, y: 20, scale: 0.95 }}
                         className="mb-3 w-[400px] pointer-events-auto"
                     >
-                        <RewardBreakdown state={step} maxSteps={600} />
+                        <RewardBreakdown state={step} maxSteps={600} scaleFactor={scaleFactor} />
                     </motion.div>
                 )}
             </AnimatePresence>
@@ -759,9 +902,13 @@ const RewardOverlay = ({ step }: { step: GameReplayState | null }) => {
 const NeuralHUD = ({
     history,
     currentStep,
+    step,
+    viewMode,
 }: {
     history: number[];
     currentStep: number;
+    step: GameReplayState | null;
+    viewMode: ViewMode;
 }) => {
     const [isOpen, setIsOpen] = useState(true);
 
@@ -951,7 +1098,9 @@ export const GameReplay = () => {
                     <directionalLight position={[-10, 20, -10]} intensity={0.8} />
                     <gridHelper args={[100, 100, '#1a1a1a', '#111111']} />
 
+                    <gridHelper args={[100, 100, '#1a1a1a', '#111111']} />
                     <VoxelGridMCTS step={replayState} viewMode={viewMode} />
+                    <LoadVector step={replayState} />
                     <LoadVector step={replayState} />
                     <SupportVoxels step={replayState} />
 
@@ -982,8 +1131,33 @@ export const GameReplay = () => {
                 </div>
             </motion.div>
 
-            <div className="absolute bottom-8 left-[340px] z-10">
-                <ViewModeSwitcher mode={viewMode} setMode={setViewMode} />
+            <div className="absolute bottom-8 left-[340px] z-10 flex items-center gap-3">
+                <ViewModeSwitcher
+                    mode={viewMode}
+                    setMode={setViewMode}
+                />
+
+                {/* Displacement / Strain Scale Legend */}
+                {(viewMode === 'deformation' || viewMode === 'strain') && replayState?.displacement_map && (
+                    <div className="bg-black/60 backdrop-blur border border-white/10 rounded-xl px-3 py-2">
+                        <div className="text-[10px] text-white/40 uppercase mb-1 text-center">
+                            {viewMode === 'deformation' ? 'Deslocamento' : 'Deformação (ε)'}
+                        </div>
+                        <div className="flex items-center gap-2">
+                            <span className="text-[10px] text-blue-400 font-mono">0</span>
+                            <div className="w-24 h-2 rounded-full bg-gradient-to-r from-blue-600 via-cyan-400 via-yellow-400 to-red-500" />
+                            <span className="text-[10px] text-red-400 font-mono">
+                                {viewMode === 'deformation' ? (() => {
+                                    const max = replayState.max_displacement || 0;
+                                    if (max === 0) return '0 mm';
+                                    const scaleFactor = simState.metadata?.initial_cantilever_problem_real_scale_factor || 500000;
+                                    const mm = (max / scaleFactor) * 1000;
+                                    return mm >= 1 ? `${mm.toFixed(1)} mm` : `${(mm * 1000).toFixed(1)} μm`;
+                                })() : 'max'}
+                            </span>
+                        </div>
+                    </div>
+                )}
             </div>
 
             <MCTSStatsPanel
@@ -995,7 +1169,10 @@ export const GameReplay = () => {
             <NeuralHUD
                 history={history}
                 currentStep={simState.currentStep}
+                step={replayState}
+                viewMode={viewMode}
             />
+
 
             <SimulationControls
                 currentStep={replayState}
@@ -1008,7 +1185,7 @@ export const GameReplay = () => {
                 onSeek={handleSeek}
             />
 
-            <RewardOverlay step={replayState} />
+            <RewardOverlay step={replayState} scaleFactor={simState.metadata?.initial_cantilever_problem_real_scale_factor} />
 
             <AnimatePresence>
                 {(loading || error) && (

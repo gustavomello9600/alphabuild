@@ -5,6 +5,7 @@ import json
 import zlib
 import pickle
 import numpy as np
+import base64
 from typing import Optional
 
 try:
@@ -187,7 +188,7 @@ def load_episode_frames_v2(db_path: Path, episode_id: str, limit: int, offset: i
     
     cursor.execute("""
         SELECT step, phase, density_blob, policy_add_blob, policy_remove_blob, 
-               fitness_score, is_connected, selected_actions_json, reward_components_json
+               fitness_score, is_connected, selected_actions_json, reward_components_json, displacement_blob
         FROM records 
         WHERE episode_id = ? 
         ORDER BY step ASC
@@ -212,6 +213,12 @@ def load_episode_frames_v2(db_path: Path, episode_id: str, limit: int, offset: i
         action_sequence = json.loads(row[7]) if row[7] else None
         reward_components = json.loads(row[8]) if row[8] else None
 
+        # Helper to encode displacement map
+        displacement_b64 = None
+        if row[9] is not None:
+             disp_map = deserialize_array(row[9])
+             displacement_b64 = base64.b64encode(disp_map.astype(np.float32).tobytes()).decode('utf-8')
+
         frames.append(Frame(
             step=row[0],
             phase=row[1],
@@ -223,7 +230,8 @@ def load_episode_frames_v2(db_path: Path, episode_id: str, limit: int, offset: i
             policy_add=policy_add.flatten().tolist(),
             policy_remove=policy_remove.flatten().tolist(),
             action_sequence=action_sequence,
-            reward_components=reward_components
+            reward_components=reward_components,
+            displacement_map=displacement_b64
         ))
         
     return frames

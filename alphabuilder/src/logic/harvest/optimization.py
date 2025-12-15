@@ -139,12 +139,27 @@ def run_fenitop_optimization(
                 rho_nodal = np.zeros((nx+1, ny+1, nz+1), dtype=np.float32)
                 rho_nodal[grid_mapper[0], grid_mapper[1], grid_mapper[2]] = rho_flat
                 rho_3d = rho_nodal[:-1, :-1, :-1]
+                
+            # Process displacement map if available
+            disp_3d = None
+            if 'displacement_map' in data and data['displacement_map'] is not None:
+                disp_flat = data['displacement_map']
+                if grid_mapper is not None and len(disp_flat) == len(grid_mapper[0]):
+                    disp_nodal = np.zeros((nx+1, ny+1, nz+1), dtype=np.float32)
+                    disp_nodal[grid_mapper[0], grid_mapper[1], grid_mapper[2]] = disp_flat
+                    # Unlike density which is elemental (maybe?), displacement magnitude is nodal.
+                    # rho_3d is created by taking [:-1,:-1,:-1] from nodal array?
+                    # Wait, rho_phys_field is CG1 (nodal). The grid mapping puts nodal values into a grid.
+                    # So rho_3d is actually (nx, ny, nz) formed by dropping the last node layer?
+                    # This seems to be how density is handled. We'll do the same for displacement.
+                    disp_3d = disp_nodal[:-1, :-1, :-1]
 
             history.append({
                 'step': data['iter'],
                 'density_map': rho_3d,
                 'compliance': float(data['compliance']),
                 'vol_frac': float(data['vol_frac']),
+                'displacement_map': disp_3d,
                 'beta': data.get('beta', 1)
             })
             

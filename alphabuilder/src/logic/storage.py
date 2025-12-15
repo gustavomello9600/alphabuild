@@ -141,6 +141,7 @@ class StepRecord:
     fitness_score: float
     is_final_step: bool = False
     is_connected: bool = False
+    displacement_map: Optional[np.ndarray] = None
 
 
 # Legacy dataclass for backward compatibility
@@ -204,6 +205,7 @@ def initialize_database(db_path: Path) -> None:
             fitness_score REAL NOT NULL,
             is_final_step INTEGER DEFAULT 0,
             is_connected INTEGER DEFAULT 0,
+            displacement_blob BLOB,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (episode_id) REFERENCES episodes(episode_id),
             UNIQUE(episode_id, step)
@@ -308,8 +310,8 @@ def save_step(db_path: Path, record: StepRecord) -> None:
         cursor.execute("""
             INSERT OR REPLACE INTO records 
             (episode_id, step, phase, density_blob, policy_add_blob, 
-             policy_remove_blob, fitness_score, is_final_step, is_connected)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             policy_remove_blob, fitness_score, is_final_step, is_connected, displacement_blob)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             record.episode_id,
             record.step,
@@ -319,7 +321,8 @@ def save_step(db_path: Path, record: StepRecord) -> None:
             serialize_sparse(rem_indices, rem_values),
             record.fitness_score,
             1 if record.is_final_step else 0,
-            1 if record.is_connected else 0
+            1 if record.is_connected else 0,
+            serialize_array(record.displacement_map) if record.displacement_map is not None else None
         ))
         conn.commit()
     except sqlite3.Error as e:
@@ -389,7 +392,7 @@ def load_step(db_path: Path, episode_id: str, step: int,
     
     cursor.execute("""
         SELECT phase, density_blob, policy_add_blob, policy_remove_blob,
-               fitness_score, is_final_step, is_connected
+               fitness_score, is_final_step, is_connected, displacement_blob
         FROM records WHERE episode_id = ? AND step = ?
     """, (episode_id, step))
     
@@ -412,7 +415,8 @@ def load_step(db_path: Path, episode_id: str, step: int,
         policy_remove=sparse_decode(rem_indices, rem_values, resolution),
         fitness_score=row[4],
         is_final_step=bool(row[5]),
-        is_connected=bool(row[6])
+        is_connected=bool(row[6]),
+        displacement_map=deserialize_array(row[7]) if row[7] else None
     )
 
 

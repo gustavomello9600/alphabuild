@@ -43,6 +43,7 @@ from . import (
     analyze_structure_islands,
     calculate_island_penalty,
     calculate_connectivity_reward,
+    backpropagate_value_targets,
 )
 
 
@@ -242,7 +243,12 @@ def run_episode(
         forces=state.forces,
         load_config=load_config,
         bc_type=config.bc_type,
-        resolution=config.resolution
+        resolution=config.resolution,
+        final_compliance=None,
+        final_volume=None,
+        total_steps=0,
+        initial_cantilever_problem_real_scale_factor=500000.0,  # 16.0 units -> 0.032mm (High-Stiffness Steel)
+        stiffness_E=200e9         # Steel (Reference)
     )
     save_game(db_path, game_info)
     
@@ -388,6 +394,7 @@ def run_episode(
         compliance = None
         max_disp = None
         fem_reward = None
+        displacement_map = None
         if state.phase == Phase.REFINEMENT and island_analysis['is_connected']:
             # Evaluate only the main island (connected component)
             main_mask = island_analysis['main_island_mask']
@@ -399,6 +406,7 @@ def run_episode(
             if fem_result.valid:
                 compliance = fem_result.compliance
                 max_disp = fem_result.max_displacement
+                displacement_map = fem_result.displacement_map
                 fem_reward = calculate_reward(
                     compliance=compliance,
                     vol_frac=vol_frac,
@@ -464,7 +472,7 @@ def run_episode(
             reward_components=reward_components,
             executed_actions=executed_actions,
             connected_load_fraction=connected_load_fraction,
-            value_target=value_target
+            value_target=value_target, displacement_map=displacement_map
         )
         
         # Apply micro-batch actions to density
@@ -597,6 +605,10 @@ def run_episode(
         total_steps=state.current_step
     )
     
+    # Backpropagate Value Targets (Phase 1 = Final, Phase 2 = Mixed)
+    print("Backpropagating Value Targets...")
+    backpropagate_value_targets(db_path, state.game_id)
+
     return state.game_id, final_score, state.current_step
 
 
@@ -1007,5 +1019,9 @@ def resume_episode(
         total_steps=state.current_step
     )
     
+    # Backpropagate Value Targets (Phase 1 = Final, Phase 2 = Mixed)
+    print("Backpropagating Value Targets...")
+    backpropagate_value_targets(db_path, state.game_id)
+
     return state.game_id, final_score, state.current_step
 

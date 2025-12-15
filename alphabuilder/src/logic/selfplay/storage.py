@@ -75,6 +75,8 @@ class GameInfo:
     final_compliance: Optional[float] = None
     final_volume: Optional[float] = None
     total_steps: int = 0
+    initial_cantilever_problem_real_scale_factor: float = 500000.0
+    stiffness_E: float = 200e9
 
 
 @dataclass
@@ -101,6 +103,8 @@ class GameStep:
     max_displacement: Optional[float] = None # Max displacement from FEM
     island_penalty: float = 0.0            # Penalty applied for disconnected islands
     volume_fraction: float = 0.0           # Pre-calculated volume fraction
+    connected_load_fraction: float = 0.0   # Fraction of loads connected to support
+    displacement_map: Optional[np.ndarray] = None # Full displacement field
     reward_components: Dict[str, float] = field(default_factory=dict) # Detailed reward breakdown
 
 
@@ -126,6 +130,32 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         ("final_reward", "REAL", None),
     ]
     
+    # Check games table for new physics fields
+    cursor.execute("PRAGMA table_info(games)")
+    game_columns = [row[1] for row in cursor.fetchall()]
+    
+    game_migrations = [
+        ("initial_cantilever_problem_real_scale_factor", "REAL", "500000.0"),
+        ("stiffness_E", "REAL", "200000000000.0"),
+    ]
+    
+    for col_name, col_type, default in game_migrations:
+        if col_name not in game_columns:
+            print(f"Migrating database: Adding {col_name} to games table...")
+            try:
+                default_clause = f" DEFAULT {default}" if default else ""
+                cursor.execute(f"ALTER TABLE games ADD COLUMN {col_name} {col_type}{default_clause}")
+                conn.commit()
+                print(f"Migration of {col_name} successful.")
+            except sqlite3.Error as e:
+                # Ignore if column already exists (sqlite < 3.35 doesn't support IF NOT EXISTS in ALTER)
+                # But we checked PRAGMA table_info, so this is just extra safety
+                print(f"Migration of {col_name} failed (might exist): {e}")
+
+    # Special Migration: Rename displacement_scale if implementation changes
+    # But since we are allowed to RESET DB, we don't need complex rename logic.
+    # The user asked for "reset logic", so maybe strict schema is ok.
+    
     for col_name, col_type, default in migrations:
         if col_name not in columns:
             print(f"Migrating database: Adding {col_name} column...")
@@ -150,8 +180,9 @@ def initialize_selfplay_db(db_path: Path) -> None:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL;")
     
+    
     # Run migration check on every startup
-    migrate_db(conn)
+    # migrate_db(conn)
     
     cursor = conn.cursor()
     
@@ -170,6 +201,8 @@ def initialize_selfplay_db(db_path: Path) -> None:
             final_compliance REAL,
             final_volume REAL,
             total_steps INTEGER DEFAULT 0,
+            initial_cantilever_problem_real_scale_factor REAL DEFAULT 500000.0,
+            stiffness_E REAL DEFAULT 200000000000.0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -202,6 +235,8 @@ def initialize_selfplay_db(db_path: Path) -> None:
             connected_load_fraction REAL DEFAULT 0.0,
             value_target REAL,
             final_reward REAL,
+            fem_reward REAL,
+            displacement_map_blob BLOB,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (game_id) REFERENCES games(game_id),
             UNIQUE(game_id, step)
@@ -246,8 +281,9 @@ def save_game(db_path: Path, game: GameInfo) -> None:
             INSERT OR REPLACE INTO games 
             (game_id, neural_engine, checkpoint_version, bc_masks_blob, 
              forces_blob, load_config, bc_type, resolution,
-             final_score, final_compliance, final_volume, total_steps)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             final_score, final_compliance, final_volume, total_steps,
+             initial_cantilever_problem_real_scale_factor, stiffness_E)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             game.game_id,
             game.neural_engine,
@@ -260,7 +296,9 @@ def save_game(db_path: Path, game: GameInfo) -> None:
             game.final_score,
             game.final_compliance,
             game.final_volume,
-            game.total_steps
+            game.total_steps,
+            game.initial_cantilever_problem_real_scale_factor,
+            game.stiffness_E
         ))
         conn.commit()
     except sqlite3.Error as e:
@@ -284,7 +322,10 @@ def record_step(
     reward_components: Optional[Dict[str, float]] = None,
     executed_actions: Optional[List[Tuple[int, int, int, int]]] = None,
     connected_load_fraction: float = 0.0,
-    value_target: Optional[float] = None
+    value_target: Optional[float] = None,
+    final_reward: Optional[float] = None,
+    fem_reward: Optional[float] = None,
+    displacement_map: Optional[np.ndarray] = None,
 ) -> None:
     """
     Record a single game step with all associated data.
@@ -293,6 +334,7 @@ def record_step(
     
     # Compress arrays
     density_blob = serialize_array(state.density)
+    displacement_map_blob = serialize_array(displacement_map) if displacement_map is not None else None
     
     # Sparse compress policies
     idx_add, val_add = sparse_encode(policy_add)
@@ -393,8 +435,9 @@ def record_step(
                 selected_actions_json, value, mcts_stats_json,
                 n_islands, loose_voxels, is_connected,
                 compliance_fem, max_displacement, island_penalty, volume_fraction,
-                reward_components_json, connected_load_fraction, value_target
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                reward_components_json, connected_load_fraction, value_target,
+                final_reward, fem_reward, displacement_map_blob
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             state.game_id, state.current_step, state.phase.value, density_blob,
             p_add_blob, p_rem_blob,
@@ -404,7 +447,8 @@ def record_step(
             island_analysis['loose_voxels'] if island_analysis else 0,
             1 if (island_analysis and island_analysis['is_connected']) else 0,
             compliance_fem, max_displacement, island_penalty, volume_fraction,
-            reward_components_json, connected_load_fraction, value_target
+            reward_components_json, connected_load_fraction, value_target,
+            final_reward, fem_reward, displacement_map_blob
         ))
         
         conn.commit()
@@ -433,23 +477,125 @@ def update_game_final(
         # Update games table
         cursor.execute("""
             UPDATE games 
-            SET final_score = ?, final_compliance = ?, 
-                final_volume = ?, total_steps = COALESCE(?, total_steps)
+            SET final_score = ?, final_volume = ?, total_steps = ?
             WHERE game_id = ?
-        """, (final_score, final_compliance, final_volume, total_steps, game_id))
+        """, (final_score, final_volume, total_steps, game_id))
         
-        # Backfill final_reward to ALL steps of this episode
-        cursor.execute("""
-            UPDATE game_steps
-            SET final_reward = ?
-            WHERE game_id = ?
-        """, (final_score, game_id))
-        
-        conn.commit()
+        cursor.execute("COMMIT")
     except sqlite3.Error as e:
-        print(f"Error updating game: {e}")
+        cursor.execute("ROLLBACK")
+        print(f"Error updating game final: {e}")
     finally:
         conn.close()
+
+
+def backpropagate_value_targets(
+    db_path: Path, 
+    game_id: str
+) -> None:
+    """
+    Backpropagate final results to set 'value_target' for all steps in the episode.
+    
+    Logic:
+    1. Calculate Pure FEM Score of the FINAL Step 
+       (using calculate_fem_score, NOT the limited reward).
+    2. For Phase 1 (GROWTH) steps:
+       Target = Final Episode FEM Score
+    3. For Phase 2 (REFINEMENT) steps:
+       Lambda = Step / Total_Episode_Steps
+       Target = (1 - Lambda) * Current_FEM + Lambda * Final_FEM
+       
+    Args:
+        db_path: Path to database
+        game_id: Game ID to process
+    """
+    from .reward import calculate_fem_score, reverse_engineer_compliance  # Late import to avoid circular dependency
+    
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    try:
+        # 1. Get all steps with necessary data (compliance_fem, volume_fraction)
+        cursor.execute("""
+            SELECT step, phase, compliance_fem, volume_fraction
+            FROM game_steps
+            WHERE game_id = ?
+            ORDER BY step ASC
+        """, (game_id,))
+        
+        steps = cursor.fetchall()
+        if not steps:
+            return
+            
+        # 2. Determine Final Episode Score (Pure FEM)
+        # Get last step
+        last_step_row = steps[-1]
+        last_step_idx = last_step_row[0]  # step index
+        _, _, last_comp, last_vol = last_step_row
+        
+        final_fem_score = 0.0
+        if last_comp is not None:
+             final_fem_score = calculate_fem_score(last_comp, last_vol)
+        else:
+             # Fallback if final step has no compliance (e.g. invalid)
+             final_fem_score = -1.0 
+             
+        # 3. Calculate Targets for each step
+        updates = []
+        
+        for step_idx, phase_val, comp, vol in steps:
+            # Phase value is stored as 'GROWTH' or 'REFINEMENT' string? 
+            # Check create_schema: phase TEXT.
+            # Enum stores as string 'GROWTH', 'REFINEMENT' in runner logic via .value
+            
+            target = 0.0
+            
+            if phase_val == 'GROWTH':
+                # Phase 1: Target is the final outcome
+                target = final_fem_score
+            else:
+                # Phase 2: Mixed target
+                # Lambda scales with progress towards the end of THIS episode
+                # lambda = current_step / total_steps
+                # Note: step_idx is 1-based usually if from database? No, runner initializes 0 or 1?
+                # Usually 1-based in DB if from runner.py logic.
+                
+                # Careful with division by zero
+                current_lambda = step_idx / max(1, last_step_idx)
+                current_lambda = min(1.0, max(0.0, current_lambda))
+                
+                if comp is not None:
+                    current_score = calculate_fem_score(comp, vol)
+                    target = (1.0 - current_lambda) * current_score + current_lambda * final_fem_score
+                else:
+                    # If current step invalid (no compliance), use final logic or penalty
+                    target = final_fem_score # Fallback
+            
+            # Clamp target
+            target = max(-1.0, min(1.0, float(target)))
+            updates.append((target, game_id, step_idx))
+            
+        # 4. Batch Update
+        cursor.executemany("""
+            UPDATE game_steps
+            SET value_target = ?
+            WHERE game_id = ? AND step = ?
+        """, updates)
+        
+        conn.commit()
+        # print(f"Backpropagated targets for {game_id}: Final Score = {final_fem_score:.4f}")
+        
+    except sqlite3.Error as e:
+        print(f"Error backpropagating targets for {game_id}: {e}")
+        conn.rollback()
+    except Exception as e:
+        print(f"Unexpected error in backpropagate: {e}")
+    finally:
+        conn.close()
+
+# Helper Stub if reverse_engineer needed later (not used here yet)
+def reverse_engineer_compliance(score, vol):
+    return 1.0
 
 
 # =============================================================================
@@ -464,7 +610,7 @@ def load_game(db_path: Path, game_id: str) -> Optional[GameInfo]:
     cursor.execute("""
         SELECT neural_engine, checkpoint_version, bc_masks_blob, forces_blob,
                load_config, bc_type, resolution, final_score, final_compliance,
-               final_volume, total_steps
+               final_volume, total_steps, initial_cantilever_problem_real_scale_factor, stiffness_E
         FROM games WHERE game_id = ?
     """, (game_id,))
     
@@ -483,10 +629,11 @@ def load_game(db_path: Path, game_id: str) -> Optional[GameInfo]:
         load_config=json.loads(row[4]),
         bc_type=row[5],
         resolution=tuple(json.loads(row[6])),
-        final_score=row[7],
         final_compliance=row[8],
         final_volume=row[9],
-        total_steps=row[10] or 0
+        total_steps=row[10] or 0,
+        initial_cantilever_problem_real_scale_factor=row[11] if len(row) > 11 else 500000.0,
+        stiffness_E=row[12] if len(row) > 12 else 200e9
     )
 
 
@@ -506,7 +653,9 @@ def load_game_step(
                mcts_q_add_blob, mcts_q_remove_blob,
                selected_actions_json, value, mcts_stats_json,
                n_islands, loose_voxels, is_connected, compliance_fem,
-               max_displacement, island_penalty, volume_fraction
+               max_displacement, island_penalty, volume_fraction,
+               reward_components_json, connected_load_fraction, value_target,
+               final_reward, fem_reward, displacement_map_blob
         FROM game_steps WHERE game_id = ? AND step = ?
     """, (game_id, step))
     
@@ -546,6 +695,9 @@ def load_game_step(
         refutation=stats_data.get('refutation', False),
     )
     
+    # Parse reward components
+    reward_components_raw = json.loads(row[18]) if row[18] else {}
+
     return GameStep(
         game_id=game_id,
         step=step,
@@ -567,6 +719,12 @@ def load_game_step(
         max_displacement=row[15],
         island_penalty=row[16] if row[16] is not None else 0.0,
         volume_fraction=row[17] if row[17] is not None else 0.0,
+        reward_components=reward_components_raw,
+        connected_load_fraction=row[19] if row[19] is not None else 0.0,
+        value_target=row[20],
+        final_reward=row[21],
+        fem_reward=row[22],
+        displacement_map=deserialize_array(row[23]) if row[23] else None,
     )
 
 
@@ -580,18 +738,88 @@ def load_all_game_steps(
     cursor = conn.cursor()
     
     cursor.execute("""
-        SELECT step FROM game_steps 
-        WHERE game_id = ? 
-        ORDER BY step
+        SELECT step, phase, policy_add_blob, policy_remove_blob,
+               mcts_visit_add_blob, mcts_visit_remove_blob,
+               mcts_q_add_blob, mcts_q_remove_blob,
+               selected_actions_json, density_blob, value, mcts_stats_json,
+               reward_components_json, n_islands, loose_voxels, is_connected,
+               connected_load_fraction, volume_fraction, value_target, final_reward,
+               fem_reward, island_penalty, displacement_map_blob, max_displacement
+        FROM game_steps
+        WHERE game_id = ?
+        ORDER BY step ASC
     """, (game_id,))
     
-    steps = [row[0] for row in cursor.fetchall()]
-    conn.close()
+    steps = []
+    for row in cursor.fetchall():
+        # Unpack row
+        (step, phase_str, pol_add_b, pol_rem_b, mcts_add_b, mcts_rem_b, q_add_b, q_rem_b, 
+         sel_act_json, dens_b, val, mcts_stats_json, res_json,
+         n_islands, loose, is_conn, conn_load_frac, vol_frac, val_tgt, fin_rwd, fem_rwd, isl_pen, disp_blob, max_disp) = row
+        
+        # Decode sparse arrays
+        def decode_sparse_or_zeros(blob: Optional[bytes]) -> np.ndarray:
+            if blob is None:
+                return np.zeros(resolution, dtype=np.float32)
+            indices, values = deserialize_sparse(blob)
+            return sparse_decode(indices, values, resolution)
+        
+        # Parse selected actions
+        actions_data = json.loads(sel_act_json) if sel_act_json else []
+        selected_actions = [
+            SelectedAction(
+                channel=a['channel'],
+                x=a['x'], y=a['y'], z=a['z'],
+                visits=a['visits'],
+                q_value=a['q_value']
+            )
+            for a in actions_data
+        ]
+        
+        # Parse MCTS stats
+        stats_data = json.loads(mcts_stats_json) if mcts_stats_json else {}
+        mcts_stats = MCTSStats(
+            num_simulations=stats_data.get('num_simulations', 0),
+            nodes_expanded=stats_data.get('nodes_expanded', 0),
+            max_depth=stats_data.get('max_depth', 0),
+            cache_hits=stats_data.get('cache_hits', 0),
+            top8_concentration=stats_data.get('top8_concentration', 0.0),
+            refutation=stats_data.get('refutation', False),
+        )
+        
+        # Parse reward components
+        reward_components_raw = json.loads(res_json) if res_json else {}
+        
+        steps.append(GameStep(
+            game_id=game_id,
+            step=step,
+            phase=Phase(phase_str),
+            density=deserialize_array(dens_b),
+            policy_add=decode_sparse_or_zeros(pol_add_b),
+            policy_remove=decode_sparse_or_zeros(pol_rem_b),
+            mcts_visit_add=decode_sparse_or_zeros(mcts_add_b),
+            mcts_visit_remove=decode_sparse_or_zeros(mcts_rem_b),
+            mcts_q_add=decode_sparse_or_zeros(q_add_b),
+            mcts_q_remove=decode_sparse_or_zeros(q_rem_b),
+            selected_actions=selected_actions,
+            value=val,
+            mcts_stats=mcts_stats,
+            n_islands=n_islands if n_islands is not None else 1,
+            loose_voxels=loose if loose is not None else 0,
+            is_connected=bool(is_conn) if is_conn is not None else False,
+            connected_load_fraction=conn_load_frac if conn_load_frac is not None else 0.0,
+            volume_fraction=vol_frac if vol_frac is not None else 0.0,
+            reward_components=reward_components_raw,
+            value_target=val_tgt,
+            final_reward=fin_rwd,
+            fem_reward=fem_rwd,
+            island_penalty=isl_pen,
+            displacement_map=deserialize_array(disp_blob) if disp_blob else None,
+            max_displacement=max_disp if max_disp is not None else 0.0,
+        ))
     
-    return [
-        load_game_step(db_path, game_id, s, resolution)
-        for s in steps
-    ]
+    conn.close()
+    return steps
 
 
 def load_game_steps_range(
@@ -613,7 +841,8 @@ def load_game_steps_range(
                mcts_q_add_blob, mcts_q_remove_blob,
                selected_actions_json, value, mcts_stats_json, step,
                n_islands, loose_voxels, is_connected, volume_fraction,
-               reward_components_json, compliance_fem, island_penalty, connected_load_fraction
+               reward_components_json, compliance_fem, island_penalty, connected_load_fraction,
+               max_displacement, displacement_map_blob
         FROM game_steps 
         WHERE game_id = ? 
         ORDER BY step
@@ -678,6 +907,9 @@ def load_game_steps_range(
             reward_components=reward_components_raw,
             compliance_fem=row[17] if row[17] is not None else None,
             island_penalty=row[18] if row[18] is not None else 0.0,
+            connected_load_fraction=row[19] if row[19] is not None else 0.0,
+            max_displacement=row[20] if row[20] is not None else 0.0,
+            displacement_map=deserialize_array(row[21]) if row[21] else None,
         ))
     
     return result

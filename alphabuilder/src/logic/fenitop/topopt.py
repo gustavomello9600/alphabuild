@@ -41,6 +41,14 @@ def topopt(fem, opt, initial_density=None, callback=None):
     heaviside = Heaviside(rho_phys_field)
     sens_problem = Sensitivity(comm, opt, linear_problem, u_field, lambda_field, rho_phys_field)
     S_comm = Communicator(rho_phys_field.function_space, fem["mesh_serial"])
+    
+    # Helper for displacement magnitude
+    disp_mag_field = None
+    if callback:
+         # Create a scalar function on the same space as rho_phys_field (Lagrange 1) to hold magnitudes
+         from dolfinx.fem import Function
+         disp_mag_field = Function(rho_phys_field.function_space)
+
     # if comm.rank == 0:
     #     plotter = Plotter(fem["mesh_serial"])
     num_consts = 1 if opt["opt_compliance"] else 2
@@ -148,6 +156,17 @@ def topopt(fem, opt, initial_density=None, callback=None):
             # ALL ranks must participate in gather, not just rank 0
             rho_phys_global = S_comm.gather(rho_phys_field)
             
+            # Gather displacement magnitude (collective)
+            disp_mag_global = None
+            if disp_mag_field:
+                 # Calculate magnitude (local)
+                 u_vecs = u_field.x.array.reshape(-1, 3)
+                 mags = np.linalg.norm(u_vecs, axis=1)
+                 # Assign to scalar field
+                 disp_mag_field.x.array[:] = mags
+                 # Gather
+                 disp_mag_global = S_comm.gather(disp_mag_field)
+
             # Only rank 0 executes the callback
             if comm.rank == 0 and rho_phys_global is not None:
                 step_data = {
@@ -156,6 +175,7 @@ def topopt(fem, opt, initial_density=None, callback=None):
                     "vol_frac": V_value,
                     "change": change,
                     "density": rho_phys_global,
+                    "displacement_map": disp_mag_global,
                     "beta": beta
                 }
                 callback(step_data)

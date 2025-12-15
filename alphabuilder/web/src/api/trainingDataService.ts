@@ -56,6 +56,7 @@ export interface Frame {
     policy_remove: number[] | null;
     action_sequence?: Action[] | null;     // [NEW] Sequence of actions
     reward_components?: RewardComponents | null; // [NEW] Breakdown
+    displacement_map?: string; // Base64 encoded float32 array
 }
 
 export interface EpisodeData {
@@ -144,6 +145,7 @@ export interface ReplayState {
     };
     action_sequence?: Action[] | null; // [NEW]
     reward_components?: RewardComponents | null; // [NEW]
+    displacement_map?: Float32Array;
 }
 
 export class TrainingDataReplayService {
@@ -248,10 +250,23 @@ export class TrainingDataReplayService {
                 },
                 value_confidence: frame.fitness_score,
                 policy_heatmap: policyHeatmap,
-                action_sequence: frame.action_sequence, // [NEW]
-                reward_components: frame.reward_components, // [NEW]
+                action_sequence: frame.action_sequence,
+                reward_components: frame.reward_components,
+                displacement_map: frame.displacement_map
+                    ? new Float32Array(this.base64ToArrayBuffer(frame.displacement_map))
+                    : undefined
             };
         });
+    }
+
+    private base64ToArrayBuffer(base64: string): ArrayBuffer {
+        const binaryString = window.atob(base64);
+        const len = binaryString.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+        }
+        return bytes.buffer;
     }
 
     play(): void {

@@ -39,7 +39,10 @@ ALPHA_VOL = 12.0
 EPSILON = 1e-9
 
 # Displacement limits for collapse detection
-DEFAULT_DISPLACEMENT_LIMIT = 10.0  # meters (very generous for small structures)
+DISPLACEMENT_LIMIT_RAW = 128000.0  # (L/250) * 500,000 = 0.256 * 500k = 128k. Allows weak but connected structures.
+
+# Physics Scale Factor (User defined Realism)
+INITIAL_CANTILEVER_PROBLEM_REAL_SCALE_FACTOR = 500000.0
 
 
 # =============================================================================
@@ -60,9 +63,10 @@ def calculate_compliance_score(compliance: float) -> float:
     Returns:
         Compliance score in [COMPLIANCE_MIN, COMPLIANCE_MAX]
     """
-    if compliance <= 0:
-        return COMPLIANCE_MAX
-    
+    # log10 mapping
+    if compliance <= 0: 
+        return float(COMPLIANCE_MAX)
+        
     log_c = np.log10(max(compliance, 1.0))
     score = COMPLIANCE_BASE - COMPLIANCE_SLOPE * (log_c - 1.0)
     
@@ -71,34 +75,85 @@ def calculate_compliance_score(compliance: float) -> float:
 
 def calculate_volume_bonus(vol_frac: float) -> float:
     """
-    Calculate the volume bonus/penalty.
-    
-    Volume is ALWAYS inversely proportional to reward:
-    - V < VOLUME_REFERENCE → positive bonus (lean structure)
-    - V > VOLUME_REFERENCE → negative penalty (heavy structure)
+    Calculate volume bonus (inversely proportional).
     
     Args:
-        vol_frac: Volume fraction (0.0 to 1.0). Lower is better.
+        vol_frac: Volume fraction (0.0 to 1.0)
         
     Returns:
-        Volume adjustment in [-VOLUME_PENALTY_MAX, VOLUME_BONUS_MAX]
+        Bonus/Penalty value
     """
-    # Linear relationship: (reference - actual) * sensitivity
     adjustment = (VOLUME_REFERENCE - vol_frac) * VOLUME_SENSITIVITY
-    
     return float(np.clip(adjustment, -VOLUME_PENALTY_MAX, VOLUME_BONUS_MAX))
 
 
-def calculate_raw_score(compliance: float, vol_frac: float) -> float:
+def calculate_raw_score(
+    compliance: float,
+    vol_frac: float
+) -> float:
     """
-    DEPRECATED: Legacy raw score calculation for backward compatibility.
+    Calculate raw score before clipping (Compliance + Volume).
     
-    S_raw = -ln(C + ε) - α·V_frac
-    
-    Note: This function is kept for backward compatibility with 
-    estimate_reward_components. New code should use calculate_reward directly.
+    Args:
+        compliance: Energy of deformation
+        vol_frac: Volume fraction
+        
+    Returns:
+        Unclipped raw score
     """
-    return -np.log(compliance + EPSILON) - ALPHA_VOL * vol_frac
+    c_score = calculate_compliance_score(compliance)
+    v_bonus = calculate_volume_bonus(vol_frac)
+    return c_score + v_bonus
+
+
+def reverse_engineer_compliance(fitness_score: float, vol_frac: float) -> float:
+    """
+    Back-calculate compliance C from legacy fitness score.
+    Used for recalculating targets from old data or mixed phase targets.
+    
+    Args:
+        fitness_score: Legacy fitness score [-1, 1]
+        vol_frac: Volume fraction
+        
+    Returns:
+        Estimated Compliance (Energy)
+    """
+    fitness = np.clip(fitness_score, -0.999999, 0.999999)
+    # S_fem = tanh((S_raw - mu) / sigma) -> raw = artanh(S)*sigma + mu
+    z = np.arctanh(fitness)
+    s_raw = z * SIGMA_SCORE + MU_SCORE
+    # S_raw = -ln(C) - alpha * V -> C = exp(-raw - alpha*V)
+    log_c_natural = -s_raw - (ALPHA_VOL * vol_frac)
+    return float(np.exp(log_c_natural))
+
+
+def calculate_fem_score(
+    compliance: float,
+    vol_frac: float
+) -> float:
+    """
+    Calculate the PURE physics score (Compliance + Volume).
+    
+    Target for Value Head Training.
+    Ignores game penalties (collapse, connectivity).
+    
+    Args:
+        compliance: Energy of deformation
+        vol_frac: Volume fraction
+        
+    Returns:
+        Score in [-1.0, 1.0] representing physical quality.
+    """
+    # 1. Calculate compliance score (log10 mapping)
+    compliance_score = calculate_compliance_score(compliance)
+    
+    # 2. Calculate volume bonus
+    volume_bonus = calculate_volume_bonus(vol_frac)
+    
+    # 3. Combine
+    score = compliance_score + volume_bonus
+    
+    return float(np.clip(score, -1.0, 1.0))
 
 
 def calculate_reward(
@@ -106,29 +161,24 @@ def calculate_reward(
     vol_frac: float,
     is_valid: bool,
     max_displacement: Optional[float] = None,
-    displacement_limit: float = DEFAULT_DISPLACEMENT_LIMIT
+    displacement_limit: float = DISPLACEMENT_LIMIT_RAW
 ) -> float:
     """
-    Calculate the reward for MCTS using the additive formula.
+    Calculate the GAME REWARD for MCTS.
     
-    R = compliance_score(C) + volume_bonus(V)
-    
-    Where:
-    - compliance_score: log10 mapping from C=10→0.80 to C=1M→0.00
-    - volume_bonus: linear inverse relationship (lower V = higher bonus)
+    Includes Game Rules (Penalties):
+    - Invalid/Disconnected -> -1.0
+    - Collapse (Displacement > Limit) -> -1.0
     
     Args:
-        compliance: Energy of deformation (Joules)
-        vol_frac: Volume fraction (0.0 to 1.0)
-        is_valid: Whether the physical solution is valid (structure connected, FEM solved)
-        max_displacement: Maximum displacement in the structure (optional)
-        displacement_limit: Threshold for collapse detection
+        compliance: Energy of deformation
+        vol_frac: Volume fraction
+        is_valid: Whether structure is connected
+        max_displacement: Maximum displacement
+        displacement_limit: Collapse threshold (Raw Units)
         
     Returns:
         Reward in range [-1, 1]
-        - Returns -1.0 for catastrophic failures (collapse, disconnection)
-        - Returns ~0.80 for excellent structures (C=10, V=0.10)
-        - Returns ~0.00 for poor structures (C=1M, V=0.10)
     """
     # 1. Hard constraint: structural validity
     if not is_valid:
@@ -138,16 +188,8 @@ def calculate_reward(
     if max_displacement is not None and max_displacement > displacement_limit:
         return -1.0
     
-    # 3. Calculate compliance score (log10 mapping)
-    compliance_score = calculate_compliance_score(compliance)
-    
-    # 4. Calculate volume bonus (always inverse: lower V = higher bonus)
-    volume_bonus = calculate_volume_bonus(vol_frac)
-    
-    # 5. Combine and clamp to [-1, 1]
-    reward = compliance_score + volume_bonus
-    
-    return float(np.clip(reward, -1.0, 1.0))
+    # 3. Use pure physics score
+    return calculate_fem_score(compliance, vol_frac)
 
 
 # =============================================================================

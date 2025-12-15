@@ -141,10 +141,14 @@ const VoxelGrid = ({
     tensor,
     heatmap,
     showHeatmap,
+    displacementMap,
+    showDisplacement,
 }: {
     tensor: ReplayState['tensor'] | null;
     heatmap?: { add: Float32Array; remove: Float32Array };
     showHeatmap: boolean;
+    displacementMap?: Float32Array;
+    showDisplacement?: boolean;
 }) => {
     // Separate refs for opaque (standard) and transparent (policy) meshes
     const opaqueRef = useRef<THREE.InstancedMesh>(null);
@@ -198,6 +202,14 @@ const VoxelGrid = ({
         let opaqueCount = 0;
         let policyCount = 0;
 
+        // Compute max displacement for normalization (per frame)
+        let maxDisp = 0.000001;
+        if (showDisplacement && displacementMap) {
+            for (let i = 0; i < displacementMap.length; i++) {
+                if (displacementMap[i] > maxDisp) maxDisp = displacementMap[i];
+            }
+        }
+
         // Initialize opacity attribute for policy mesh
         const maxPolicyInstances = 10000;
         if (!opacityAttrRef.current) {
@@ -214,6 +226,12 @@ const VoxelGrid = ({
 
                     // Channel 0: Density
                     const density = tensor.data[CHANNEL.DENSITY * (D * H * W) + flatIdx];
+
+                    // Data for Displacement Heatmap
+                    let dispMag = 0;
+                    if (displacementMap) {
+                        dispMag = displacementMap[flatIdx];
+                    }
 
                     // Support detection and color based on constraint type
                     let supportColor: string | null = null;
@@ -260,6 +278,12 @@ const VoxelGrid = ({
                             opaqueRef.current.setColorAt(opaqueCount, new THREE.Color(supportColor));
                         } else if (hasLoad) {
                             opaqueRef.current.setColorAt(opaqueCount, new THREE.Color('#FF6B00'));
+                        } else if (showDisplacement && displacementMap && density > 0.01) {
+                            // Deformation Heatmap (Blue -> Red)
+                            const val = Math.min(1.0, dispMag / maxDisp);
+                            const hue = (1.0 - val) * 0.66; // Blue (0.66) to Red (0.0)
+                            const color = new THREE.Color().setHSL(hue, 1.0, 0.5);
+                            opaqueRef.current.setColorAt(opaqueCount, color);
                         } else {
                             const val = Math.max(0.2, density);
                             const color = new THREE.Color().setHSL(0, 0, val * 0.95);
@@ -570,11 +594,15 @@ const NeuralHUD = ({
     history,
     showHeatmap,
     setShowHeatmap,
+    showDisplacement,
+    setShowDisplacement,
 }: {
     state: ReplayState | null;
     history: number[];
     showHeatmap: boolean;
     setShowHeatmap: (v: boolean) => void;
+    showDisplacement: boolean;
+    setShowDisplacement: (v: boolean) => void;
 }) => {
     const [isOpen, setIsOpen] = useState(true);
 
@@ -696,26 +724,69 @@ const NeuralHUD = ({
                             </div>
                         </div>
 
-                        {/* Policy Heatmap Toggle */}
-                        <div className="bg-black/60 backdrop-blur border border-white/10 p-2 rounded-xl pointer-events-auto">
-                            <button
-                                onClick={() => setShowHeatmap(!showHeatmap)}
-                                className={`
-                                    flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-medium transition-all
-                                    ${showHeatmap
-                                        ? 'bg-cyan/20 text-cyan border border-cyan/50'
-                                        : 'bg-white/10 text-white/60 hover:text-white hover:bg-white/20'
-                                    }
-                                `}
-                            >
-                                <Layers size={14} />
-                                {showHeatmap ? 'Ocultar Policy' : 'Mostrar Policy'}
-                            </button>
+                        {/* Deformation Heatmap Toggle */}
+                        <div className="bg-black/60 backdrop-blur border border-white/10 p-2 rounded-xl pointer-events-auto flex flex-col gap-2">
+                            <div className="flex gap-2">
+                                <button
+                                    onClick={() => setShowHeatmap(!showHeatmap)}
+                                    className={`
+                                        flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-medium transition-all
+                                        ${showHeatmap
+                                            ? 'bg-cyan/20 text-cyan border border-cyan/50'
+                                            : 'bg-white/10 text-white/60 hover:text-white hover:bg-white/20'
+                                        }
+                                    `}
+                                >
+                                    <Layers size={14} />
+                                    {showHeatmap ? 'Ocultar Policy' : 'Policy'}
+                                </button>
+
+                                <button
+                                    onClick={() => setShowDisplacement(!showDisplacement)}
+                                    className={`
+                                        flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-medium transition-all
+                                        ${showDisplacement
+                                            ? 'bg-magenta/20 text-magenta border border-magenta/50'
+                                            : 'bg-white/10 text-white/60 hover:text-white hover:bg-white/20'
+                                        }
+                                    `}
+                                >
+                                    <Network size={14} />
+                                    {showDisplacement ? 'Ocultar Deformation' : 'Deformation'}
+                                </button>
+                            </div>
+
+                            {/* Deformation Legend */}
+                            {showDisplacement && state?.displacement_map && (
+                                <div className="pt-2 border-t border-white/10">
+                                    <div className="flex justify-between text-[10px] text-white/40 uppercase mb-1">
+                                        <span>0 mm</span>
+                                        <span>
+                                            {(() => {
+                                                if (!state.displacement_map) return '0 mm';
+                                                let max = 0;
+                                                for (let i = 0; i < state.displacement_map.length; i++)
+                                                    if (state.displacement_map[i] > max) max = state.displacement_map[i];
+
+                                                // Real World Scale Factor = 500,000 (Hardcoded as per requirement)
+                                                // Max Disp usually ~1e-5 to 1e-4 raw.
+                                                // 1e-4 * 5e5 = 50.
+                                                const realVal = max * 500000;
+                                                return `${realVal.toFixed(2)} mm`;
+                                            })()}
+                                        </span>
+                                    </div>
+                                    <div className="h-2 rounded-full bg-gradient-to-r from-blue-600 via-cyan-400 via-yellow-400 to-red-500" />
+                                    <div className="text-[9px] text-white/30 font-mono mt-1 text-center">
+                                        Escala de Deformação Real (x500k)
+                                    </div>
+                                </div>
+                            )}
                         </div>
                     </motion.div>
                 )}
             </AnimatePresence>
-        </div>
+        </div >
     );
 };
 
@@ -765,6 +836,7 @@ export const EpisodeReplay = () => {
     const [simState, setSimState] = useState(trainingDataReplayService.getState());
     const [history, setHistory] = useState<number[]>([]);
     const [showHeatmap, setShowHeatmap] = useState(false);
+    const [showDisplacement, setShowDisplacement] = useState(false);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
 
@@ -864,6 +936,8 @@ export const EpisodeReplay = () => {
                         tensor={replayState?.tensor || null}
                         heatmap={replayState?.policy_heatmap}
                         showHeatmap={showHeatmap}
+                        displacementMap={replayState?.displacement_map}
+                        showDisplacement={showDisplacement}
                     />
                     <LoadVector tensor={replayState?.tensor || null} />
 
@@ -889,6 +963,8 @@ export const EpisodeReplay = () => {
                 history={history}
                 showHeatmap={showHeatmap}
                 setShowHeatmap={setShowHeatmap}
+                showDisplacement={showDisplacement}
+                setShowDisplacement={setShowDisplacement}
             />
 
             {/* Loading/Error States */}

@@ -5,6 +5,7 @@ import type { ReplayState } from '../api/trainingDataService';
 interface RewardBreakdownProps {
     state: GameReplayState | ReplayState | null;
     maxSteps?: number;
+    scaleFactor?: number;
 }
 
 // Backend constants (matching src/logic/selfplay/reward.py)
@@ -23,7 +24,7 @@ const CONSTANTS = {
     PENALTY_LOOSE_SCALE: 0.1
 };
 
-export const RewardBreakdown: React.FC<RewardBreakdownProps> = ({ state, maxSteps }) => {
+export const RewardBreakdown: React.FC<RewardBreakdownProps> = ({ state, maxSteps, scaleFactor = 500000.0 }) => {
     const [expanded, setExpanded] = React.useState(false);
     if (!state) return <div className="text-gray-500 italic">No data</div>;
 
@@ -186,6 +187,26 @@ export const RewardBreakdown: React.FC<RewardBreakdownProps> = ({ state, maxStep
                     <span className="text-[10px] text-gray-500 uppercase font-bold text-center block mb-1">Topology</span>
                     {renderMetric("Islands", islands)}
                     {renderMetric("Loose Voxels", loose)}
+                </div>
+            </div>
+
+            {/* Scale / Displacement Metrics */}
+            <div className="grid grid-cols-2 gap-3 mb-3">
+                <div className="bg-black/20 p-2 rounded border border-gray-800/50">
+                    <span className="text-[10px] text-gray-500 uppercase font-bold text-center block mb-1">Scale</span>
+                    {renderMetric("Factor", scaleFactor.toLocaleString())}
+                    {renderMetric("Limit (L/250)", "0.2560m")}
+                </div>
+                <div className="bg-black/20 p-2 rounded border border-gray-800/50">
+                    <span className="text-[10px] text-gray-500 uppercase font-bold text-center block mb-1">Max Displacement</span>
+                    {('max_displacement' in state && typeof state.max_displacement === 'number') ? (
+                        <>
+                            {renderMetric("Raw", (state.max_displacement).toFixed(0))}
+                            {renderMetric("Real", `${((state.max_displacement) / scaleFactor).toFixed(4)}m`)}
+                        </>
+                    ) : (
+                        <span className="text-[10px] text-gray-500 italic block text-center">N/A</span>
+                    )}
                 </div>
             </div>
 

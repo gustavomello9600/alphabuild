@@ -49,7 +49,10 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
                     if (s.visuals.mctsMatrix?.buffer) buffers.push(s.visuals.mctsMatrix.buffer);
                     if (s.visuals.mctsColor?.buffer) buffers.push(s.visuals.mctsColor.buffer);
                 }
+
+                if (s.displacement_map?.buffer) buffers.push(s.displacement_map.buffer);
             }
+
             // Remove duplicates just in case (though slicing creates unique buffers)
             const uniqueBuffers = Array.from(new Set(buffers));
             self.postMessage({ type: 'CHUNK_LOADED', payload: steps }, uniqueBuffers);
@@ -172,14 +175,15 @@ function parseBinaryStream(buffer: ArrayBuffer) {
             selected_actions.push({ channel, x, y, z, visits, q_value });
         }
 
-        // Parse extension block: n_islands(i), loose_voxels(i), is_connected(i), compliance_fem(f), island_penalty(f)
-        // Extension block is 20 bytes: 3 ints (12 bytes) + 2 floats (8 bytes)
+        // Parse extension block: n_islands(i), loose_voxels(i), is_connected(i), compliance_fem(f), island_penalty(f), max_displacement(f)
+        // Extension block is 24 bytes: 3 ints (12 bytes) + 3 floats (12 bytes)
         const n_islands = view.getInt32(cursor, true);
         const loose_voxels = view.getInt32(cursor + 4, true);
         const is_connected = view.getInt32(cursor + 8, true) === 1;
         const compliance_fem = view.getFloat32(cursor + 12, true);
         const island_penalty = view.getFloat32(cursor + 16, true);
-        cursor += 20;
+        const max_displacement = view.getFloat32(cursor + 20, true);
+        cursor += 24;
 
         // Parse reward_components (length int32 + bytes)
         const rcLength = view.getInt32(cursor, true);
@@ -196,6 +200,17 @@ function parseBinaryStream(buffer: ArrayBuffer) {
             const jsonStr = decoder.decode(jsonView);
             reward_components = JSON.parse(jsonStr);
             cursor += rcLength;
+        }
+
+        // Parse displacement_map (length int32 + bytes)
+        const dispLength = view.getInt32(cursor, true);
+        cursor += 4;
+
+        let displacement_map = undefined;
+        if (dispLength > 0) {
+            // It's a Float32Array
+            displacement_map = new Float32Array(buffer.slice(cursor, cursor + dispLength));
+            cursor += dispLength;
         }
 
         // Compute Visual Buffers immediately
@@ -226,7 +241,9 @@ function parseBinaryStream(buffer: ArrayBuffer) {
             is_connected,
             compliance_fem: compliance_fem || undefined,
             island_penalty: island_penalty || undefined,
-            reward_components, // [NEW]
+            max_displacement: max_displacement || undefined,
+            reward_components,
+            displacement_map, // [NEW]
             mcts_stats: {
                 num_simulations: numSimulations,
                 nodes_expanded: 0,

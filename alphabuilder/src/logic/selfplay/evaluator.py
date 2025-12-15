@@ -33,6 +33,7 @@ class FEMResult:
     max_displacement: float
     vol_frac: float
     valid: bool
+    displacement_map: Optional[np.ndarray] = None
     error_msg: Optional[str] = None
 
 
@@ -229,11 +230,30 @@ def evaluate_fem(
         displacement_magnitudes = np.linalg.norm(u_array, axis=1)
         max_displacement = float(np.max(displacement_magnitudes))
         
+        # --- Gather Global Displacement Map ---
+        # Only include displacement values where there is actual material
+        # Use np.maximum.at to handle multiple FEM nodes mapping to same grid cell
+        local_grid = np.zeros((nx, ny, nz), dtype=np.float32)
+        node_densities = density[x_idx, y_idx, z_idx]
+        has_material = node_densities > 0.5
+        
+        # Use maximum to aggregate (handles multiple nodes per cell correctly)
+        np.maximum.at(
+            local_grid,
+            (x_idx[has_material], y_idx[has_material], z_idx[has_material]),
+            displacement_magnitudes[has_material].astype(np.float32)
+        )
+        
+        # Reduce to get global grid (max is more appropriate than sum for overlapping regions)
+        global_displacement_map = np.zeros_like(local_grid)
+        comm.Allreduce(local_grid, global_displacement_map, op=MPI.MAX)
+        
         return FEMResult(
             compliance=float(compliance),
             max_displacement=max_displacement,
             vol_frac=vol_frac,
-            valid=True
+            valid=True,
+            displacement_map=global_displacement_map
         )
         
     except Exception as e:

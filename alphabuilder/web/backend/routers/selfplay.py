@@ -3,8 +3,10 @@ from pathlib import Path
 import sqlite3
 import json
 import json
+import json
 import struct
 import numpy as np
+import base64
 import math
 from fastapi import Response
 from typing import Optional, List
@@ -47,6 +49,8 @@ class SelfPlayGameSummary(BaseModel):
     final_volume: Optional[float]
     total_steps: int
     created_at: str
+    initial_cantilever_problem_real_scale_factor: float = 500000.0
+    stiffness_E: float = 200e9
 
 class SelectedActionData(BaseModel):
     channel: int
@@ -87,6 +91,7 @@ class SelfPlayStepData(BaseModel):
     island_penalty: float = 0.0
     loose_voxels: int = 0
     reward_components: Optional[dict] = None
+    displacement_map: Optional[str] = None  # Base64 encoded float32 array
 
 
 class SelfPlayGameData(BaseModel):
@@ -98,7 +103,10 @@ class SelfPlayGameData(BaseModel):
     final_score: Optional[float]
     final_compliance: Optional[float]
     final_volume: Optional[float]
+    final_volume: Optional[float]
     total_steps: int
+    initial_cantilever_problem_real_scale_factor: float = 500000.0
+    stiffness_E: float = 200e9
     steps: list[SelfPlayStepData]
 
 class SelfPlayGameMetadata(BaseModel):
@@ -112,6 +120,8 @@ class SelfPlayGameMetadata(BaseModel):
     final_compliance: Optional[float]
     final_volume: Optional[float]
     total_steps: int
+    initial_cantilever_problem_real_scale_factor: float = 500000.0
+    stiffness_E: float = 200e9
     value_history: Optional[list[float]] = None
 
 # --- Endpoints ---
@@ -150,6 +160,8 @@ def list_selfplay_games(
             final_volume=g.final_volume,
             total_steps=g.total_steps,
             created_at=g.created_at,
+            initial_cantilever_problem_real_scale_factor=getattr(g, 'initial_cantilever_problem_real_scale_factor', 500000.0),
+            stiffness_E=getattr(g, 'stiffness_E', 200e9),
         )
         for g in games
     ]
@@ -189,6 +201,8 @@ def get_selfplay_game_metadata(game_id: str, deprecated: bool = False):
         final_compliance=game.final_compliance,
         final_volume=game.final_volume,
         total_steps=game.total_steps,
+        initial_cantilever_problem_real_scale_factor=getattr(game, 'initial_cantilever_problem_real_scale_factor', 500000.0),
+        stiffness_E=getattr(game, 'stiffness_E', 200e9),
         value_history=value_history
     )
 
@@ -259,6 +273,7 @@ def get_selfplay_game_steps(
             island_penalty=getattr(s, 'island_penalty', 0.0),
             loose_voxels=getattr(s, 'loose_voxels', 0),
             reward_components=getattr(s, 'reward_components', None) or None,
+            displacement_map=base64.b64encode(s.displacement_map.astype(np.float32).tobytes()).decode('utf-8') if getattr(s, 'displacement_map', None) is not None else None,
         ))
         
     return step_data
@@ -328,14 +343,15 @@ def get_selfplay_game_steps_binary(
             # channel, x, y, z, visits (5 ints) + q_value (1 float)
             selected_actions_bytes += struct.pack('<5if', a.channel, a.x, a.y, a.z, a.visits, a.q_value)
         
-        # Extension block: n_islands(i), loose_voxels(i), is_connected(i), compliance_fem(f), island_penalty(f)
+        # Extension block: n_islands(i), loose_voxels(i), is_connected(i), compliance_fem(f), island_penalty(f), max_displacement(f)
         extension_bytes = struct.pack(
-            '<3i2f',
+            '<3i3f',
             getattr(s, 'n_islands', 1),
             getattr(s, 'loose_voxels', 0),
             1 if getattr(s, 'is_connected', False) else 0,
             float(getattr(s, 'compliance_fem', 0.0) or 0.0),
-            float(getattr(s, 'island_penalty', 0.0) or 0.0)
+            float(getattr(s, 'island_penalty', 0.0) or 0.0),
+            float(getattr(s, 'max_displacement', 0.0) or 0.0)
         )
 
         # [NEW] Reward Components JSON block
@@ -345,6 +361,13 @@ def get_selfplay_game_steps_binary(
             rc_json_bytes = json.dumps(rc).encode('utf-8')
         rc_header = struct.pack('<i', len(rc_json_bytes))
         
+        # [NEW] Displacement Map block
+        disp_map_bytes = b""
+        d_map = getattr(s, 'displacement_map', None)
+        if d_map is not None:
+             disp_map_bytes = d_map.astype(np.float32).tobytes()
+        disp_header = struct.pack('<i', len(disp_map_bytes))
+
         total_data_size = (
             len(tensor_bytes) + 
             len(policy_add_bytes) + 
@@ -354,7 +377,9 @@ def get_selfplay_game_steps_binary(
             len(selected_actions_bytes) +
             len(extension_bytes) +
             len(rc_header) + 
-            len(rc_json_bytes)
+            len(rc_json_bytes) +
+            len(disp_header) +
+            len(disp_map_bytes)
         )
         
         header = struct.pack(
@@ -379,5 +404,7 @@ def get_selfplay_game_steps_binary(
         output_buffer.extend(extension_bytes)
         output_buffer.extend(rc_header)
         output_buffer.extend(rc_json_bytes)
+        output_buffer.extend(disp_header)
+        output_buffer.extend(disp_map_bytes)
         
     return Response(content=bytes(output_buffer), media_type="application/octet-stream")
