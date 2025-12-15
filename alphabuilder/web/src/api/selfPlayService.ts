@@ -233,10 +233,6 @@ export class SelfPlayReplayService {
     private currentStepIndex = 0;
     private isPlaying = false;
 
-    // Pending requests
-    private pendingResolves = new Map<string, (steps: GameReplayState[]) => void>();
-    private pendingRejects = new Map<string, (err: any) => void>();
-
     // Constants
     private readonly FETCH_CHUNK_SIZE = 10; // Reduced to avoid timeout on visual computation
     private readonly PREFETCH_THRESHOLD = 5;
@@ -481,6 +477,10 @@ export class SelfPlayReplayService {
 
     getCurrentFrame(): GameReplayState | null {
         return this.framesMap.get(this.currentStepIndex) || null;
+    }
+
+    public getFrame(step: number): GameReplayState | undefined {
+        return this.framesMap.get(step);
     }
 }
 

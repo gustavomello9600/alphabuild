@@ -282,7 +282,16 @@ def main():
                 "beta": current_frame.get('beta', 1),
                 "current_compliance": current_compliance,
                 "current_vol": current_vol,
-                "displacement_map": current_frame.get('displacement_map', None)
+                "displacement_map": current_frame.get('displacement_map', None),
+                "reward_components": {
+                    "fem_score": current_frame.get('fem_score', 0.0),
+                    "mixing_factor": current_frame.get('mixing_factor', 0.0),
+                    "final_fem_score": current_frame.get('final_fem_score', 0.0),
+                    "final_compliance": current_frame.get('final_compliance', 0.0),
+                    "current_compliance": current_compliance,
+                    "current_vol": current_vol,
+                    "beta": current_frame.get('beta', 1)
+                }
             })
             record_idx += 1
             
@@ -310,7 +319,8 @@ def main():
                     fitness_score=rec['target_value'],
                     is_final_step=is_final,
                     is_connected=is_conn,
-                    displacement_map=rec.get('displacement_map', None)
+                    displacement_map=rec.get('displacement_map', None),
+                    reward_components=rec.get('reward_components', None)
                 )
                 save_step(db_path, step_record)
 

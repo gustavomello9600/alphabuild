@@ -162,11 +162,12 @@ def evaluate_fem(
         load_half_width = 1.0
         
         # Surface traction at right boundary (x=Lx) in load region
-        # This matches the harvest data setup exactly
+        # This matches the harvest data setup exactly (UPDATED to match load_config.x)
+        load_x_pos = float(load_config.get('x')) + 1.0
         def right_load_boundary(x):
             """Right face (x=Lx) within load region."""
             return (
-                np.isclose(x[0], Lx) &
+                np.isclose(x[0], load_x_pos) &
                 (x[1] >= ly - load_half_width - 0.5) & (x[1] <= ly + load_half_width + 0.5) &
                 (x[2] >= lz_center - load_half_width - 0.5) & (x[2] <= lz_center + load_half_width + 0.5)
             )

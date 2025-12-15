@@ -16,7 +16,7 @@ describe('TrainingDataReplayService', () => {
 
     it('should fetch databases (standalone)', async () => {
         const mockDbs = [{ id: 'db1', name: 'Database 1' }];
-        (global.fetch as any).mockResolvedValueOnce({
+        (globalThis as any).fetch.mockResolvedValueOnce({
             ok: true,
             json: async () => mockDbs,
         });

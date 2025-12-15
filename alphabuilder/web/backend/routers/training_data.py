@@ -188,7 +188,7 @@ def load_episode_frames_v2(db_path: Path, episode_id: str, limit: int, offset: i
     
     cursor.execute("""
         SELECT step, phase, density_blob, policy_add_blob, policy_remove_blob, 
-               fitness_score, is_connected, selected_actions_json, reward_components_json, displacement_blob
+               fitness_score, is_connected, reward_components_json, displacement_blob
         FROM records 
         WHERE episode_id = ? 
         ORDER BY step ASC
@@ -210,13 +210,20 @@ def load_episode_frames_v2(db_path: Path, episode_id: str, limit: int, offset: i
         policy_remove = sparse_decode(p_rem_idx, p_rem_val, resolution)
         
         # Deserialize JSON fields
-        action_sequence = json.loads(row[7]) if row[7] else None
-        reward_components = json.loads(row[8]) if row[8] else None
+        action_sequence = None # Not available in training data v2 schema
+        reward_components = json.loads(row[7]) if row[7] else None
+        
+        if reward_components:
+            # Backfill missing fields for Pydantic validation
+            if 'base_reward' not in reward_components:
+                reward_components['base_reward'] = reward_components.get('fem_score', 0.0)
+            if 'total' not in reward_components:
+                reward_components['total'] = row[5]
 
         # Helper to encode displacement map
         displacement_b64 = None
-        if row[9] is not None:
-             disp_map = deserialize_array(row[9])
+        if row[8] is not None:
+             disp_map = deserialize_array(row[8])
              displacement_b64 = base64.b64encode(disp_map.astype(np.float32).tobytes()).decode('utf-8')
 
         frames.append(Frame(

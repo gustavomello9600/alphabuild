@@ -142,6 +142,7 @@ class StepRecord:
     is_final_step: bool = False
     is_connected: bool = False
     displacement_map: Optional[np.ndarray] = None
+    reward_components: Optional[Dict[str, float]] = None
 
 
 # Legacy dataclass for backward compatibility
@@ -206,6 +207,7 @@ def initialize_database(db_path: Path) -> None:
             is_final_step INTEGER DEFAULT 0,
             is_connected INTEGER DEFAULT 0,
             displacement_blob BLOB,
+            reward_components_json TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (episode_id) REFERENCES episodes(episode_id),
             UNIQUE(episode_id, step)
@@ -310,8 +312,9 @@ def save_step(db_path: Path, record: StepRecord) -> None:
         cursor.execute("""
             INSERT OR REPLACE INTO records 
             (episode_id, step, phase, density_blob, policy_add_blob, 
-             policy_remove_blob, fitness_score, is_final_step, is_connected, displacement_blob)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            policy_remove_blob, fitness_score, is_final_step, is_connected, 
+            displacement_blob, reward_components_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             record.episode_id,
             record.step,
@@ -322,7 +325,8 @@ def save_step(db_path: Path, record: StepRecord) -> None:
             record.fitness_score,
             1 if record.is_final_step else 0,
             1 if record.is_connected else 0,
-            serialize_array(record.displacement_map) if record.displacement_map is not None else None
+            serialize_array(record.displacement_map) if record.displacement_map is not None else None,
+            json.dumps(record.reward_components) if record.reward_components else None
         ))
         conn.commit()
     except sqlite3.Error as e:

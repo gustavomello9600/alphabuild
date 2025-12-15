@@ -13,6 +13,7 @@ from dolfinx.fem import functionspace
 from alphabuilder.src.core.physics_model import PhysicalProperties
 from alphabuilder.src.logic.fenitop.topopt import topopt
 from alphabuilder.src.logic.harvest.config import SIMPConfig
+from alphabuilder.src.logic.selfplay.reward import calculate_fem_score
 
 def run_fenitop_optimization(
     resolution: Tuple[int, int, int],
@@ -71,15 +72,16 @@ def run_fenitop_optimization(
         "young's modulus": 100,
         "poisson's ratio": 0.25,
         "disp_bc": lambda x: np.isclose(x[0], 0),
-        "traction_bcs": [[
-            (0, -2.0, 0),
-            lambda x, _Lx=Lx, _yc=load_y_center, _zc=load_z_center, _hw=load_half_width: (
-                np.isclose(x[0], _Lx) &
-                (x[1] >= _yc - _hw - 0.5) & (x[1] <= _yc + _hw + 0.5) &
-                (x[2] >= _zc - _hw - 0.5) & (x[2] <= _zc + _hw + 0.5)
-            )
-        ]],
-        "body_force": (0, 0, 0),
+        "traction_bcs": [],
+        "body_force": lambda x: np.stack([
+            np.zeros(x.shape[1]),
+            -2.0 * (
+                (x[0] >= float(load_cfg['x'])) & (x[0] <= float(load_cfg['x']) + 1.0) &
+                (x[1] >= load_y_center - load_half_width - 0.5) & (x[1] <= load_y_center + load_half_width + 0.5) &
+                (x[2] >= load_z_center - load_half_width - 0.5) & (x[2] <= load_z_center + load_half_width + 0.5)
+            ),
+            np.zeros(x.shape[1])
+        ]),
         "quadrature_degree": 2,
         "petsc_options": {
             "ksp_type": "cg",
@@ -147,27 +149,31 @@ def run_fenitop_optimization(
                 if grid_mapper is not None and len(disp_flat) == len(grid_mapper[0]):
                     disp_nodal = np.zeros((nx+1, ny+1, nz+1), dtype=np.float32)
                     disp_nodal[grid_mapper[0], grid_mapper[1], grid_mapper[2]] = disp_flat
-                    # Unlike density which is elemental (maybe?), displacement magnitude is nodal.
-                    # rho_3d is created by taking [:-1,:-1,:-1] from nodal array?
-                    # Wait, rho_phys_field is CG1 (nodal). The grid mapping puts nodal values into a grid.
-                    # So rho_3d is actually (nx, ny, nz) formed by dropping the last node layer?
-                    # This seems to be how density is handled. We'll do the same for displacement.
                     disp_3d = disp_nodal[:-1, :-1, :-1]
 
+            # Calculate metrics
+            cur_iter = data['iter']
+            comp = float(data['compliance'])
+            vol = float(data['vol_frac'])
+            fem_score = calculate_fem_score(comp, vol)
+            mixing_factor = min(1.0, cur_iter / float(max_iter))
+
             history.append({
-                'step': data['iter'],
+                'step': cur_iter,
                 'density_map': rho_3d,
-                'compliance': float(data['compliance']),
-                'vol_frac': float(data['vol_frac']),
+                'compliance': comp,
+                'vol_frac': vol,
+                'fem_score': fem_score,
+                'mixing_factor': mixing_factor,
                 'displacement_map': disp_3d,
                 'beta': data.get('beta', 1)
             })
             
-            if data['iter'] % 10 == 0 and pbar:
+            if cur_iter % 10 == 0 and pbar:
                 pbar.set_postfix({
-                    'C': f"{data['compliance']:.2f}", 
-                    'V': f"{data['vol_frac']:.2f}",
-                    'B': f"{data.get('beta', 1)}"
+                    'C': f"{comp:.2f}", 
+                    'V': f"{vol:.2f}",
+                    'S': f"{fem_score:.2f}"
                 })
             
             if pbar:
@@ -180,5 +186,15 @@ def run_fenitop_optimization(
     
     if comm.rank == 0 and pbar:
         pbar.close()
-    
+        
+    # --- Post-Process: Add Final Score to all steps ---
+    if comm.rank == 0 and history:
+        final_step = history[-1]
+        final_fem_score = final_step['fem_score']
+        final_compliance = final_step['compliance']
+        
+        for step_data in history:
+            step_data['final_fem_score'] = final_fem_score
+            step_data['final_compliance'] = final_compliance
+
     return history

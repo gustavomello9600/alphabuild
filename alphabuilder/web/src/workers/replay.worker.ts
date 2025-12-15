@@ -6,40 +6,53 @@
 interface WorkerMessage {
     type: 'LOAD_CHUNK';
     payload: {
-        gameId: string;
+        source: 'selfplay' | 'training';
+        // Common
         start: number;
         end: number;
-        isDeprecated: boolean;
-        apiBase: string; // Pass base URL since worker doesn't have env
+        apiBase: string;
+        // SelfPlay specific
+        gameId?: string;
+        isDeprecated?: boolean;
+        // Training specific
+        dbId?: string;
+        episodeId?: string;
+        staticData?: {
+            bc_masks?: number[];
+            forces?: number[];
+        };
     };
 }
 
-// 7-Channel structure
-const CHANNEL = {
-    DENSITY: 0,
-    MASK_X: 1,
-    MASK_Y: 2,
-    MASK_Z: 3,
-    FORCE_X: 4,
-    FORCE_Y: 5,
-    FORCE_Z: 6,
-};
-
 self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
     if (e.data.type === 'LOAD_CHUNK') {
-        const { gameId, start, end, isDeprecated, apiBase } = e.data.payload;
+        const { source, apiBase, start, end } = e.data.payload;
+        console.log(`[Worker] Received LOAD_CHUNK: ${source} ${start}-${end}`);
         try {
-            const steps = await fetchBinarySteps(apiBase, gameId, start, end, isDeprecated);
+            let steps: any[] = [];
+
+            if (source === 'selfplay') {
+                const { gameId, isDeprecated } = e.data.payload;
+                if (!gameId) throw new Error("GameID required for selfplay source");
+                steps = await fetchBinarySteps(apiBase, gameId, start, end, !!isDeprecated);
+            } else {
+                const { dbId, episodeId, staticData } = e.data.payload;
+                if (!dbId || !episodeId) throw new Error("DbId and EpisodeId required for training source");
+                console.log(`[Worker] Fetching training steps for ${episodeId}`);
+                steps = await fetchTrainingSteps(apiBase, dbId, episodeId, start, end, staticData);
+                console.log(`[Worker] Fetched ${steps.length} steps`);
+            }
+
             // Transfer buffers to main thread
             const buffers: Transferable[] = [];
             for (const s of steps) {
                 if (s.tensor.data.buffer) buffers.push(s.tensor.data.buffer);
 
-                if (s.policy.add.buffer) buffers.push(s.policy.add.buffer);
-                if (s.policy.remove.buffer) buffers.push(s.policy.remove.buffer);
+                if (s.policy?.add?.buffer) buffers.push(s.policy.add.buffer);
+                if (s.policy?.remove?.buffer) buffers.push(s.policy.remove.buffer);
 
-                if (s.mcts.visit_add.buffer) buffers.push(s.mcts.visit_add.buffer);
-                if (s.mcts.visit_remove.buffer) buffers.push(s.mcts.visit_remove.buffer);
+                if (s.mcts?.visit_add?.buffer) buffers.push(s.mcts.visit_add.buffer);
+                if (s.mcts?.visit_remove?.buffer) buffers.push(s.mcts.visit_remove.buffer);
 
                 if (s.visuals) {
                     if (s.visuals.opaqueMatrix.buffer) buffers.push(s.visuals.opaqueMatrix.buffer);
@@ -55,9 +68,11 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
 
             // Remove duplicates just in case (though slicing creates unique buffers)
             const uniqueBuffers = Array.from(new Set(buffers));
-            self.postMessage({ type: 'CHUNK_LOADED', payload: steps }, uniqueBuffers);
+            console.log(`[Worker] Posting CHUNK_LOADED with ${steps.length} steps`);
+            self.postMessage({ type: 'CHUNK_LOADED', payload: steps }, uniqueBuffers as any);
         } catch (err: unknown) {
             const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+            console.error('[Worker] Error:', errorMessage);
             self.postMessage({ type: 'ERROR', payload: errorMessage });
         }
     }
@@ -83,6 +98,120 @@ async function fetchBinarySteps(
     return parseBinaryStream(buffer);
 }
 
+// Fetch and Parse Training Data (JSON)
+// Fetch and Parse Training Data (JSON)
+async function fetchTrainingSteps(
+    apiBase: string,
+    dbId: string,
+    episodeId: string,
+    start: number,
+    end: number,
+    staticData?: { bc_masks?: number[], forces?: number[] }
+) {
+    const params = new URLSearchParams();
+    params.append('start', start.toString());
+    params.append('end', end.toString());
+    params.append('t', Date.now().toString());
+
+    const response = await fetch(`${apiBase}/databases/${dbId}/episodes/${episodeId}/frames?${params}`);
+    if (!response.ok) throw new Error(`Fetch error: ${response.status}`);
+
+    const frames = await response.json();
+    return processTrainingFrames(frames, episodeId, staticData);
+}
+
+function processTrainingFrames(
+    frames: any[],
+    episodeId: string,
+    staticData?: { bc_masks?: number[], forces?: number[] }
+) {
+    return frames.map(frame => {
+        // frame.tensor_data only contains density (1 channel)
+        const densityData = new Float32Array(frame.tensor_data);
+        // frame.tensor_shape is [1, D, H, W]
+        const [, D, H, W] = frame.tensor_shape as [number, number, number, number];
+        const spatialSize = D * H * W;
+
+        // Create full 7-channel tensor
+        const fullTensorData = new Float32Array(7 * spatialSize);
+
+        // Channel 0: Density
+        fullTensorData.set(densityData, 0);
+
+        // Channels 1-3: BC Masks
+        if (staticData?.bc_masks && staticData.bc_masks.length === 3 * spatialSize) {
+            fullTensorData.set(staticData.bc_masks, spatialSize); // Offset by 1 channel size
+        }
+
+        // Channels 4-6: Forces
+        if (staticData?.forces && staticData.forces.length === 3 * spatialSize) {
+            fullTensorData.set(staticData.forces, 4 * spatialSize); // Offset by 4 channel sizes
+        }
+
+        const shape: [number, number, number, number] = [7, D, H, W];
+
+        const policyAdd = frame.policy_add ? new Float32Array(frame.policy_add) : new Float32Array(spatialSize);
+        const policyRem = frame.policy_remove ? new Float32Array(frame.policy_remove) : new Float32Array(spatialSize);
+
+        // MCTS Data not available in training frames usually
+        const mctsAdd = new Float32Array(spatialSize);
+        const mctsRem = new Float32Array(spatialSize);
+
+        // Helper to parse base64 displacement
+        let displacement_map = undefined;
+        if (frame.displacement_map) {
+            const binaryString = atob(frame.displacement_map);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) bytes[i] = binaryString.charCodeAt(i);
+            displacement_map = new Float32Array(bytes.buffer);
+        }
+
+        // Compute Visuals
+        const { opaqueMatrix, opaqueColor, overlayMatrix, overlayColor, mctsMatrix, mctsColor } = computeVisuals(
+            fullTensorData,
+            policyAdd, policyRem,
+            mctsAdd, mctsRem,
+            D, H, W
+        );
+
+        return {
+            episode_id: episodeId,
+            step: frame.step,
+            phase: frame.phase,
+            tensor: { shape, data: fullTensorData },
+            policy: { add: policyAdd, remove: policyRem },
+            mcts: { visit_add: mctsAdd, visit_remove: mctsRem },
+            // Training specific fields mapped to common
+            value: frame.fitness_score,
+            value_confidence: frame.fitness_score, // Map fitness to confidence for HUD
+            action_sequence: frame.action_sequence, // Keep passing this
+            reward_components: frame.reward_components,
+            displacement_map,
+
+            // Stats (Mock or Empty)
+            mcts_stats: {
+                num_simulations: 0,
+                nodes_expanded: 0,
+                max_depth: 0,
+                cache_hits: 0,
+                top8_concentration: 0,
+                refutation: false
+            },
+
+            // Visuals
+            visuals: {
+                opaqueMatrix,
+                opaqueColor,
+                overlayMatrix,
+                overlayColor,
+                mctsMatrix,
+                mctsColor
+            }
+        };
+    });
+}
+
 function parseBinaryStream(buffer: ArrayBuffer) {
     const view = new DataView(buffer);
     let offset = 0;
@@ -104,19 +233,6 @@ function parseBinaryStream(buffer: ArrayBuffer) {
         offset += 40;
 
         // Extract Data Arrays
-        // Total Float32 elements check
-        // Tensor: 7 * D * H * W
-        // Policy Add: D * H * W
-        // Policy Rem: D * H * W
-        // MCTS Add: D * H * W
-        // MCTS Rem: D * H * W
-        // Total per spatial: 7 + 1 + 1 + 1 + 1 = 11 floats per voxel
-        // This is implicit in the data flow, we just slice by bytes
-
-        // We slice the ArrayBuffer directly to create views
-        // NOTE: These views share the underlying memory of 'buffer'.
-        // When we transfer 'buffer' back, all these views become detached in the worker but valid in main.
-
         const spatialSize = D * H * W;
         const floatSize = 4;
 
@@ -124,24 +240,7 @@ function parseBinaryStream(buffer: ArrayBuffer) {
         const policyAudioBytes = spatialSize * floatSize;
         const mctsBytes = spatialSize * floatSize;
 
-        // Create views using proper offsets
-        // WARNING: DataView interaction is slow for bulk, use Float32Array on the buffer segment
-
-        // Offset for this step's data body
         const stepBodyStart = offset;
-
-        // We actually want to copy this out or just pass the shared buffer segment?
-        // To allow Zero-Copy transfer of specific step data, strict isolation is needed.
-        // But since we want to return a list of steps, we can parse them into objects holding TypedArrays.
-        // If we want zero-copy transfer, we must transfer the underlying buffer.
-        // But we have one big buffer for ALL steps.
-        // Strategy: Create slice for each step's data to make them independent ArrayBuffers? 
-        // No, that copies. 
-        // Better Strategy: Return the ONE big buffer to main thread, and a list of pointer/offsets objects.
-        // BUT main thread needs to put them into 'GameReplayState' objects.
-
-        // Let's copy for now for simplicity of consumption in the App until we need extreme mem opt.
-        // Actually, copying 50 steps x 1MB is 50MB copy. Not ideal but better than JSON.
 
         const tensorData = new Float32Array(buffer.slice(stepBodyStart, stepBodyStart + tensorBytes));
         let cursor = stepBodyStart + tensorBytes;
@@ -175,8 +274,7 @@ function parseBinaryStream(buffer: ArrayBuffer) {
             selected_actions.push({ channel, x, y, z, visits, q_value });
         }
 
-        // Parse extension block: n_islands(i), loose_voxels(i), is_connected(i), compliance_fem(f), island_penalty(f), max_displacement(f)
-        // Extension block is 24 bytes: 3 ints (12 bytes) + 3 floats (12 bytes)
+        // Parse extension block
         const n_islands = view.getInt32(cursor, true);
         const loose_voxels = view.getInt32(cursor + 4, true);
         const is_connected = view.getInt32(cursor + 8, true) === 1;
@@ -185,30 +283,25 @@ function parseBinaryStream(buffer: ArrayBuffer) {
         const max_displacement = view.getFloat32(cursor + 20, true);
         cursor += 24;
 
-        // Parse reward_components (length int32 + bytes)
+        // Parse reward_components
         const rcLength = view.getInt32(cursor, true);
         cursor += 4;
 
         let reward_components = undefined;
         if (rcLength > 0) {
-            // Read bytes
-            // Since we can't easily decode bytes to string in worker without TextDecoder (available?)
-            // TextDecoder IS available in workers in modern browsers.
             const decoder = new TextDecoder('utf-8');
-            // We need a view on the specific bytes
             const jsonView = new Uint8Array(buffer, cursor, rcLength);
             const jsonStr = decoder.decode(jsonView);
             reward_components = JSON.parse(jsonStr);
             cursor += rcLength;
         }
 
-        // Parse displacement_map (length int32 + bytes)
+        // Parse displacement_map
         const dispLength = view.getInt32(cursor, true);
         cursor += 4;
 
         let displacement_map = undefined;
         if (dispLength > 0) {
-            // It's a Float32Array
             displacement_map = new Float32Array(buffer.slice(cursor, cursor + dispLength));
             cursor += dispLength;
         }
@@ -218,9 +311,7 @@ function parseBinaryStream(buffer: ArrayBuffer) {
             tensorData,
             policyAdd, policyRem,
             mctsAdd, mctsRem,
-            phaseCode,
-            D, H, W,
-            numSimulations
+            D, H, W
         );
 
         steps.push({
@@ -252,7 +343,7 @@ function parseBinaryStream(buffer: ArrayBuffer) {
                 top8_concentration: 0,
                 refutation: false
             },
-            // Visual Buffers - NOW INCLUDING MCTS!
+            // Visual Buffers
             visuals: {
                 opaqueMatrix,
                 opaqueColor,
@@ -270,14 +361,11 @@ function parseBinaryStream(buffer: ArrayBuffer) {
 }
 
 // Visual Computation Helpers
-// Visual Computation Helpers
 function computeVisuals(
     tensor: Float32Array,
     pAdd: Float32Array, pRem: Float32Array,
     mAdd: Float32Array, mRem: Float32Array,
-    phase: number,
-    D: number, H: number, W: number,
-    totalSims: number
+    D: number, H: number, W: number
 ) {
     // Estimations for buffer size
     const maxInstances = D * H * W; // worst case
@@ -294,10 +382,8 @@ function computeVisuals(
     let ovIdx = 0;
     let mIdx = 0;
 
-    const spatial = D * H * W;
-    const CHANNEL_FORCE_X = 4;
-    const CHANNEL_FORCE_Y = 5;
-    const CHANNEL_FORCE_Z = 6;
+    const spatial = D * H * W; // Used in other parts if revived, but for now clean up?
+    // Constants removed to silence linter
 
     // Helper to set matrix at index
     const setMatrix = (out: Float32Array, idx: number, x: number, y: number, z: number, scale: number) => {
@@ -329,23 +415,11 @@ function computeVisuals(
                 const z = w - W / 2;
 
                 // 1. Opaque Structure
-                // Check loads
-                const fx = tensor[CHANNEL_FORCE_X * spatial + idx];
-                const fy = tensor[CHANNEL_FORCE_Y * spatial + idx];
-                const fz = tensor[CHANNEL_FORCE_Z * spatial + idx];
-                const hasLoad = Math.abs(fx) > 0.01 || Math.abs(fy) > 0.01 || Math.abs(fz) > 0.01;
-
-                if (density > 0.5 || hasLoad) {
+                if (density > 0.5) {
                     setMatrix(opaqueMatrix, oIdx, x, y, z, 1.0);
-
-                    if (hasLoad) {
-                        // #FF6B00 -> 1.0, 0.42, 0.0
-                        setColor(opaqueColor, oIdx, 1.0, 0.42, 0.0);
-                    } else {
-                        // Gray: HSL(0,0, gray*0.95). 
-                        const g = Math.max(0.2, density) * 0.95;
-                        setColor(opaqueColor, oIdx, g, g, g);
-                    }
+                    // Gray: HSL(0,0, gray*0.95). 
+                    const g = Math.max(0.2, density) * 0.95;
+                    setColor(opaqueColor, oIdx, g, g, g);
                     oIdx++;
                 }
 
@@ -364,38 +438,16 @@ function computeVisuals(
                     setOverlayColor(overlayColor, ovIdx, 1.0, 0.0, 0.33, Math.min(1, pRemVal * 2));
                     ovIdx++;
                 }
-                // Main thread can filter? No, main thread rendering is InstanceMesh, count is fixed by buffer.
-                // We should filter here.
 
-                // Optimization: Find Max first?
-                // Iterating twice is okay for 260k elements in a worker.
-
-                // Actually, let's just do one pass and normalized later? 
-                // No, color needs normalization.
-                // Let's assume we want to show significant visits. 
-                // Any visit > 0 is significant? 
-                // In large trees, we might have thousands.
-
-                // Let's implement a dynamic threshold or just > 1 visit.
-
+                // MCTS Visuals
                 if (mAdd[idx] > 0 && density <= 0.5) {
                     setMatrix(mctsMatrix, mIdx, x, y, z, 1.0);
-                    // Green-ish wireframe.
-                    // We store intensity in Alpha or just RGB?
-                    // Wireframe material is Basic.
-                    // Color: 1,1,1 implies white.
-                    // We want Gradient?
-                    // Let's store raw visit count in Alpha for shader? 
-                    // Or just pre-compute specific color based on valid range (e.g. log scale).
-
-                    // Simple: Green
                     setColor(mctsColor, mIdx, 0.0, 1.0, 0.6);
                     mIdx++;
                 }
 
                 if (mRem[idx] > 0 && density > 0.5) {
                     setMatrix(mctsMatrix, mIdx, x, y, z, 1.0);
-                    // Red-ish wireframe
                     setColor(mctsColor, mIdx, 1.0, 0.0, 0.33);
                     mIdx++;
                 }

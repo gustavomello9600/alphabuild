@@ -131,7 +131,11 @@ def form_fem(fem, opt):
     metadata = {"quadrature_degree": fem["quadrature_degree"]}
     dx = ufl.Measure("dx", metadata=metadata)
     ds = ufl.Measure("ds", domain=mesh, metadata=metadata, subdomain_data=facet_tags)
-    b = Constant(mesh, np.array(fem["body_force"], dtype=float))
+    if callable(fem["body_force"]):
+        b = Function(V)
+        b.interpolate(fem["body_force"])
+    else:
+        b = Constant(mesh, np.array(fem["body_force"], dtype=float))
 
     # Establish the equilibrium and adjoint equations
     lhs = ufl.inner(sigma(u), epsilon(v))*dx

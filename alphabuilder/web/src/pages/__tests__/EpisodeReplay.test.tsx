@@ -1,8 +1,7 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, waitFor } from '@testing-library/react';
 import { EpisodeReplay } from '../EpisodeReplay'; // Named import
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { trainingDataReplayService } from '../../api/trainingDataService'; // Singleton import
-import React from 'react';
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 
 // Mocks
@@ -27,15 +26,6 @@ vi.mock('../../components/StructureVisualizer', () => ({
 vi.mock('../../components/NeuralHUD', () => ({
     default: () => <div data-testid="neural-hud">HUD</div>
 }));
-
-// Mock VoxelGrid and LoadVector which are internal to EpisodeReplay or imported?
-// They are internal in EpisodeReplay file? No, they are defined IN EpisodeReplay.tsx but not exported.
-// Since they are children of Canvas, and Canvas (from R3F) renders in jsdom (mostly), but might fail if WebGL context required.
-// We mocked Canvas? No.
-// R3F Canvas in jsdom usually needs `resize-observer-polyfill` and might need mocking of WebGL context.
-// Better to mock `Canvas` or the sub-components if they cause issues.
-// The error before was "Element type is invalid" which was likely the default export issue.
-// Let's try fixing export first.
 
 describe('EpisodeReplay', () => {
     beforeEach(() => {

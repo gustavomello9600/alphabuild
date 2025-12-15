@@ -54,8 +54,8 @@ export interface Frame {
     volume_fraction: number | null;
     policy_add: number[] | null;
     policy_remove: number[] | null;
-    action_sequence?: Action[] | null;     // [NEW] Sequence of actions
-    reward_components?: RewardComponents | null; // [NEW] Breakdown
+    action_sequence?: Action[] | null;
+    reward_components?: RewardComponents | null;
     displacement_map?: string; // Base64 encoded float32 array
 }
 
@@ -66,9 +66,6 @@ export interface EpisodeData {
 
 // --- API Functions ---
 
-/**
- * Fetch all available databases
- */
 export async function fetchDatabases(): Promise<DatabaseInfo[]> {
     try {
         const response = await fetch(`${API_BASE}/databases?t=${Date.now()}`);
@@ -79,9 +76,6 @@ export async function fetchDatabases(): Promise<DatabaseInfo[]> {
     }
 }
 
-/**
- * Fetch all episodes in a database
- */
 export async function fetchEpisodes(dbId: string): Promise<EpisodeSummary[]> {
     try {
         const response = await fetch(`${API_BASE}/databases/${dbId}/episodes?t=${Date.now()}`);
@@ -92,18 +86,12 @@ export async function fetchEpisodes(dbId: string): Promise<EpisodeSummary[]> {
     }
 }
 
-/**
- * Fetch episode metadata
- */
 export async function fetchEpisodeMetadata(dbId: string, episodeId: string): Promise<EpisodeMetadata> {
     const response = await fetch(`${API_BASE}/databases/${dbId}/episodes/${episodeId}/metadata?t=${Date.now()}`);
     if (!response.ok) throw new Error(`Erro ao buscar metadados (${response.status})`);
     return response.json();
 }
 
-/**
- * Fetch paginated episode frames
- */
 export async function fetchEpisodeFrames(dbId: string, episodeId: string, start: number, end: number): Promise<Frame[]> {
     const response = await fetch(`${API_BASE}/databases/${dbId}/episodes/${episodeId}/frames?start=${start}&end=${end}&t=${Date.now()}`);
     if (!response.ok) throw new Error(`Erro ao buscar frames (${response.status})`);
@@ -121,6 +109,8 @@ export async function fetchEpisodeData(dbId: string, episodeId: string): Promise
 
 // --- Replay Service Class ---
 
+import ReplayWorker from '../workers/replay.worker?worker';
+
 type ReplayCallback = (state: ReplayState) => void;
 
 export interface ReplayState {
@@ -131,9 +121,10 @@ export interface ReplayState {
         shape: [number, number, number, number];
         data: Float32Array;
     };
-    fitness_score: number;
-    valid_fem: boolean;
-    metadata: {
+    fitness_score: number; // retained for compat, map to value
+    value?: number; // compat with GameReplayState
+    valid_fem: boolean; // default true
+    metadata?: {
         compliance: number;
         max_displacement: number;
         volume_fraction: number;
@@ -143,14 +134,34 @@ export interface ReplayState {
         add: Float32Array;
         remove: Float32Array;
     };
-    action_sequence?: Action[] | null; // [NEW]
-    reward_components?: RewardComponents | null; // [NEW]
+    // Map to GameReplayState fields for component compat
+    policy?: {
+        add: Float32Array;
+        remove: Float32Array;
+    };
+    action_sequence?: Action[] | null;
+    reward_components?: RewardComponents | null;
     displacement_map?: Float32Array;
+
+    // Visuals from Worker
+    visuals?: {
+        opaqueMatrix: Float32Array;
+        opaqueColor: Float32Array;
+        overlayMatrix: Float32Array;
+        overlayColor: Float32Array;
+        mctsMatrix?: Float32Array;
+        mctsColor?: Float32Array;
+    };
+
+    // MCTS Stats (Empty for training usually)
+    mcts_stats?: any;
+    selected_actions?: any[];
 }
 
 export class TrainingDataReplayService {
     private subscribers: ReplayCallback[] = [];
     private intervalId: ReturnType<typeof setInterval> | null = null;
+    private worker: Worker;
 
     // State
     private dbId: string | null = null;
@@ -163,8 +174,34 @@ export class TrainingDataReplayService {
     private isPlaying = false;
 
     // Constants
-    private readonly FETCH_CHUNK_SIZE = 25;
-    private readonly PREFETCH_THRESHOLD = 5;
+    private readonly FETCH_CHUNK_SIZE = 50;
+    private readonly PREFETCH_THRESHOLD = 20;
+
+    constructor() {
+        this.worker = new ReplayWorker();
+        this.worker.onmessage = this.handleWorkerMessage.bind(this);
+    }
+
+    private handleWorkerMessage(e: MessageEvent) {
+        const { type, payload } = e.data;
+        if (type === 'ERROR') {
+            console.error('ReplayWorker Error:', payload);
+            return;
+        }
+        if (type === 'CHUNK_LOADED') {
+            const steps = payload as ReplayState[];
+            console.log(`[Service] Received CHUNK_LOADED: ${steps.length} steps. Indices: ${steps.map(s => s.step).join(', ')}`);
+            steps.forEach(s => {
+                this.framesMap.set(s.step, s);
+            });
+            this.pruneCache();
+
+            // Notify if we are waiting for current frame
+            if (this.framesMap.has(this.currentStepIndex)) {
+                this.notifySubscribers(this.framesMap.get(this.currentStepIndex)!);
+            }
+        }
+    }
 
     /**
      * Load episode metadata and initial chunk
@@ -178,40 +215,96 @@ export class TrainingDataReplayService {
             // 1. Fetch Metadata
             this.metadata = await fetchEpisodeMetadata(dbId, episodeId);
 
-            // 2. Fetch Initial Chunk
-            await this.loadChunk(0, this.FETCH_CHUNK_SIZE);
+            // 2. Fetch Initial Chunk via Worker
+            this.requestChunk(0, this.FETCH_CHUNK_SIZE);
 
-            this.currentStepIndex = 0;
+            // Wait for initial chunk to populate
+            await this.waitForFirstChunk();
 
-            if (this.framesMap.has(0)) {
-                this.notifySubscribers(this.framesMap.get(0)!);
+            // Set current step to the first available step (likely 1 for Training Data)
+            const steps = Array.from(this.framesMap.keys());
+            if (steps.length > 0) {
+                this.currentStepIndex = Math.min(...steps);
+                console.log(`[Service] Initialized at step ${this.currentStepIndex}`);
+            } else {
+                this.currentStepIndex = 0; // Fallback
             }
+
+            await this.waitForFrame(this.currentStepIndex);
+
         } catch (err) {
             console.error("Error loading episode:", err);
             throw err;
         }
     }
 
-    private async loadChunk(start: number, count: number): Promise<void> {
-        if (!this.dbId || !this.episodeId) return;
+    private async waitForFirstChunk(timeout = 10000): Promise<void> {
+        return new Promise((resolve, reject) => {
+            if (this.framesMap.size > 0) {
+                resolve();
+                return;
+            }
 
-        const end = start + count;
-        // console.log(`Fetching chunk ${start} - ${end}`);
+            const checkInterval = setInterval(() => {
+                if (this.framesMap.size > 0) {
+                    clearInterval(checkInterval);
+                    resolve();
+                }
+            }, 100);
 
-        const frames = await fetchEpisodeFrames(this.dbId, this.episodeId, start, end);
-        const processed = this.processFrames(frames);
-
-        // Add to map
-        processed.forEach(f => {
-            this.framesMap.set(f.step, f);
+            setTimeout(() => {
+                clearInterval(checkInterval);
+                reject(new Error("Timeout waiting for first chunk"));
+            }, timeout);
         });
+    }
 
-        this.pruneCache();
+    private async waitForFrame(step: number, timeout = 10000): Promise<void> {
+        return new Promise((resolve, reject) => {
+            if (this.framesMap.has(step)) {
+                resolve();
+                return;
+            }
+
+            const checkInterval = setInterval(() => {
+                if (this.framesMap.has(step)) {
+                    clearInterval(checkInterval);
+                    resolve();
+                }
+            }, 100);
+
+            setTimeout(() => {
+                clearInterval(checkInterval);
+                reject(new Error(`Timeout waiting for frame ${step}`));
+            }, timeout);
+        });
+    }
+
+    private requestChunk(start: number, count: number): void {
+        if (!this.dbId || !this.episodeId) return;
+        const end = start + count;
+
+        if (this.framesMap.has(start)) return;
+
+        this.worker.postMessage({
+            type: 'LOAD_CHUNK',
+            payload: {
+                source: 'training',
+                apiBase: API_BASE,
+                dbId: this.dbId,
+                episodeId: this.episodeId,
+                start,
+                end,
+                staticData: {
+                    bc_masks: this.metadata?.bc_masks,
+                    forces: this.metadata?.forces
+                }
+            }
+        });
     }
 
     private pruneCache() {
-        // Keep a window around currentStepIndex
-        const KEEP_WINDOW = 100; // Increased window to avoid frequent refetching if seeking nearby
+        const KEEP_WINDOW = 200;
         const minStep = this.currentStepIndex - KEEP_WINDOW;
         const maxStep = this.currentStepIndex + KEEP_WINDOW;
 
@@ -222,67 +315,18 @@ export class TrainingDataReplayService {
         }
     }
 
-    private processFrames(frames: Frame[]): ReplayState[] {
-        return frames.map(frame => {
-            const tensorData = new Float32Array(frame.tensor_data);
-            const shape = frame.tensor_shape as [number, number, number, number];
-
-            let policyHeatmap = undefined;
-            if (frame.policy_add || frame.policy_remove) {
-                const spatialSize = shape[1] * shape[2] * shape[3];
-                policyHeatmap = {
-                    add: frame.policy_add ? new Float32Array(frame.policy_add) : new Float32Array(spatialSize),
-                    remove: frame.policy_remove ? new Float32Array(frame.policy_remove) : new Float32Array(spatialSize),
-                };
-            }
-
-            return {
-                episode_id: this.episodeId!,
-                step: frame.step,
-                phase: frame.phase as 'GROWTH' | 'REFINEMENT',
-                tensor: { shape, data: tensorData },
-                fitness_score: frame.fitness_score,
-                valid_fem: true,
-                metadata: {
-                    compliance: frame.compliance || 0,
-                    max_displacement: 0,
-                    volume_fraction: frame.volume_fraction || 0,
-                },
-                value_confidence: frame.fitness_score,
-                policy_heatmap: policyHeatmap,
-                action_sequence: frame.action_sequence,
-                reward_components: frame.reward_components,
-                displacement_map: frame.displacement_map
-                    ? new Float32Array(this.base64ToArrayBuffer(frame.displacement_map))
-                    : undefined
-            };
-        });
-    }
-
-    private base64ToArrayBuffer(base64: string): ArrayBuffer {
-        const binaryString = window.atob(base64);
-        const len = binaryString.length;
-        const bytes = new Uint8Array(len);
-        for (let i = 0; i < len; i++) {
-            bytes[i] = binaryString.charCodeAt(i);
-        }
-        return bytes.buffer;
-    }
-
     play(): void {
         if (this.isPlaying || !this.metadata) return;
 
-        // If at end, restart
         if (this.currentStepIndex >= this.metadata.total_steps - 1) {
             this.currentStepIndex = 0;
-            this.seekToStep(0); // This will handle fetching if needed
+            this.seekToStep(0);
         }
 
         this.isPlaying = true;
-        this.intervalId = setInterval(async () => {
+        this.intervalId = setInterval(() => {
             if (!this.metadata) return;
 
-            // Check if next step is valid
             if (this.currentStepIndex >= this.metadata.total_steps - 1) {
                 this.pause();
                 return;
@@ -290,24 +334,20 @@ export class TrainingDataReplayService {
 
             this.currentStepIndex++;
 
-            // Check buffering / prefetch
             if (!this.framesMap.has(this.currentStepIndex)) {
-                // Buffer underrun! Pause and load.
-                // console.log("Buffer underrun, pausing to load...");
                 this.pause();
-                await this.loadChunk(this.currentStepIndex, this.FETCH_CHUNK_SIZE);
-                this.play(); // Resume
+                this.requestChunk(this.currentStepIndex, this.FETCH_CHUNK_SIZE);
+                this.waitForFrame(this.currentStepIndex).then(() => this.play()).catch(() => { });
                 return;
             }
 
-            // Prefetch if needed
             const nextChunkStart = this.currentStepIndex + this.PREFETCH_THRESHOLD;
             if (nextChunkStart < this.metadata.total_steps && !this.framesMap.has(nextChunkStart)) {
-                this.loadChunk(nextChunkStart, this.FETCH_CHUNK_SIZE).catch(console.error);
+                this.requestChunk(nextChunkStart, this.FETCH_CHUNK_SIZE);
             }
 
             this.notifySubscribers(this.framesMap.get(this.currentStepIndex)!);
-        }, 500); // 2 FPS
+        }, 100);
     }
 
     pause(): void {
@@ -346,12 +386,13 @@ export class TrainingDataReplayService {
         if (this.framesMap.has(index)) {
             this.notifySubscribers(this.framesMap.get(index)!);
         } else {
-            // Need to fetch
-            this.pause(); // Pause while seeking if not buffered
-            // console.log("Seeking to unbuffered step...");
-            await this.loadChunk(index, this.FETCH_CHUNK_SIZE);
-            if (this.framesMap.has(index)) {
+            this.pause();
+            this.requestChunk(index, this.FETCH_CHUNK_SIZE);
+            try {
+                await this.waitForFrame(index);
                 this.notifySubscribers(this.framesMap.get(index)!);
+            } catch (e) {
+                // Ignore timeout
             }
         }
     }
@@ -383,23 +424,23 @@ export class TrainingDataReplayService {
     getState() {
         return {
             episodeId: this.episodeId,
-            stepsLoaded: this.metadata ? this.metadata.total_steps : 0, // Used for progress bar max
+            stepsLoaded: this.metadata ? this.metadata.total_steps : 0,
             currentStep: this.currentStepIndex,
             isPlaying: this.isPlaying,
-            maxCompliance: 1.0, // Deprecated/Unused scaling
+            maxCompliance: 1.0,
         };
     }
 
-    /**
-     * Get fitness history for graph
-     */
     getFitnessHistory(): number[] {
         return this.metadata?.fitness_history || [];
     }
 
-    // Deprecated but kept for compatibility - returns ONLY buffered frames
     getAllFrames(): ReplayState[] {
         return Array.from(this.framesMap.values()).sort((a, b) => a.step - b.step);
+    }
+
+    public getFrame(step: number): ReplayState | undefined {
+        return this.framesMap.get(step);
     }
 }
 
