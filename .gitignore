@@ -38,3 +38,6 @@ data/*.db
 htmlcov/
 coverage.xml
 alphabuilder/.coverage
+
+# dados grandes (release assets)
+data/
