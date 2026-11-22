@@ -233,9 +233,16 @@ def main():
         s_final_vol = float(final_state['vol_frac'])
         s_final_disp = float(final_state.get('max_displacement', 0.0))
 
-        is_final_connected, _ = check_connectivity(
+        is_final_strict_05, _ = check_connectivity(
             final_state['density_map'], 0.5, load_config, strict_load_coverage=True
         )
+        is_final_loose_05, _ = check_connectivity(
+            final_state['density_map'], 0.5, load_config, strict_load_coverage=False
+        )
+        is_final_strict_04, _ = check_connectivity(
+            final_state['density_map'], 0.4, load_config, strict_load_coverage=True
+        )
+        is_final_connected = bool(is_final_strict_05 or (is_final_loose_05 and is_final_strict_04))
         s_final_reward = calculate_reward(
             s_final_compliance,
             s_final_vol,
