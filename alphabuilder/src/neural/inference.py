@@ -1,382 +1,268 @@
 """
-Inference utilities for AlphaBuilder neural network.
+Inference utilities for AlphaBuilder neural network (v3.3).
 
 This module provides:
-- Model loading from checkpoints
-- Input preprocessing (centralized padding)
-- Batch inference support
-
-Usage:
-    from alphabuilder.src.neural.inference import AlphaBuilderInference
-    
-    # Initialize
-    model = AlphaBuilderInference('checkpoints/best_model.pt', device='xpu')
-    
-    # Single inference
-    value, policy_add, policy_remove = model.predict(state)
-    
-    # Batch inference
-    values, policies = model.predict_batch(states)
+- Checkpoint loading (single-GPU, DataParallel, DDP, and optional OpenVINO NPU)
+- Standardized unpadded preprocessing matching training (`AlphaBuilderV31` pads/crops internally)
+- Batch inference and optional auxiliary Blueprint Head prediction
 """
 
+from pathlib import Path
+from typing import List, Optional, Tuple, Union
 import numpy as np
 import torch
-from pathlib import Path
-from typing import Union, Tuple, List, Optional
 
 from .model import AlphaBuilderV31
 
 
 def pad_to_target_centered(
-    state: np.ndarray, 
-    divisor: int = 32
+    state: np.ndarray,
+    divisor: int = 32,
 ) -> np.ndarray:
     """
-    Apply centralized padding to ensure dimensions are divisible by divisor.
-    
-    This is the CORRECT preprocessing for inference - it places the structure
-    in the center of the padded volume, unlike training which uses random positioning.
-    
-    Args:
-        state: Input tensor of shape (C, D, H, W)
-        divisor: Dimensions will be padded to be divisible by this value
-        
-    Returns:
-        Padded tensor of shape (C, D', H', W') where D', H', W' are divisible by divisor
+    Apply centered padding so spatial dimensions are divisible by divisor.
+    Kept for backward compatibility with external utilities.
     """
-    C, D, H, W = state.shape
-    
-    # Calculate target dimensions (next multiple of divisor)
+    _, D, H, W = state.shape
     target_D = ((D + divisor - 1) // divisor) * divisor
     target_H = ((H + divisor - 1) // divisor) * divisor
     target_W = ((W + divisor - 1) // divisor) * divisor
-    
-    # Calculate padding amounts
+
     pad_D = target_D - D
     pad_H = target_H - H
     pad_W = target_W - W
-    
-    # Center the structure
+
     pad_before = (pad_D // 2, pad_H // 2, pad_W // 2)
     pad_after = (pad_D - pad_before[0], pad_H - pad_before[1], pad_W - pad_before[2])
-    
-    # Apply padding
-    padded = np.pad(
+
+    return np.pad(
         state,
-        ((0, 0),  # No padding on channel dimension
-         (pad_before[0], pad_after[0]),
-         (pad_before[1], pad_after[1]),
-         (pad_before[2], pad_after[2])),
-        mode='constant',
-        constant_values=0
+        (
+            (0, 0),
+            (pad_before[0], pad_after[0]),
+            (pad_before[1], pad_after[1]),
+            (pad_before[2], pad_after[2]),
+        ),
+        mode="constant",
+        constant_values=0,
     )
-    
-    return padded
 
 
 def unpad_from_target(
-    tensor: np.ndarray, 
-    original_shape: Tuple[int, int, int, int]
+    tensor: np.ndarray,
+    original_shape: Tuple[int, int, int, int],
 ) -> np.ndarray:
-    """
-    Remove padding to restore original shape.
-    
-    Args:
-        tensor: Padded tensor of shape (C, D', H', W')
-        original_shape: Original shape (C, D, H, W) before padding
-        
-    Returns:
-        Unpadded tensor of shape (C, D, H, W)
-    """
-    C, D, H, W = original_shape
+    """Center-crop tensor back to original (C, D, H, W) shape."""
+    _, D, H, W = original_shape
     _, Dp, Hp, Wp = tensor.shape
-    
-    # Calculate padding that was applied
-    pad_D = Dp - D
-    pad_H = Hp - H
-    pad_W = Wp - W
-    
-    # Calculate start indices (center crop)
-    start_d = pad_D // 2
-    start_h = pad_H // 2
-    start_w = pad_W // 2
-    
-    return tensor[:, start_d:start_d+D, start_h:start_h+H, start_w:start_w+W]
+    if (Dp, Hp, Wp) == (D, H, W):
+        return tensor
+
+    start_d = (Dp - D) // 2
+    start_h = (Hp - H) // 2
+    start_w = (Wp - W) // 2
+    return tensor[:, start_d : start_d + D, start_h : start_h + H, start_w : start_w + W]
 
 
 class AlphaBuilderInference:
     """
-    Inference wrapper for AlphaBuilder model.
-    
-    Handles:
-    - Model loading from checkpoint
-    - Input preprocessing (padding)
-    - Output postprocessing (unpadding)
-    - GPU optimization (IPEX for XPU, CUDA for GPU)
+    Unified inference wrapper for AlphaBuilderV31.
+
+    Note: `AlphaBuilderV31.forward()` encapsulates internal centered padding and cropping,
+    so inference passes unpadded `(B, 7, D, H, W)` tensors identically to training.
     """
-    
+
     def __init__(
         self,
         checkpoint_path: Union[str, Path],
-        device: str = 'auto',
-        model_config: dict = None
+        device: str = "auto",
+        model_config: Optional[dict] = None,
     ):
-        """
-        Initialize inference model.
-        
-        Args:
-            checkpoint_path: Path to model checkpoint (.pt file)
-            device: Device to use ('auto', 'xpu', 'cuda', 'cpu')
-        """
         self.checkpoint_path = Path(checkpoint_path)
-        
-        # Auto-detect device
-        if device == 'auto':
-            if torch.cuda.is_available():
-                device = 'cuda'
-            elif hasattr(torch, 'xpu') and torch.xpu.is_available():
-                device = 'xpu'
-            else:
-                device = 'cpu'
-        
-        self.device_str = device.lower()
-        
-        if self.device_str == 'npu' or self.device_str == 'auto':
-            from .openvino_inference import AlphaBuilderOpenVINO
-            
-            # Default to AUTO/GPU with THROUGHPUT hint if not specified
-            model_config = model_config or {}
-            if 'performance_hint' not in model_config:
-                model_config['performance_hint'] = 'THROUGHPUT'
 
-            self.backend = AlphaBuilderOpenVINO(checkpoint_path, device='AUTO', model_config=model_config)
-            # We can't really set self.device to torch.device object here easily as it's not a torch device
-            # But let's keep it for compatibility if needed, though NPU backend handles everything
-            self.device = torch.device('cpu') 
+        if device == "auto":
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                device = "xpu"
+            else:
+                device = "cpu"
+
+        self.device_str = device.lower()
+
+        if self.device_str == "npu":
+            from .openvino_inference import AlphaBuilderOpenVINO
+
+            cfg = dict(model_config or {})
+            cfg.setdefault("performance_hint", "THROUGHPUT")
+            self.backend = AlphaBuilderOpenVINO(str(checkpoint_path), device="AUTO", model_config=cfg)
+            self.device = torch.device("cpu")
             self.is_npu = True
-            
-            # Mimic attributes expected by repr or inspection
-            self.config = getattr(self.backend, 'config', {})
-            self.epoch = getattr(self.backend, 'epoch', -1)
-            self.val_loss = getattr(self.backend, 'val_loss', 0.0)
-            self.use_swin = getattr(self.backend, 'use_swin', False)
-            
-            # Assuming logger is defined elsewhere or will be added
-            # logger.info(f"Initialized AlphaBuilderOpenVINO backend on device {self.backend.device}")
+            self.config = getattr(self.backend, "config", {})
+            self.epoch = getattr(self.backend, "epoch", -1)
+            self.val_loss = getattr(self.backend, "val_loss", float("inf"))
+            self.use_swin = getattr(self.backend, "use_swin", False)
             return
-        else:
-            self.is_npu = False
-            self.device = torch.device(device)
-        
-        # Load checkpoint
+
+        self.is_npu = False
+        self.device = torch.device(self.device_str)
+
         checkpoint = torch.load(
-            self.checkpoint_path, 
-            map_location='cpu',
-            weights_only=False
+            self.checkpoint_path,
+            map_location="cpu",
+            weights_only=False,
         )
-        
-        # Extract config
-        self.config = checkpoint.get('config', {})
-        self.epoch = checkpoint.get('epoch', -1)
-        self.val_loss = checkpoint.get('val_loss', float('inf'))
-        
-        # Create model
+
+        self.config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+        if model_config:
+            self.config = {**self.config, **model_config}
+        self.epoch = checkpoint.get("epoch", -1) if isinstance(checkpoint, dict) else -1
+        metrics = checkpoint.get("metrics", {}) if isinstance(checkpoint, dict) else {}
+        self.val_loss = checkpoint.get("val_loss", metrics.get("loss", float("inf"))) if isinstance(checkpoint, dict) else float("inf")
+        self.use_swin = bool(self.config.get("use_swin", False))
+
         self.model = AlphaBuilderV31(
-            in_channels=7,
-            out_channels=2,
-            feature_size=self.config.get('feature_size', 24),
-            use_swin=self.config.get('use_swin', False)
+            in_channels=int(self.config.get("in_channels", 7)),
+            out_channels=int(self.config.get("out_channels", 2)),
+            feature_size=int(self.config.get("feature_size", 24)),
+            use_swin=self.use_swin,
         )
-        
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+
+        raw_sd = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
+        state_dict = {
+            (k[7:] if k.startswith("module.") else k): v
+            for k, v in raw_sd.items()
+        }
+        self.model.load_state_dict(state_dict)
         self.model = self.model.to(self.device)
         self.model.eval()
-        
-        # Apply device-specific optimizations
+
         self._optimize_for_device()
-        
-        # Pre-warm the model
         self._warmup()
-    
-    def _optimize_for_device(self):
-        """Apply device-specific optimizations."""
-        if self.device.type == 'xpu':
+
+    def _optimize_for_device(self) -> None:
+        if self.device.type == "xpu":
             try:
                 import intel_extension_for_pytorch as ipex
                 self.model = ipex.optimize(self.model)
             except ImportError:
                 pass
-        elif self.device.type == 'cuda':
-            # Enable TensorFloat32 for faster computation on Ampere+ GPUs
+        elif self.device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-    
-    def _warmup(self, num_iterations: int = 5):
-        """Warmup the model to avoid cold-start latency."""
-        x = torch.randn(1, 7, 64, 32, 32).to(self.device)
+
+    def _warmup(self, num_iterations: int = 3) -> None:
+        x = torch.randn(1, self.model.in_channels, 64, 32, 8, device=self.device)
         with torch.no_grad():
             for _ in range(num_iterations):
                 _ = self.model(x)
-        
-        if self.device.type == 'xpu':
+
+        if self.device.type == "xpu":
             torch.xpu.synchronize()
-        elif self.device.type == 'cuda':
+        elif self.device.type == "cuda":
             torch.cuda.synchronize()
-    
+
     def preprocess(
-        self, 
-        state: np.ndarray, 
-        divisor: int = 32
+        self,
+        state: np.ndarray,
     ) -> Tuple[torch.Tensor, Tuple[int, int, int, int]]:
-        """
-        Preprocess state for inference.
-        
-        Args:
-            state: Input state of shape (C, D, H, W) or (7, D, H, W)
-            divisor: Padding divisor (default 32)
-            
-        Returns:
-            Tuple of (tensor ready for inference, original shape)
-        """
-        original_shape = state.shape
-        
-        # Apply centered padding
-        padded = pad_to_target_centered(state, divisor=divisor)
-        
-        # Convert to tensor and add batch dimension
-        tensor = torch.from_numpy(padded).float().unsqueeze(0).to(self.device)
-        
-        return tensor, original_shape
-    
+        """Convert unpadded (C, D, H, W) state directly to batched tensor."""
+        original_shape = tuple(int(s) for s in state.shape)
+        tensor = torch.from_numpy(np.ascontiguousarray(state)).float().unsqueeze(0).to(self.device)
+        return tensor, original_shape  # type: ignore[return-value]
+
     def postprocess(
         self,
         policy: np.ndarray,
-        original_shape: Tuple[int, int, int, int]
+        original_shape: Tuple[int, int, int, int],
     ) -> np.ndarray:
-        """
-        Postprocess policy to remove padding.
-        
-        Args:
-            policy: Padded policy of shape (2, D', H', W')
-            original_shape: Original input shape (C, D, H, W)
-            
-        Returns:
-            Unpadded policy of shape (2, D, H, W)
-        """
-        # Policy has shape (2, D', H', W'), original is (7, D, H, W)
-        policy_shape = (2, original_shape[1], original_shape[2], original_shape[3])
+        """Ensure policy tensor matches original spatial shape (2, D, H, W)."""
+        policy_shape = (policy.shape[0], original_shape[1], original_shape[2], original_shape[3])
         return unpad_from_target(policy, policy_shape)
-    
+
+    def _sync(self) -> None:
+        if self.device.type == "xpu":
+            torch.xpu.synchronize()
+        elif self.device.type == "cuda":
+            torch.cuda.synchronize()
+
     def predict(
         self,
         state: np.ndarray,
-        return_raw_policy: bool = False
+        return_raw_policy: bool = False,
     ) -> Tuple[float, np.ndarray, np.ndarray]:
-        """
-        Predict value and policy for a single state.
-        
-        Args:
-            state: Input state of shape (7, D, H, W)
-                   - Channel 0: density
-                   - Channels 1-3: boundary condition masks
-                   - Channels 4-6: force vectors
-            return_raw_policy: If True, return padded policy without unpadding
-            
-        Returns:
-            Tuple of (value, policy_add, policy_remove)
-            - value: Predicted fitness score in [-1, 1]
-            - policy_add: Heatmap of where to add material
-            - policy_remove: Heatmap of where to remove material
-        """
-
+        """Predict (value, policy_add, policy_remove) for a single (7, D, H, W) state."""
         if self.is_npu:
-            # NPU Backend handles its own preprocessing/inference/postprocessing logic internally for simplicity, 
-            # OR we should delegate to it.
-            # The OpenVINO class we wrote implements predict(state) -> (val, padd, prem)
-            # The signature here matches.
             return self.backend.predict(state)
 
-        # Preprocess
         tensor, original_shape = self.preprocess(state)
-        
-        # Inference
         with torch.no_grad():
             pred_policy, pred_value = self.model(tensor)
-        
-        # Synchronize if needed
-        if self.device.type == 'xpu':
-            torch.xpu.synchronize()
-        elif self.device.type == 'cuda':
-            torch.cuda.synchronize()
-        
-        # Extract results
-        value = pred_value.cpu().item()
-        policy = pred_policy[0].cpu().numpy()  # (2, D', H', W')
-        
-        # Postprocess policy
+        self._sync()
+
+        value = float(pred_value.cpu().item())
+        policy = pred_policy[0].cpu().numpy()
         if not return_raw_policy:
             policy = self.postprocess(policy, original_shape)
-        
-        policy_add = policy[0]
-        policy_remove = policy[1]
-        
-        return value, policy_add, policy_remove
-    
+        return value, policy[0], policy[1]
+
+    def predict_with_blueprint(
+        self,
+        state: np.ndarray,
+    ) -> Tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+        """Predict (value, policy_add, policy_remove, blueprint_probs) for visualization/analysis."""
+        if self.is_npu:
+            tensor = torch.from_numpy(np.ascontiguousarray(state)).float().unsqueeze(0)
+            with torch.no_grad():
+                pred_policy, pred_value, pred_bp = self.backend.pt_model(tensor, return_blueprint=True)
+            bp_prob = torch.sigmoid(pred_bp)[0, 0].cpu().numpy()
+            pol = pred_policy[0].cpu().numpy()
+            return float(pred_value.cpu().item()), pol[0], pol[1], bp_prob
+
+        tensor, original_shape = self.preprocess(state)
+        with torch.no_grad():
+            pred_policy, pred_value, pred_bp = self.model(tensor, return_blueprint=True)
+        self._sync()
+
+        value = float(pred_value.cpu().item())
+        policy = self.postprocess(pred_policy[0].cpu().numpy(), original_shape)
+        bp_probs = torch.sigmoid(pred_bp)[0, 0].cpu().numpy()
+        return value, policy[0], policy[1], bp_probs
+
     def predict_batch(
         self,
-        states: List[np.ndarray]
+        states: List[np.ndarray],
     ) -> Tuple[List[float], List[np.ndarray], List[np.ndarray]]:
-        """
-        Predict value and policy for a batch of states.
-        
-        Note: All states should have the same shape for efficient batching.
-        
-        Args:
-            states: List of input states, each of shape (7, D, H, W)
-            
-        Returns:
-            Tuple of (values, policies_add, policies_remove)
-        """
+        """Predict (values, policies_add, policies_remove) for a batch of states."""
         if not states:
             return [], [], []
-        
-        # Preprocess all states
+        if self.is_npu:
+            return self.backend.predict_batch(states)
+
         tensors = []
         original_shapes = []
-        
         for state in states:
             tensor, orig_shape = self.preprocess(state)
             tensors.append(tensor)
             original_shapes.append(orig_shape)
-        
-        # Stack into batch
+
         batch_tensor = torch.cat(tensors, dim=0)
-        
-        # Inference
         with torch.no_grad():
             pred_policies, pred_values = self.model(batch_tensor)
-        
-        # Synchronize
-        if self.device.type == 'xpu':
-            torch.xpu.synchronize()
-        elif self.device.type == 'cuda':
-            torch.cuda.synchronize()
-        
-        # Extract results
-        values = pred_values.cpu().numpy().flatten().tolist()
+        self._sync()
+
+        values = [float(v) for v in pred_values.cpu().numpy().flatten().tolist()]
         policies = pred_policies.cpu().numpy()
-        
-        # Postprocess each policy
-        policies_add = []
-        policies_remove = []
-        
+
+        policies_add: List[np.ndarray] = []
+        policies_remove: List[np.ndarray] = []
         for i, orig_shape in enumerate(original_shapes):
             policy = self.postprocess(policies[i], orig_shape)
             policies_add.append(policy[0])
             policies_remove.append(policy[1])
-        
+
         return values, policies_add, policies_remove
-    
+
     def __repr__(self) -> str:
         return (
             f"AlphaBuilderInference(\n"
@@ -384,6 +270,6 @@ class AlphaBuilderInference:
             f"  device={self.device},\n"
             f"  epoch={self.epoch},\n"
             f"  val_loss={self.val_loss:.4f},\n"
-            f"  use_swin={self.config.get('use_swin', False)}\n"
+            f"  use_swin={self.use_swin}\n"
             f")"
         )

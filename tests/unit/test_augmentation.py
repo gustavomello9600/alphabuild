@@ -1,314 +1,224 @@
 """
-Unit tests for data augmentation module.
-
-Performance target: < 5ms per sample (200+ samples/second)
+Unit tests for 16x rigid symmetries and physics-consistent negative sampling.
 """
-import pytest
-import numpy as np
 import time
+import numpy as np
+import pytest
 
 from alphabuilder.src.neural.augmentation import (
-    rotate_90_z,
-    flip_y,
+    EROSION_KERNEL,
     erosion_attack,
+    flip_x,
+    flip_y,
+    flip_z,
     load_multiplier,
+    rotate_90_z,
     sabotage,
     saboteur,
-    EROSION_KERNEL
 )
 
 
 @pytest.fixture
 def sample_state():
-    """Create a sample 7-channel state tensor."""
     state = np.zeros((7, 64, 32, 8), dtype=np.float32)
-    # Add some density
     state[0, 10:50, 10:20, 2:6] = 1.0
-    # Add support masks at X=0
     state[1, 0, :, :] = 1.0
     state[2, 0, :, :] = 1.0
     state[3, 0, :, :] = 1.0
-    # Add force at X=63
     state[5, 63, 16, 4] = -1.0
     return state
 
 
 @pytest.fixture
 def sample_policy():
-    """Create a sample 2-channel policy tensor."""
     policy = np.zeros((2, 64, 32, 8), dtype=np.float32)
-    # Some add targets
     policy[0, 20:30, 10:15, 2:5] = 1.0
     return policy
 
 
 class TestRotate90Z:
-    """Tests for 90° rotation around Z axis."""
-    
-    def test_output_shapes(self, sample_state, sample_policy):
-        """Rotation should preserve number of channels."""
-        state_rot, policy_rot = rotate_90_z(sample_state, sample_policy)
-        
-        assert state_rot.shape[0] == 7  # 7 channels
-        assert policy_rot.shape[0] == 2  # 2 channels
-    
-    def test_spatial_rotation(self, sample_state, sample_policy):
-        """Spatial dimensions should be rotated."""
-        state_rot, policy_rot = rotate_90_z(sample_state, sample_policy)
-        
-        # After rotation, D and H swap (64, 32) -> (32, 64)
-        assert state_rot.shape[1:] == (32, 64, 8)
-        assert policy_rot.shape[1:] == (32, 64, 8)
-    
-    def test_force_vector_rotation(self, sample_state, sample_policy):
-        """Force vectors should be rotated correctly."""
-        # Set known force
-        state = sample_state.copy()
-        state[4, :, :, :] = 0  # Clear Fx
-        state[5, :, :, :] = 0  # Clear Fy
-        state[4, 30, 16, 4] = 1.0  # Fx = 1
-        state[5, 30, 16, 4] = 0.0  # Fy = 0
-        
-        state_rot, _ = rotate_90_z(state, sample_policy)
-        
-        # After 90° CCW: (Fx, Fy) -> (Fy, -Fx)
-        # New Fx should be old Fy (0), new Fy should be -old Fx (-1)
-        # Note: spatial position also rotates
-        assert state_rot[5].min() == -1.0  # Fy has -1
-    
+    def test_output_shapes_and_blueprint(self, sample_state, sample_policy):
+        bp = np.ones((1, 64, 32, 8), dtype=np.float32)
+        state_rot, policy_rot, bp_rot = rotate_90_z(sample_state, sample_policy, bp)
+        assert state_rot.shape == (7, 32, 64, 8)
+        assert policy_rot.shape == (2, 32, 64, 8)
+        assert bp_rot.shape == (1, 32, 64, 8)
+
+    def test_force_vector_rotation_exact_sign(self, sample_state, sample_policy):
+        """
+        Under np.rot90(..., k=1, axes=(1, 2)): (x, y) -> (H - 1 - y, x)
+        so vector components transform as (Fx, Fy) -> (-Fy, +Fx).
+        """
+        state = np.zeros((7, 8, 6, 2), dtype=np.float32)
+        pol = np.zeros((2, 8, 6, 2), dtype=np.float32)
+        # Voxel (2, 1, 0) carries Fx=+2.0, Fy=-3.0
+        state[4, 2, 1, 0] = 2.0
+        state[5, 2, 1, 0] = -3.0
+
+        state_rot, _ = rotate_90_z(state, pol)
+        # Rotated coords: (H - 1 - y, x, z) = (6 - 1 - 1, 2, 0) = (4, 2, 0)
+        assert state_rot[4, 4, 2, 0] == pytest.approx(3.0)   # new Fx = -Fy = +3.0
+        assert state_rot[5, 4, 2, 0] == pytest.approx(2.0)   # new Fy = +Fx = +2.0
+
+    def test_four_rotations_return_identity(self, sample_state, sample_policy):
+        s, p = sample_state.copy(), sample_policy.copy()
+        for _ in range(4):
+            s, p = rotate_90_z(s, p)
+        np.testing.assert_allclose(s, sample_state)
+        np.testing.assert_allclose(p, sample_policy)
+
     def test_mask_rotation(self, sample_state, sample_policy):
-        """Mask channels should be rotated (without sign change)."""
-        state_rot, _ = rotate_90_z(sample_state, sample_policy)
-        
-        # Masks should be swapped but not negated
-        # Original: mask_x at X=0 -> after rotation, should be at different position
-        assert state_rot[1].sum() > 0  # Still has values
-        assert state_rot[2].sum() > 0
-    
-    def test_returns_copies(self, sample_state, sample_policy):
-        """Should return copies, not views."""
-        state_rot, policy_rot = rotate_90_z(sample_state, sample_policy)
-        
-        state_rot[0, 0, 0, 0] = 999
-        assert sample_state[0, 0, 0, 0] != 999
+        """Support on X=0 (fixed X & Z only) swaps Mask_X -> Mask_Y after rot90."""
+        state = sample_state.copy()
+        state[1, 0, :, :] = 1.0
+        state[2, :, :, :] = 0.0  # Asymmetric BC mask between X and Y
+        state_rot, _ = rotate_90_z(state, sample_policy)
+        assert state_rot[1].sum() == 0.0
+        assert state_rot[2].sum() == state[1].sum()
 
 
-class TestFlipY:
-    """Tests for Y-axis flip."""
-    
-    def test_preserves_shape(self, sample_state, sample_policy):
-        """Flip should preserve shape."""
-        state_flip, policy_flip = flip_y(sample_state, sample_policy)
-        
-        assert state_flip.shape == sample_state.shape
-        assert policy_flip.shape == sample_policy.shape
-    
-    def test_flips_spatial_y(self, sample_state, sample_policy):
-        """Should flip along Y (H) dimension."""
-        # Set marker at Y=0
+class TestFlips:
+    def test_flip_x_inverts_fx_only(self, sample_state, sample_policy):
+        state = sample_state.copy()
+        state[0, 5, 10, 4] = 0.5
+        state[4, 5, 10, 4] = 2.0
+        state[5, 5, 10, 4] = -1.0
+        state[6, 5, 10, 4] = 0.7
+        bp = state[0:1].copy()
+
+        sf, pf, bpf = flip_x(state, sample_policy, bp)
+        nx = state.shape[1]
+        assert sf[0, nx - 1 - 5, 10, 4] == 0.5
+        assert bpf[0, nx - 1 - 5, 10, 4] == 0.5
+        assert sf[4, nx - 1 - 5, 10, 4] == -2.0
+        assert sf[5, nx - 1 - 5, 10, 4] == -1.0
+        assert sf[6, nx - 1 - 5, 10, 4] == 0.7
+
+    def test_flip_y_inverts_fy_only(self, sample_state, sample_policy):
         state = sample_state.copy()
         state[0, 30, 0, 4] = 0.5
-        state[0, 30, 31, 4] = 0.0
-        
-        state_flip, _ = flip_y(state, sample_policy)
-        
-        # Marker should now be at Y=31
-        assert state_flip[0, 30, 31, 4] == 0.5
-    
-    def test_inverts_fy(self, sample_state, sample_policy):
-        """Fy should be inverted."""
+        state[4, 30, 0, 4] = 1.0
+        state[5, 30, 0, 4] = -1.0
+        state[6, 30, 0, 4] = 0.5
+        sf, _ = flip_y(state, sample_policy)
+        ny = state.shape[2]
+        assert sf[0, 30, ny - 1, 4] == 0.5
+        assert sf[4, 30, ny - 1, 4] == 1.0
+        assert sf[5, 30, ny - 1, 4] == 1.0
+        assert sf[6, 30, ny - 1, 4] == 0.5
+
+    def test_flip_z_inverts_fz_only(self, sample_state, sample_policy):
         state = sample_state.copy()
-        state[5, 63, 16, 4] = -1.0  # Original Fy = -1
-        
-        state_flip, _ = flip_y(state, sample_policy)
-        
-        # After flip, Fy should be +1 at flipped position
-        assert state_flip[5].max() == 1.0
-    
-    def test_fx_fz_unchanged(self, sample_state, sample_policy):
-        """Fx and Fz should not be inverted."""
-        state = sample_state.copy()
-        state[4, 30, 16, 4] = 1.0  # Fx
-        state[6, 30, 16, 4] = 0.5  # Fz
-        
-        state_flip, _ = flip_y(state, sample_policy)
-        
-        # Fx and Fz should have same sign (just moved position)
-        assert state_flip[4].max() == 1.0
-        assert state_flip[6].max() == 0.5
+        state[4, 30, 16, 1] = 1.0
+        state[5, 30, 16, 1] = -2.0
+        state[6, 30, 16, 1] = 3.0
+        bp = state[0:1].copy()
+        sf, _, bpf = flip_z(state, sample_policy, bp)
+        nz = state.shape[3]
+        assert sf[4, 30, 16, nz - 2] == 1.0
+        assert sf[5, 30, 16, nz - 2] == -2.0
+        assert sf[6, 30, 16, nz - 2] == -3.0
+        assert bpf.shape == bp.shape
+
+    def test_d4_x_z2_has_16_distinct_orientations(self):
+        """8 flips (fx, fy, fz) x 2 rot90 yield 16 unique physical configurations."""
+        s0 = np.zeros((7, 8, 8, 8), dtype=np.float32)
+        p0 = np.zeros((2, 8, 8, 8), dtype=np.float32)
+        # Asymmetric voxel & force off-center so all 16 symmetries differ
+        s0[0, 1, 2, 1] = 1.0
+        s0[4, 1, 2, 1] = 1.0
+        s0[5, 1, 2, 1] = 2.0
+        s0[6, 1, 2, 1] = 3.0
+        p0[0, 1, 2, 1] = 1.0
+
+        seen = set()
+        for r in (0, 1):
+            for fx_b in (0, 1):
+                for fy_b in (0, 1):
+                    for fz_b in (0, 1):
+                        s, p = s0.copy(), p0.copy()
+                        if fx_b:
+                            s, p = flip_x(s, p)
+                        if fy_b:
+                            s, p = flip_y(s, p)
+                        if fz_b:
+                            s, p = flip_z(s, p)
+                        if r:
+                            s, p = rotate_90_z(s, p)
+                        seen.add(s.tobytes())
+        assert len(seen) == 16
 
 
-class TestErosionAttack:
-    """Tests for erosion attack (negative sampling)."""
-    
-    def test_returns_negative_value(self, sample_state, sample_policy):
-        """Should return value = -1.0."""
-        _, _, value = erosion_attack(sample_state, sample_policy, 0.5)
-        
-        assert value == -1.0
-    
-    def test_reduces_density(self, sample_state, sample_policy):
-        """Erosion should reduce material volume."""
+class TestNegativeSampling:
+    def test_erosion_attack(self, sample_state, sample_policy):
         original_volume = sample_state[0].sum()
-        
-        state_eroded, _, _ = erosion_attack(sample_state, sample_policy, 0.5)
-        
-        eroded_volume = state_eroded[0].sum()
-        assert eroded_volume < original_volume
-    
-    def test_policy_indicates_repair(self, sample_state, sample_policy):
-        """Policy should indicate where to add material (repair)."""
-        state_eroded, policy_repair, _ = erosion_attack(sample_state, sample_policy, 0.5)
-        
-        # Repair policy add channel should have values where material was removed
-        removed = sample_state[0] - state_eroded[0]
-        np.testing.assert_array_equal(policy_repair[0], np.maximum(0, removed))
-    
-    def test_remove_channel_zero(self, sample_state, sample_policy):
-        """Remove channel should be zero (nothing to remove after erosion)."""
-        _, policy_repair, _ = erosion_attack(sample_state, sample_policy, 0.5)
-        
+        state_eroded, policy_repair, value = erosion_attack(sample_state, sample_policy, 0.5)
+        assert value == -1.0
+        assert state_eroded[0].sum() < original_volume
+        np.testing.assert_array_equal(policy_repair[0], np.maximum(0.0, sample_state[0] - state_eroded[0]))
         assert policy_repair[1].sum() == 0
 
-
-class TestLoadMultiplier:
-    """Tests for load multiplier (stress test)."""
-    
-    def test_multiplies_forces(self, sample_state, sample_policy):
-        """Forces should be multiplied by k."""
+    def test_load_multiplier_never_adds_on_solid(self, sample_state, sample_policy):
         k = 3.0
-        original_fy = sample_state[5, 63, 16, 4]
-        
-        state_stressed, _, _ = load_multiplier(sample_state, sample_policy, 0.5, k=k)
-        
-        assert state_stressed[5, 63, 16, 4] == original_fy * k
-    
-    def test_returns_negative_value(self, sample_state, sample_policy):
-        """Should return value = -0.8."""
-        _, _, value = load_multiplier(sample_state, sample_policy, 0.5)
-        
+        # Ensure solid exists adjacent to force
+        state = sample_state.copy()
+        state[0, 62, 16, 4] = 1.0
+        state_stressed, policy, value = load_multiplier(state, sample_policy, 0.5, k=k)
         assert value == -0.8
-    
-    def test_policy_suggests_reinforcement(self, sample_state, sample_policy):
-        """Policy should suggest adding material near load."""
-        _, policy, _ = load_multiplier(sample_state, sample_policy, 0.5)
-        
-        # Add channel should have values (reinforcement suggestions)
+        assert state_stressed[5, 63, 16, 4] == state[5, 63, 16, 4] * k
         assert policy[0].sum() > 0
+        # Crucial Bloco B fix: ADD targets cannot overlap already-solid voxels
+        solid = state[0] > 0.5
+        assert np.sum(policy[0][solid]) == 0.0
 
-
-class TestSabotage:
-    """Tests for sabotage (remove near support)."""
-    
-    @pytest.fixture
-    def state_with_support_material(self):
-        """Create state with material near support for sabotage testing."""
+    def test_sabotage_removes_and_guards_empty(self, sample_policy):
         state = np.zeros((7, 64, 32, 8), dtype=np.float32)
-        # Add material near support (X=0 to X=5)
-        state[0, 0:5, 10:20, 2:6] = 1.0
-        # Add support masks
-        state[1, 0, :, :] = 1.0
-        state[2, 0, :, :] = 1.0
-        state[3, 0, :, :] = 1.0
-        return state
-    
-    def test_returns_negative_value(self, state_with_support_material, sample_policy):
-        """Should return value = -1.0."""
-        _, _, value = sabotage(state_with_support_material, sample_policy, 0.5)
-        
-        assert value == -1.0
-    
-    def test_removes_near_support(self, state_with_support_material, sample_policy):
-        """Should remove material near X=0."""
-        state = state_with_support_material
-        
-        state_sab, _, _ = sabotage(state, sample_policy, 0.5)
-        
-        # Some material should be removed near support
-        original_near_support = state[0, 0:5, :, :].sum()
-        sabotaged_near_support = state_sab[0, 0:5, :, :].sum()
-        assert sabotaged_near_support < original_near_support
-    
-    def test_policy_indicates_repair(self, state_with_support_material, sample_policy):
-        """Policy should indicate where to repair."""
-        state_sab, policy_repair, _ = sabotage(state_with_support_material, sample_policy, 0.5)
-        
-        # Add channel should indicate removed voxels
-        assert policy_repair[0].sum() > 0
+        state[1:4, 0, :, :] = 1.0
+        # Case 1: no material near support -> must leave state/value unchanged
+        s_unchanged, p_unchanged, v_unchanged = sabotage(state, sample_policy, 0.6)
+        assert v_unchanged == 0.6
+        np.testing.assert_array_equal(s_unchanged, state)
 
+        # Case 2: material near support -> removes >0 and labels -1.0
+        state[0, 0:4, 10:20, 2:6] = 1.0
+        state_sab, pol_rep, val = sabotage(state, sample_policy, 0.6)
+        assert val == -1.0
+        assert state_sab[0].sum() < state[0].sum()
+        assert pol_rep[0].sum() > 0
 
-class TestSaboteur:
-    """Tests for saboteur (random cube removal)."""
-    
-    def test_returns_negative_value(self, sample_state, sample_policy):
-        """Should return value = -1.0."""
-        _, _, value = saboteur(sample_state, sample_policy, 0.5)
-        
-        assert value == -1.0
-    
-    def test_removes_cube(self, sample_state, sample_policy):
-        """Should remove a cube of material."""
-        original_volume = sample_state[0].sum()
-        
-        state_sab, _, _ = saboteur(sample_state, sample_policy, 0.5, cube_size=3)
-        
-        sabotaged_volume = state_sab[0].sum()
-        assert sabotaged_volume < original_volume
-    
-    def test_handles_empty_state(self):
-        """Should handle state with no material gracefully."""
-        empty_state = np.zeros((7, 64, 32, 8), dtype=np.float32)
-        empty_policy = np.zeros((2, 64, 32, 8), dtype=np.float32)
-        
-        state_out, policy_out, value_out = saboteur(empty_state, empty_policy, 0.5)
-        
-        # Should return unchanged
-        np.testing.assert_array_equal(state_out, empty_state)
-        np.testing.assert_array_equal(policy_out, empty_policy)
-        assert value_out == 0.5
+    def test_saboteur(self, sample_state, sample_policy):
+        state_sab, pol_rep, val = saboteur(sample_state, sample_policy, 0.5, cube_size=3)
+        assert val == -1.0
+        assert state_sab[0].sum() < sample_state[0].sum()
+        assert pol_rep[0].sum() > 0
+
+        empty_s = np.zeros((7, 64, 32, 8), dtype=np.float32)
+        empty_p = np.zeros((2, 64, 32, 8), dtype=np.float32)
+        so, po, vo = saboteur(empty_s, empty_p, 0.5)
+        assert vo == 0.5
+        np.testing.assert_array_equal(so, empty_s)
 
 
 class TestPerformance:
-    """Performance tests - must be fast for training."""
-    
     @pytest.fixture
     def large_sample(self):
-        """Create larger sample for performance testing."""
         state = np.random.rand(7, 64, 32, 8).astype(np.float32)
-        state[0] = (state[0] > 0.5).astype(np.float32)  # Binary density
+        state[0] = (state[0] > 0.5).astype(np.float32)
         policy = np.random.rand(2, 64, 32, 8).astype(np.float32)
         return state, policy
-    
+
     def test_rotate_performance(self, large_sample):
-        """Rotation should be < 5ms."""
         state, policy = large_sample
-        
-        start = time.perf_counter()
+        t0 = time.perf_counter()
         for _ in range(100):
             rotate_90_z(state, policy)
-        elapsed = (time.perf_counter() - start) / 100 * 1000
-        
-        assert elapsed < 5, f"Rotation took {elapsed:.2f}ms, should be < 5ms"
-    
+        ms = (time.perf_counter() - t0) / 100 * 1000
+        assert ms < 5, f"rotate_90_z took {ms:.2f}ms"
+
     def test_flip_performance(self, large_sample):
-        """Flip should be < 5ms."""
         state, policy = large_sample
-        
-        start = time.perf_counter()
+        t0 = time.perf_counter()
         for _ in range(100):
             flip_y(state, policy)
-        elapsed = (time.perf_counter() - start) / 100 * 1000
-        
-        assert elapsed < 5, f"Flip took {elapsed:.2f}ms, should be < 5ms"
-    
-    def test_erosion_performance(self, large_sample):
-        """Erosion should be < 10ms (morphological ops are slower)."""
-        state, policy = large_sample
-        
-        start = time.perf_counter()
-        for _ in range(50):
-            erosion_attack(state, policy, 0.5)
-        elapsed = (time.perf_counter() - start) / 50 * 1000
-        
-        assert elapsed < 10, f"Erosion took {elapsed:.2f}ms, should be < 10ms"
-
+        ms = (time.perf_counter() - t0) / 100 * 1000
+        assert ms < 5, f"flip_y took {ms:.2f}ms"

@@ -106,6 +106,9 @@ class GameStep:
     connected_load_fraction: float = 0.0   # Fraction of loads connected to support
     displacement_map: Optional[np.ndarray] = None # Full displacement field
     reward_components: Dict[str, float] = field(default_factory=dict) # Detailed reward breakdown
+    value_target: Optional[float] = None
+    final_reward: Optional[float] = None
+    fem_reward: Optional[float] = None
 
 
 # =============================================================================
@@ -326,9 +329,10 @@ def record_step(
     final_reward: Optional[float] = None,
     fem_reward: Optional[float] = None,
     displacement_map: Optional[np.ndarray] = None,
+    executed_action_stats: Optional[List[Tuple[Tuple[int, int, int, int], int, float]]] = None,
 ) -> None:
     """
-    Record a single game step with all associated data.
+    Record a single game step with all associated data and faithful MCTS branch statistics.
     """
     conn = sqlite3.connect(db_path)
     
@@ -344,24 +348,19 @@ def record_step(
     p_rem_blob = serialize_sparse(idx_rem, val_rem)
     
     # Serialize MCTS data - FULL TREE AGGREGATION
-    # Use collect_subtree_visits() to get visits from ALL levels of the tree,
-    # not just the immediate children of the root.
     resolution = state.density.shape
     v_add = np.zeros(resolution, dtype=np.float32)
     v_rem = np.zeros(resolution, dtype=np.float32)
     
-    # Get aggregated visits from entire subtree
     if hasattr(result, 'root') and result.root is not None:
         full_tree_visits = result.root.collect_subtree_visits()
     else:
-        # Fallback to shallow distribution
-        full_tree_visits = result.visit_distribution
+        full_tree_visits = result.visit_distribution or {}
     
     for action, visits in full_tree_visits.items():
-        # Action is (channel, x, y, z) tuple
         channel, x, y, z = action
         if channel == 0:
-            v_add[x, y, z] += visits  # Use += for aggregation
+            v_add[x, y, z] += visits
         else:
             v_rem[x, y, z] += visits
             
@@ -371,52 +370,74 @@ def record_step(
     v_add_blob = serialize_sparse(idx_v_add, val_v_add)
     v_rem_blob = serialize_sparse(idx_v_rem, val_v_rem)
     
-    # Selected actions (Executed Sequence vs Top Candidates)
-    # If executed_actions is provided (PV Sequence), stick to that.
-    # Otherwise fallback to result.actions (Top-K alternatives).
-    actions_to_record = executed_actions if executed_actions is not None else result.actions
-    
+    # Selected actions: prefer exact tree branch stats when provided
     actions_data = []
-    
-    # If using sequence, we need to trace stats from root
-    current_node = result.root if hasattr(result, 'root') else None
-    
-    for a in actions_to_record:
-        channel, x, y, z = a
-        visits = 0
-        q_value = 0.0
-        
-        # Try to find stats in the tree
-        if current_node and a in current_node.children:
-            child = current_node.children[a]
-            visits = child.visit_count
-            q_value = child.mean_value
-            # Advance for next action in sequence (if it is a sequence)
-            # Only if we are using executed_actions (sequence)
-            if executed_actions is not None:
-                current_node = child
-        elif current_node is None and not executed_actions:
-             # Fallback for result.actions (roots children)
-             visits = result.visit_distribution.get(a, 0)
-        
-        actions_data.append({
-             "channel": channel,
-             "x": x, "y": y, "z": z,
-             "visits": visits,
-             "q_value": q_value
-        })
+    if executed_action_stats is not None:
+        for (channel, x, y, z), visits, q_val in executed_action_stats:
+            actions_data.append({
+                "channel": int(channel),
+                "x": int(x),
+                "y": int(y),
+                "z": int(z),
+                "visits": int(visits),
+                "q_value": float(q_val),
+            })
+    else:
+        actions_to_record = executed_actions if executed_actions is not None else (result.actions or [])
+        current_node = result.root if hasattr(result, 'root') else None
+        for a in actions_to_record:
+            channel, x, y, z = a
+            visits = 0
+            q_value = 0.0
+            if current_node and a in current_node.children:
+                child = current_node.children[a]
+                visits = child.visit_count
+                q_value = child.mean_value
+                if executed_actions is not None:
+                    current_node = child
+            elif result.visit_distribution:
+                visits = int(result.visit_distribution.get(a, 0))
+            actions_data.append({
+                "channel": int(channel),
+                "x": int(x),
+                "y": int(y),
+                "z": int(z),
+                "visits": int(visits),
+                "q_value": float(q_value),
+            })
     
     actions_json = json.dumps(actions_data)
     
-    # MCTS Stats
-    # Assuming result has stats dict or object
+    # Real MCTS Stats extraction
+    nodes_expanded = 0
+    max_depth = 0
+    if hasattr(result, 'root') and result.root is not None and hasattr(result.root, 'tree_stats'):
+        nodes_expanded, max_depth = result.root.tree_stats()
+
+    visit_dist = result.visit_distribution or {}
+    total_visits = sum(visit_dist.values())
+    top8_concentration = 0.0
+    refutation = False
+    if total_visits > 0:
+        sorted_visits = sorted(visit_dist.values(), reverse=True)
+        top8_concentration = float(sum(sorted_visits[:8]) / total_visits)
+        most_visited_action = max(visit_dist.items(), key=lambda item: item[1])[0]
+        all_pol = np.concatenate([policy_add.flatten(), policy_remove.flatten()])
+        best_idx = int(np.argmax(all_pol))
+        spatial_size = policy_add.size
+        if best_idx < spatial_size:
+            best_pol_action = (0,) + np.unravel_index(best_idx, policy_add.shape)
+        else:
+            best_pol_action = (1,) + np.unravel_index(best_idx - spatial_size, policy_remove.shape)
+        refutation = bool(most_visited_action != best_pol_action)
+
     stats_data = {
-        "num_simulations": result.num_simulations,
-        "nodes_expanded": 0, # TODO: extract from engine if available
-        "max_depth": 0,
+        "num_simulations": int(result.num_simulations),
+        "nodes_expanded": int(nodes_expanded),
+        "max_depth": int(max_depth),
         "cache_hits": 0,
-        "top8_concentration": 0.0,
-        "refutation": False
+        "top8_concentration": top8_concentration,
+        "refutation": refutation,
     }
     stats_json = json.dumps(stats_data)
 
@@ -467,23 +488,23 @@ def update_game_final(
     total_steps: Optional[int] = None
 ) -> None:
     """
-    Update game with final results after completion.
-    Also backfills final_reward to all steps of this episode.
+    Update game summary row (`final_score`, `final_compliance`, `final_volume`, `total_steps`).
     """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
     try:
-        # Update games table
         cursor.execute("""
             UPDATE games 
-            SET final_score = ?, final_volume = ?, total_steps = ?
+            SET final_score = ?,
+                final_compliance = COALESCE(?, final_compliance),
+                final_volume = COALESCE(?, final_volume),
+                total_steps = COALESCE(?, total_steps)
             WHERE game_id = ?
-        """, (final_score, final_volume, total_steps, game_id))
-        
-        cursor.execute("COMMIT")
+        """, (final_score, final_compliance, final_volume, total_steps, game_id))
+        conn.commit()
     except sqlite3.Error as e:
-        cursor.execute("ROLLBACK")
+        conn.rollback()
         print(f"Error updating game final: {e}")
     finally:
         conn.close()
@@ -491,100 +512,85 @@ def update_game_final(
 
 def backpropagate_value_targets(
     db_path: Path, 
-    game_id: str
+    game_id: str,
+    gamma: float = 0.99,
 ) -> None:
     """
-    Backpropagate final results to set 'value_target' for all steps in the episode.
-    
-    Logic:
-    1. Calculate Pure FEM Score of the FINAL Step 
-       (using calculate_fem_score, NOT the limited reward).
-    2. For Phase 1 (GROWTH) steps:
-       Target = Final Episode FEM Score
-    3. For Phase 2 (REFINEMENT) steps:
-       Lambda = Step / Total_Episode_Steps
-       Target = (1 - Lambda) * Current_FEM + Lambda * Final_FEM
-       
-    Args:
-        db_path: Path to database
-        game_id: Game ID to process
+    Backpropagate episode outcome to set `value_target` consistently for every step:
+    - Phase 1 (GROWTH): discounted return `gamma^(t_P2 - t) * R_final`
+    - Phase 2 (REFINEMENT): `(1 - lambda_t) * R_FEM(t) + lambda_t * R_final`,
+      respecting structural disconnection and displacement collapse (-1.0).
     """
-    from .reward import calculate_fem_score, reverse_engineer_compliance  # Late import to avoid circular dependency
-    
+    from .reward import calculate_reward
+
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    
+
     try:
-        # 1. Get all steps with necessary data (compliance_fem, volume_fraction)
-        cursor.execute("""
-            SELECT step, phase, compliance_fem, volume_fraction
+        cursor.execute(
+            """
+            SELECT step, phase, compliance_fem, volume_fraction, max_displacement, is_connected, fem_reward
             FROM game_steps
             WHERE game_id = ?
             ORDER BY step ASC
-        """, (game_id,))
-        
+            """,
+            (game_id,),
+        )
         steps = cursor.fetchall()
         if not steps:
             return
-            
-        # 2. Determine Final Episode Score (Pure FEM)
-        # Get last step
-        last_step_row = steps[-1]
-        last_step_idx = last_step_row[0]  # step index
-        _, _, last_comp, last_vol = last_step_row
-        
-        final_fem_score = 0.0
-        if last_comp is not None:
-             final_fem_score = calculate_fem_score(last_comp, last_vol)
+
+        last_step_idx, last_phase, last_comp, last_vol, last_disp, last_conn, last_fem_r = steps[-1]
+        if last_fem_r is not None:
+            final_reward = float(last_fem_r)
+        elif last_comp is not None and last_vol is not None:
+            final_reward = calculate_reward(
+                compliance=float(last_comp),
+                vol_frac=float(last_vol),
+                is_valid=bool(last_conn),
+                max_displacement=last_disp,
+            )
         else:
-             # Fallback if final step has no compliance (e.g. invalid)
-             final_fem_score = -1.0 
-             
-        # 3. Calculate Targets for each step
+            final_reward = -1.0
+
+        phase2_starts = [s[0] for s in steps if s[1] == "REFINEMENT"]
+        phase2_start_step = phase2_starts[0] if phase2_starts else last_step_idx
+        p2_span = max(1, last_step_idx - phase2_start_step)
+
         updates = []
-        
-        for step_idx, phase_val, comp, vol in steps:
-            # Phase value is stored as 'GROWTH' or 'REFINEMENT' string? 
-            # Check create_schema: phase TEXT.
-            # Enum stores as string 'GROWTH', 'REFINEMENT' in runner logic via .value
-            
-            target = 0.0
-            
-            if phase_val == 'GROWTH':
-                # Phase 1: Target is the final outcome
-                target = final_fem_score
+        for step_idx, phase_val, comp, vol, max_disp, is_conn, fem_r in steps:
+            if phase_val == "GROWTH":
+                steps_to_p2 = max(0, int(phase2_start_step) - int(step_idx))
+                target = (float(gamma) ** steps_to_p2) * final_reward
             else:
-                # Phase 2: Mixed target
-                # Lambda scales with progress towards the end of THIS episode
-                # lambda = current_step / total_steps
-                # Note: step_idx is 1-based usually if from database? No, runner initializes 0 or 1?
-                # Usually 1-based in DB if from runner.py logic.
-                
-                # Careful with division by zero
-                current_lambda = step_idx / max(1, last_step_idx)
-                current_lambda = min(1.0, max(0.0, current_lambda))
-                
-                if comp is not None:
-                    current_score = calculate_fem_score(comp, vol)
-                    target = (1.0 - current_lambda) * current_score + current_lambda * final_fem_score
+                lam = min(1.0, max(0.0, float(step_idx - phase2_start_step) / float(p2_span)))
+                if not is_conn:
+                    cur_r = -1.0
+                elif fem_r is not None:
+                    cur_r = float(fem_r)
+                elif comp is not None and vol is not None:
+                    cur_r = calculate_reward(
+                        compliance=float(comp),
+                        vol_frac=float(vol),
+                        is_valid=True,
+                        max_displacement=max_disp,
+                    )
                 else:
-                    # If current step invalid (no compliance), use final logic or penalty
-                    target = final_fem_score # Fallback
-            
-            # Clamp target
+                    cur_r = final_reward
+                target = (1.0 - lam) * cur_r + lam * final_reward
+
             target = max(-1.0, min(1.0, float(target)))
-            updates.append((target, game_id, step_idx))
-            
-        # 4. Batch Update
-        cursor.executemany("""
+            updates.append((target, final_reward, game_id, step_idx))
+
+        cursor.executemany(
+            """
             UPDATE game_steps
-            SET value_target = ?
+            SET value_target = ?, final_reward = ?
             WHERE game_id = ? AND step = ?
-        """, updates)
-        
+            """,
+            updates,
+        )
         conn.commit()
-        # print(f"Backpropagated targets for {game_id}: Final Score = {final_fem_score:.4f}")
-        
     except sqlite3.Error as e:
         print(f"Error backpropagating targets for {game_id}: {e}")
         conn.rollback()
@@ -629,6 +635,7 @@ def load_game(db_path: Path, game_id: str) -> Optional[GameInfo]:
         load_config=json.loads(row[4]),
         bc_type=row[5],
         resolution=tuple(json.loads(row[6])),
+        final_score=row[7],
         final_compliance=row[8],
         final_volume=row[9],
         total_steps=row[10] or 0,

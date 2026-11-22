@@ -85,6 +85,25 @@ def reverse_engineer_compliance(fitness_score: float, vol_frac: float) -> float:
     return float(np.exp(log_c_natural))
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Deprecated v3.2 database recalculation script.")
+    parser.add_argument(
+        "--force-legacy",
+        action="store_true",
+        help="Acknowledge that reverse_engineer_compliance is retired in v3.3 and run anyway.",
+    )
+    args = parser.parse_args()
+    if not args.force_legacy:
+        print(
+            "DEPRECATED: scripts/recalculate_warmup_db.py is retired in AlphaBuilder v3.3.\n"
+            "v3.3 harvest databases already store raw physical compliance, vol_frac, max_displacement,\n"
+            "and unified calculate_fem_score fitness_score directly without reverse_engineer_compliance.\n"
+            "Pass --force-legacy only if migrating an archival pre-v3.3 dataset.",
+            file=sys.stderr,
+        )
+        return
+
     if not SOURCE_DB.exists():
         print(f"Error: Source database {SOURCE_DB} not found.")
         return

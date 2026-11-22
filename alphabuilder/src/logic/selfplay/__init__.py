@@ -23,7 +23,6 @@ from .storage import (
     get_game_count,
     get_last_step,
     get_incomplete_games,
-    get_incomplete_games,
     generate_game_id,
     backpropagate_value_targets,
 )
@@ -41,6 +40,7 @@ from .reward import (
     # New helper functions
     calculate_compliance_score,
     calculate_volume_bonus,
+    calculate_displacement_penalty,
     # Core functions
     calculate_raw_score,
     calculate_reward,
@@ -49,13 +49,13 @@ from .reward import (
     get_phase2_terminal_reward,
     check_structure_connectivity,
     estimate_reward_components,
-    # Island analysis
+    # Island analysis & PBRS shaping
     analyze_structure_islands,
     calculate_island_penalty,
     get_reward_with_island_penalty,
-    calculate_island_penalty,
-    get_reward_with_island_penalty,
     calculate_connectivity_reward,
+    calculate_pbrs_potential,
+    get_guidance_alpha,
     reverse_engineer_compliance,
 )
 
@@ -78,8 +78,10 @@ __all__ = [
     'get_incomplete_games',
     'generate_game_id',
     'backpropagate_value_targets',
-    'backpropagate_value_targets',
     'calculate_connectivity_reward',
+    'calculate_displacement_penalty',
+    'calculate_pbrs_potential',
+    'get_guidance_alpha',
     'reverse_engineer_compliance',
 ]
 

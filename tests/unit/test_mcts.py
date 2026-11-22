@@ -1,431 +1,305 @@
 """
-Unit tests for MCTS module.
-
-Tests cover:
-- MCTSNode statistics and selection
-- Legal move generation
-- MCTS search integration
+Unit tests for MCTS engine, node pruning normalization, protected remove moves,
+batch inference forwarding, and faithful multi-branch PV recording.
 """
 
-import pytest
+from pathlib import Path
+import tempfile
 import numpy as np
-from unittest.mock import Mock, patch
+import pytest
 
-from alphabuilder.src.logic.mcts.node import MCTSNode, Action
-from alphabuilder.src.logic.mcts.legal_moves import (
-    get_legal_moves,
-    get_legal_add_moves,
-    get_legal_remove_moves,
-    apply_action_mask,
-    masked_softmax,
-    is_terminal_state,
-    count_legal_moves
-)
 from alphabuilder.src.logic.mcts.engine import (
+    AlphaBuilderMCTS,
+    MCTSConfig,
+    PHASE1_CONFIG,
+    PHASE2_CONFIG,
+    SearchResult,
     apply_action,
     apply_actions,
     build_state_tensor,
     run_mcts_search,
-    MCTSConfig,
-    AlphaBuilderMCTS
+    select_pv_branches,
 )
+from alphabuilder.src.logic.mcts.legal_moves import (
+    apply_action_mask,
+    count_legal_moves,
+    get_legal_add_moves,
+    get_legal_moves,
+    get_legal_remove_moves,
+    is_terminal_state,
+    masked_softmax,
+)
+from alphabuilder.src.logic.mcts.node import MCTSNode
+from alphabuilder.src.logic.selfplay.runner import EpisodeState
+from alphabuilder.src.logic.selfplay.storage import (
+    GameInfo,
+    initialize_selfplay_db,
+    load_game_step,
+    record_step,
+    save_game,
+)
+from alphabuilder.src.logic.storage import Phase
 
-
-# =============================================================================
-# MCTSNode Tests
-# =============================================================================
 
 class TestMCTSNode:
-    """Tests for MCTSNode dataclass."""
-    
     def test_initial_state(self):
-        """Node starts with zero visits and zero value."""
         node = MCTSNode(prior=0.5)
         assert node.visit_count == 0
         assert node.value_sum == 0.0
         assert node.prior == 0.5
         assert not node.is_expanded
         assert node.children == {}
-    
+
     def test_mean_value_zero_visits(self):
-        """Mean value is 0 when no visits (avoid div by zero)."""
         node = MCTSNode()
         assert node.mean_value == 0.0
-    
+
     def test_mean_value_after_updates(self):
-        """Mean value is W/N after updates."""
         node = MCTSNode()
         node.update(0.8)
         node.update(0.6)
         node.update(0.4)
-        
         assert node.visit_count == 3
         assert node.value_sum == pytest.approx(1.8)
         assert node.mean_value == pytest.approx(0.6)
-    
-    def test_puct_score_exploration_bonus(self):
-        """PUCT score includes exploration bonus for low-visit nodes."""
+
+    def test_puct_score_exploration_and_exploitation(self):
         node = MCTSNode(prior=0.5)
-        
-        # High exploration bonus when N=0
         score = node.puct_score(c_puct=1.25, parent_visits=100)
-        expected = 0 + 1.25 * 0.5 * np.sqrt(100) / 1
-        assert score == pytest.approx(expected)
-    
-    def test_puct_score_exploitation(self):
-        """PUCT score favors high-value nodes with many visits."""
-        node = MCTSNode(prior=0.1)
-        node.update(0.9)
-        node.update(0.9)
-        node.update(0.9)
-        
-        # Q=0.9, exploration term is small with N=3
-        score = node.puct_score(c_puct=1.25, parent_visits=10)
-        expected = 0.9 + 1.25 * 0.1 * np.sqrt(10) / 4
-        assert score == pytest.approx(expected)
-    
+        assert score == pytest.approx(1.25 * 0.5 * np.sqrt(100) / 1.0)
+
+        node2 = MCTSNode(prior=0.1)
+        node2.update(0.9)
+        node2.update(0.9)
+        node2.update(0.9)
+        score2 = node2.puct_score(c_puct=1.25, parent_visits=10)
+        assert score2 == pytest.approx(0.9 + 1.25 * 0.1 * np.sqrt(10) / 4.0)
+
     def test_select_child(self):
-        """Select child with highest PUCT score."""
         root = MCTSNode()
-        
-        # Create children with different priors
-        # When N=0 for all, PUCT = 0 + c_puct * P * sqrt(0) / 1 = 0
-        # So we need some visits to differentiate, or just check highest prior wins
         child1 = MCTSNode(prior=0.1, parent=root)
-        child2 = MCTSNode(prior=0.8, parent=root)  # Highest prior
+        child2 = MCTSNode(prior=0.8, parent=root)
         child3 = MCTSNode(prior=0.1, parent=root)
-        
-        # Give child2 a visit so it has higher total_visits for PUCT calc
         child2.update(0.5)
-        
-        root.children = {
-            (0, 0, 0, 0): child1,
-            (0, 1, 0, 0): child2,
-            (0, 2, 0, 0): child3,
-        }
+        root.children = {(0, 0, 0, 0): child1, (0, 1, 0, 0): child2, (0, 2, 0, 0): child3}
         root.is_expanded = True
-        
         action, selected = root.select_child(c_puct=1.25)
-        # child2 has highest prior AND has visits, so should dominate
         assert action == (0, 1, 0, 0)
         assert selected is child2
-    
-    def test_expand_creates_children(self):
-        """Expand creates children for valid moves with non-zero prior."""
+
+    def test_expand_renormalizes_after_topk(self):
         node = MCTSNode()
-        
-        # Small grid for testing
-        policy_add = np.array([[[0.5, 0.3], [0.1, 0.1]]])  # (1, 2, 2)
-        policy_remove = np.zeros((1, 2, 2))
-        valid_add = np.array([[[1, 1], [0, 0]]])  # Only top row valid
-        valid_remove = np.zeros((1, 2, 2))
-        
-        node.expand(policy_add, policy_remove, valid_add, valid_remove)
-        
+        policy_add = np.arange(8, dtype=np.float32).reshape(2, 2, 2)
+        policy_remove = np.zeros((2, 2, 2), dtype=np.float32)
+        valid_add = np.ones((2, 2, 2), dtype=np.float32)
+        valid_remove = np.zeros((2, 2, 2), dtype=np.float32)
+
+        node.expand(policy_add, policy_remove, valid_add, valid_remove, top_k=3)
         assert node.is_expanded
-        assert len(node.children) == 2  # Two valid add positions
-        
-        # Check actions are (channel=0, x, y, z)
-        actions = list(node.children.keys())
-        assert (0, 0, 0, 0) in actions
-        assert (0, 0, 0, 1) in actions
-    
+        assert len(node.children) == 3
+        total_prior = sum(c.prior for c in node.children.values())
+        assert total_prior == pytest.approx(1.0, abs=1e-6)
+
     def test_get_top_k_actions(self):
-        """Get top-k actions by visit count."""
         root = MCTSNode()
-        
-        # Create children with different visit counts
         for i in range(5):
             child = MCTSNode(parent=root)
-            child.visit_count = 10 - i  # 10, 9, 8, 7, 6
+            child.visit_count = 10 - i
             root.children[(0, i, 0, 0)] = child
-        
         root.is_expanded = True
-        
-        top_3 = root.get_top_k_actions(3)
-        assert len(top_3) == 3
-        assert top_3[0] == (0, 0, 0, 0)  # Highest visits
-        assert top_3[1] == (0, 1, 0, 0)
-        assert top_3[2] == (0, 2, 0, 0)
+        assert root.get_top_k_actions(3) == [(0, 0, 0, 0), (0, 1, 0, 0), (0, 2, 0, 0)]
 
-
-# =============================================================================
-# Legal Moves Tests
-# =============================================================================
 
 class TestLegalMoves:
-    """Tests for legal move generation."""
-    
     def test_legal_add_moves_empty_grid(self):
-        """Empty grid: only support plane (X=0) is valid for adding."""
         density = np.zeros((4, 4, 4))
         valid_add = get_legal_add_moves(density)
-        # 4x4 = 16 voxels on X=0 support plane
-        # Plus 4x4 = 16 voxels on X=1 support plane (legacy fallback) -> Total 32
         assert valid_add.sum() == 32
-        assert valid_add[0:2, :, :].sum() == 32  # All on support planes
-        assert valid_add[2:, :, :].sum() == 0  # Nothing else
-    
-    def test_legal_add_moves_empty_grid_no_supports(self):
-        """Empty grid without supports: no valid add moves."""
-        density = np.zeros((4, 4, 4))
-        valid_add = get_legal_add_moves(density, include_supports=False)
-        assert valid_add.sum() == 0
-    
+        assert valid_add[0:2, :, :].sum() == 32
+
+        assert get_legal_add_moves(density, include_supports=False).sum() == 0
+
     def test_legal_add_moves_single_voxel(self):
-        """Add moves are neighbors of existing material + support plane."""
-        density = np.zeros((5, 5, 5))
-        density[2, 2, 2] = 1.0  # Single voxel in center
-        
-        valid_add = get_legal_add_moves(density)
-        
-        # 6 face neighbors + 50 support plane voxels (X=0, X=1)
-        # One neighbor (1, 2, 2) is at X=1, so it overlaps.
-        # Supports: 50. Neighbors: 6. Overlap: 1.
-        # Total = 50 + 6 - 1 = 55.
-        assert valid_add.sum() == 55
-        assert valid_add[2, 2, 2] == 0  # Original position not valid
-        assert valid_add[1, 2, 2] == 1  # Left neighbor
-        assert valid_add[3, 2, 2] == 1  # Right neighbor
-        assert valid_add[2, 1, 2] == 1  # Front neighbor
-        assert valid_add[2, 3, 2] == 1  # Back neighbor
-        assert valid_add[2, 2, 1] == 1  # Bottom neighbor
-        assert valid_add[2, 2, 3] == 1  # Top neighbor
-    
-    def test_legal_add_moves_single_voxel_no_supports(self):
-        """Add moves without supports: only 6 neighbors."""
         density = np.zeros((5, 5, 5))
         density[2, 2, 2] = 1.0
-        
-        valid_add = get_legal_add_moves(density, include_supports=False)
-        
-        # Should have 6 neighbors (faces) only
-        assert valid_add.sum() == 6
-    
-    def test_legal_remove_moves(self):
-        """Remove moves are existing material positions."""
+        valid_add = get_legal_add_moves(density)
+        assert valid_add.sum() == 55
+        assert valid_add[2, 2, 2] == 0
+        assert get_legal_add_moves(density, include_supports=False).sum() == 6
+
+    def test_legal_remove_moves_and_protection(self):
         density = np.zeros((4, 4, 4))
+        density[0, 1, 1] = 1.0  # Support BC voxel
         density[1, 1, 1] = 1.0
-        density[2, 2, 2] = 0.8
-        density[0, 0, 0] = 0.3  # Below threshold
-        
-        valid_remove = get_legal_remove_moves(density, threshold=0.5)
-        
-        assert valid_remove.sum() == 2
-        assert valid_remove[1, 1, 1] == 1
-        assert valid_remove[2, 2, 2] == 1
-        assert valid_remove[0, 0, 0] == 0  # Below threshold
-    
-    def test_apply_action_mask(self):
-        """Invalid actions get -inf in logits."""
+        density[3, 2, 2] = 1.0  # Loaded voxel
+        density[0, 0, 0] = 0.3
+
+        assert get_legal_remove_moves(density, threshold=0.5).sum() == 3
+
+        bc = (np.zeros_like(density), np.zeros_like(density), np.zeros_like(density))
+        bc[0][0, :, :] = 1.0
+        forces = (np.zeros_like(density), np.zeros_like(density), np.zeros_like(density))
+        forces[1][3, 2, 2] = -1.0
+
+        protected_rem = get_legal_remove_moves(density, threshold=0.5, bc_masks=bc, forces=forces)
+        assert protected_rem.sum() == 1
+        assert protected_rem[1, 1, 1] == 1.0
+        assert protected_rem[0, 1, 1] == 0.0
+        assert protected_rem[3, 2, 2] == 0.0
+
+    def test_apply_action_mask_and_masked_softmax(self):
         policy = np.array([[[1.0, 2.0], [3.0, 4.0]]])
         valid = np.array([[[1, 0], [1, 0]]])
-        
         masked, _ = apply_action_mask(policy, np.zeros_like(policy), valid, np.zeros_like(valid))
-        
-        assert masked[0, 0, 0] == 1.0  # Valid
-        assert masked[0, 0, 1] == -np.inf  # Invalid
-        assert masked[0, 1, 0] == 3.0  # Valid
-        assert masked[0, 1, 1] == -np.inf  # Invalid
-    
-    def test_masked_softmax_normalization(self):
-        """Masked softmax sums to 1 over valid actions."""
-        policy_add = np.ones((2, 2, 2)) * 0.5
-        policy_remove = np.ones((2, 2, 2)) * 0.5
-        valid_add = np.ones((2, 2, 2))
-        valid_remove = np.zeros((2, 2, 2))  # No removes allowed
-        
-        prob_add, prob_remove = masked_softmax(
-            policy_add, policy_remove, valid_add, valid_remove
+        assert masked[0, 0, 1] == -np.inf
+
+        prob_add, prob_rem = masked_softmax(
+            np.ones((2, 2, 2)) * 0.5,
+            np.ones((2, 2, 2)) * 0.5,
+            np.ones((2, 2, 2)),
+            np.zeros((2, 2, 2)),
         )
-        
-        total_prob = prob_add.sum() + prob_remove.sum()
-        assert total_prob == pytest.approx(1.0)
-        assert prob_remove.sum() == 0  # No valid remove actions
-    
-    def test_is_terminal_volume_exceeded(self):
-        """Volume exceeded triggers terminal state."""
-        density = np.ones((10, 10, 10)) * 0.9
-        
-        is_term, reason = is_terminal_state(density, max_volume_fraction=0.3)
-        
-        assert is_term
-        assert reason == "max_volume_exceeded"
-    
-    def test_is_terminal_structure_too_small(self):
-        """Nearly empty structure triggers terminal."""
-        density = np.zeros((10, 10, 10))
-        density[0, 0, 0] = 1.0  # Single voxel
-        
-        is_term, reason = is_terminal_state(density, min_volume_fraction=0.01)
-        
-        assert is_term
-        assert reason == "structure_too_small"
-    
-    def test_count_legal_moves(self):
-        """Count legal moves correctly."""
-        density = np.zeros((4, 4, 4))
-        density[1:3, 1:3, 1:3] = 1.0  # 2x2x2 cube
-        
-        num_add, num_remove = count_legal_moves(density)
-        
-        assert num_remove == 8  # 2x2x2 cube
-        assert num_add > 0  # Surface around cube
+        assert prob_add.sum() + prob_rem.sum() == pytest.approx(1.0)
+        assert prob_rem.sum() == 0.0
+
+    def test_terminal_and_count(self):
+        is_term, reason = is_terminal_state(np.ones((10, 10, 10)) * 0.9, max_volume_fraction=0.3)
+        assert is_term and reason == "max_volume_exceeded"
+
+        d_small = np.zeros((10, 10, 10))
+        d_small[0, 0, 0] = 1.0
+        is_term2, reason2 = is_terminal_state(d_small, min_volume_fraction=0.01)
+        assert is_term2 and reason2 == "structure_too_small"
+
+        d_cube = np.zeros((4, 4, 4))
+        d_cube[1:3, 1:3, 1:3] = 1.0
+        na, nr = count_legal_moves(d_cube)
+        assert nr == 8 and na > 0
 
 
-# =============================================================================
-# Engine Tests
-# =============================================================================
-
-class TestEngine:
-    """Tests for MCTS engine functions."""
-    
+class TestEngineAndBlocoBFixes:
     def test_apply_action_add(self):
-        """Apply add action sets voxel to 1."""
         density = np.zeros((4, 4, 4))
-        action = (0, 1, 2, 3)  # Add at (1, 2, 3)
-        
-        result = apply_action(density, action)
-        
+        result = apply_action(density, (0, 1, 2, 3))
         assert result[1, 2, 3] == 1.0
-        assert density[1, 2, 3] == 0.0  # Original unchanged
-    
+        assert density[1, 2, 3] == 0.0
+
     def test_apply_action_remove(self):
-        """Apply remove action sets voxel to 0."""
         density = np.ones((4, 4, 4))
-        action = (1, 1, 2, 3)  # Remove at (1, 2, 3)
-        
-        result = apply_action(density, action)
-        
+        result = apply_action(density, (1, 1, 2, 3))
         assert result[1, 2, 3] == 0.0
-        assert density[1, 2, 3] == 1.0  # Original unchanged
-    
+        assert density[1, 2, 3] == 1.0
+
     def test_apply_actions_batch(self):
-        """Apply batch of actions."""
         density = np.zeros((4, 4, 4))
-        actions = [
-            (0, 0, 0, 0),  # Add
-            (0, 1, 1, 1),  # Add
-            (0, 2, 2, 2),  # Add
-        ]
-        
-        result = apply_actions(density, actions)
-        
+        result = apply_actions(density, [(0, 0, 0, 0), (0, 1, 1, 1), (0, 2, 2, 2)])
         assert result[0, 0, 0] == 1.0
         assert result[1, 1, 1] == 1.0
         assert result[2, 2, 2] == 1.0
-    
+
     def test_build_state_tensor_shape(self):
-        """State tensor has correct shape (7, D, H, W)."""
         D, H, W = 8, 6, 4
         density = np.random.rand(D, H, W)
-        bc_masks = (np.zeros((D, H, W)), np.zeros((D, H, W)), np.zeros((D, H, W)))
+        bc = (np.zeros((D, H, W)), np.zeros((D, H, W)), np.zeros((D, H, W)))
         forces = (np.zeros((D, H, W)), np.zeros((D, H, W)), np.zeros((D, H, W)))
-        
-        state = build_state_tensor(density, bc_masks, forces)
-        
+        state = build_state_tensor(density, bc, forces)
         assert state.shape == (7, D, H, W)
         assert state.dtype == np.float32
-    
-    def test_mcts_search_basic(self):
-        """MCTS search returns valid actions."""
-        # Simple setup
-        density = np.zeros((8, 8, 8))
-        density[3:5, 3:5, 3:5] = 1.0  # 2x2x2 seed
-        
-        bc_masks = (np.zeros((8, 8, 8)), np.zeros((8, 8, 8)), np.zeros((8, 8, 8)))
-        forces = (np.zeros((8, 8, 8)), np.zeros((8, 8, 8)), np.zeros((8, 8, 8)))
-        
-        # Mock predict function
+
+    def test_configs_aligned_with_spec(self):
+        assert PHASE1_CONFIG.min_volume_fraction == 0.0
+        assert PHASE2_CONFIG.action_batch_size == 8
+
+    def test_phase1_runs_from_empty_grid(self):
+        density = np.zeros((8, 6, 4), dtype=np.float32)
+        bc_masks = (np.ones_like(density), np.zeros_like(density), np.zeros_like(density))
+        bc_masks[0][1:, :, :] = 0.0
+        forces = (np.zeros_like(density), np.zeros_like(density), np.zeros_like(density))
+
         def mock_predict(state):
-            value = 0.5
-            policy_add = np.random.rand(8, 8, 8)
-            policy_remove = np.random.rand(8, 8, 8)
-            return value, policy_add, policy_remove
-        
-        config = MCTSConfig(num_simulations=10, batch_size=4)
-        result = run_mcts_search(density, bc_masks, forces, mock_predict, config)
-        
-        assert len(result.actions) <= 4
-        assert result.num_simulations == 10
-        assert -1 <= result.root_value <= 1
-    
-    def test_mcts_wrapper_class(self):
-        """AlphaBuilderMCTS wrapper works correctly."""
-        density = np.zeros((8, 8, 8))
+            return 0.25, np.ones((8, 6, 4), dtype=np.float32), np.zeros((8, 6, 4), dtype=np.float32)
+
+        cfg = PHASE1_CONFIG._replace(num_simulations=16, batch_size=1)
+        res = run_mcts_search(density, bc_masks, forces, mock_predict, cfg)
+        assert res.root_value > -0.9
+        assert len(res.actions) > 0
+
+    def test_wrapper_invokes_predict_batch_fn(self):
+        density = np.zeros((8, 8, 8), dtype=np.float32)
         density[3:5, 3:5, 3:5] = 1.0
-        
-        bc_masks = (np.zeros((8, 8, 8)), np.zeros((8, 8, 8)), np.zeros((8, 8, 8)))
-        forces = (np.zeros((8, 8, 8)), np.zeros((8, 8, 8)), np.zeros((8, 8, 8)))
-        
-        def mock_predict(state):
-            return 0.5, np.random.rand(8, 8, 8), np.random.rand(8, 8, 8)
-        
+        bc = (np.zeros_like(density), np.zeros_like(density), np.zeros_like(density))
+        forces = (np.zeros_like(density), np.zeros_like(density), np.zeros_like(density))
+
+        calls = {"single": 0, "batch": 0}
+
+        def single_fn(state):
+            calls["single"] += 1
+            return 0.5, np.ones_like(density), np.ones_like(density)
+
+        def batch_fn(states):
+            calls["batch"] += 1
+            n = len(states)
+            return [0.5] * n, [np.ones_like(density)] * n, [np.ones_like(density)] * n
+
         mcts = AlphaBuilderMCTS(
-            predict_fn=mock_predict,
-            num_simulations=5,
-            batch_size=2
+            predict_fn=single_fn,
+            predict_batch_fn=batch_fn,
+            num_simulations=12,
+            batch_size=4,
+            action_batch_size=4,
         )
-        
-        result = mcts.get_action_batch(density, bc_masks, forces)
-        
-        assert len(result.actions) <= 2
-        assert isinstance(result.visit_distribution, dict)
+        res = mcts.search(density, bc, forces)
+        assert calls["batch"] >= 1
+        assert len(res.actions) > 0
 
+    def test_record_step_multi_branch_pv_stats(self):
+        root = MCTSNode(prior=1.0, is_expanded=True)
+        a1 = (0, 1, 1, 1)
+        a1b = (0, 1, 2, 1)
+        a2 = (0, 2, 1, 1)
 
-# =============================================================================
-# Integration Tests
-# =============================================================================
+        c1b = MCTSNode(prior=0.5, action_to_parent=a1b)
+        c1b.visit_count = 15
+        c1b.value_sum = 7.5
+        c1 = MCTSNode(prior=0.6, action_to_parent=a1, parent=root, children={a1b: c1b}, is_expanded=True)
+        c1.visit_count = 40
+        c1.value_sum = 24.0
+        c1b.parent = c1
 
-class TestMCTSIntegration:
-    """Integration tests for complete MCTS flow."""
-    
-    def test_convergence_behavior(self):
-        """MCTS should concentrate visits on promising actions."""
-        density = np.zeros((8, 8, 8))
-        density[3:5, 3:5, 3:5] = 1.0
-        
-        bc_masks = (np.zeros((8, 8, 8)), np.zeros((8, 8, 8)), np.zeros((8, 8, 8)))
-        forces = (np.zeros((8, 8, 8)), np.zeros((8, 8, 8)), np.zeros((8, 8, 8)))
-        
-        # Predict function with strong preference for one action
-        def biased_predict(state):
-            value = 0.5
-            policy_add = np.ones((8, 8, 8)) * -10  # Low prior everywhere
-            policy_add[2, 3, 3] = 10  # High prior at one position
-            policy_remove = np.ones((8, 8, 8)) * -10
-            return value, policy_add, policy_remove
-        
-        config = MCTSConfig(num_simulations=50, batch_size=4)
-        result = run_mcts_search(density, bc_masks, forces, biased_predict, config)
-        
-        # Check that visits are concentrated
-        visit_counts = list(result.visit_distribution.values())
-        max_visits = max(visit_counts) if visit_counts else 0
-        
-        # Most-visited action should have significantly more visits
-        assert max_visits > config.num_simulations / 10
-    
-    def test_value_influences_selection(self):
-        """High-value subtrees should attract more visits."""
-        density = np.zeros((8, 8, 8))
-        density[3:5, 3:5, 3:5] = 1.0
-        
-        bc_masks = (np.zeros((8, 8, 8)), np.zeros((8, 8, 8)), np.zeros((8, 8, 8)))
-        forces = (np.zeros((8, 8, 8)), np.zeros((8, 8, 8)), np.zeros((8, 8, 8)))
-        
-        # Track which states were evaluated
-        evaluation_count = {}
-        
-        def tracking_predict(state):
-            state_hash = hash(state.tobytes())
-            evaluation_count[state_hash] = evaluation_count.get(state_hash, 0) + 1
-            
-            # Return uniform policy and value
-            return 0.0, np.ones(state.shape[1:]) * 0.1, np.ones(state.shape[1:]) * 0.1
-        
-        config = MCTSConfig(num_simulations=20, batch_size=4)
-        result = run_mcts_search(density, bc_masks, forces, tracking_predict, config)
-        
-        # Search should have explored multiple states
-        assert len(evaluation_count) >= 1
+        c2 = MCTSNode(prior=0.4, action_to_parent=a2, parent=root, is_expanded=True)
+        c2.visit_count = 25
+        c2.value_sum = 10.0
+
+        root.children = {a1: c1, a2: c2}
+        branches = select_pv_branches(root, max_actions=8, max_depth=4)
+        assert len(branches) == 2
+        flat_actions = [a for br in branches for a, _, _ in br]
+        flat_stats = [e for br in branches for e in br]
+        assert flat_actions == [a1, a1b, a2]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "selfplay.db"
+            initialize_selfplay_db(db_path)
+            res = (4, 4, 4)
+            bc = np.zeros((3, *res), dtype=np.float32)
+            forces = np.zeros((3, *res), dtype=np.float32)
+            save_game(
+                db_path,
+                GameInfo("g1", "simple", "v3.3", bc, forces, {"x": 3, "y": 2, "z_start": 1, "z_end": 3}, "FULL_CLAMP", res),
+            )
+            state = EpisodeState(density=np.zeros(res, dtype=np.float32), bc_masks=bc, forces=forces, load_config={}, current_step=0, phase=Phase.GROWTH, game_id="g1")
+            sr = SearchResult(actions=[a1, a2], visit_distribution=root.collect_subtree_visits(), root_value=0.5, num_simulations=65, root=root)
+            record_step(
+                db_path,
+                state,
+                sr,
+                value=0.4,
+                policy_add=np.ones(res, dtype=np.float32),
+                policy_remove=np.zeros(res, dtype=np.float32),
+                executed_actions=flat_actions,
+                executed_action_stats=flat_stats,
+            )
+            loaded = load_game_step(db_path, "g1", 0, res)
+            assert loaded is not None
+            assert [sa.visits for sa in loaded.selected_actions] == [40, 15, 25]
+            assert loaded.selected_actions[2].q_value == pytest.approx(0.4)

@@ -1,232 +1,179 @@
 """
-Unit tests for training module.
+Unit tests for v3.3 loss functions and training step.
 """
 import pytest
 import torch
 import torch.nn as nn
-import numpy as np
+import torch.nn.functional as F
 
+from alphabuilder.src.neural.model import AlphaBuilderV31
 from alphabuilder.src.neural.trainer import (
-    weighted_value_loss,
+    HUBER_BETA,
+    LAMBDA_BLUEPRINT_WARMUP,
+    LAMBDA_POLICY,
+    LAMBDA_VALUE,
+    W_NEG,
+    blueprint_loss,
+    compute_backbone_grad_ratio,
+    compute_total_loss,
     policy_loss,
     train_one_epoch,
-    W_NEG,
-    LAMBDA_POLICY,
-    POS_WEIGHT_ADD,
-    POS_WEIGHT_REM
+    weighted_value_loss,
 )
 
 
 class TestWeightedValueLoss:
-    """Tests for weighted value loss function."""
-    
-    def test_positive_targets_weight_1(self):
-        """Positive targets should have weight 1."""
+    def test_huber_zero_at_exact(self):
         pred = torch.tensor([[0.5]])
-        target = torch.tensor([[0.5]])  # Positive
-        
-        loss = weighted_value_loss(pred, target)
-        
-        # Should be simple MSE
-        expected = (0.5 - 0.5) ** 2
-        assert loss.item() == pytest.approx(expected)
-    
-    def test_negative_targets_weighted(self):
-        """Negative targets should have higher weight."""
+        target = torch.tensor([[0.5]])
+        assert weighted_value_loss(pred, target).item() == pytest.approx(0.0)
+
+    def test_negative_targets_weighted_and_huber_scaled(self):
         pred = torch.tensor([[0.0]])
-        target = torch.tensor([[-0.5]])  # Negative
-        
-        loss = weighted_value_loss(pred, target)
-        
-        # Should be weighted MSE
-        mse = (0.0 - (-0.5)) ** 2
-        expected = W_NEG * mse
-        assert loss.item() == pytest.approx(expected)
-    
-    def test_batch_average(self):
-        """Loss should be averaged over batch."""
-        pred = torch.tensor([[0.0], [0.0]])
-        target = torch.tensor([[0.5], [0.5]])  # Both positive
-        
-        loss = weighted_value_loss(pred, target)
-        
-        # Both have same error, average should be same as individual
-        individual_mse = (0.0 - 0.5) ** 2
-        assert loss.item() == pytest.approx(individual_mse)
-    
-    def test_gradient_flow(self):
-        """Gradients should flow through loss."""
-        pred = torch.tensor([[0.5]], requires_grad=True)
         target = torch.tensor([[-0.5]])
-        
-        loss = weighted_value_loss(pred, target)
-        loss.backward()
-        
-        assert pred.grad is not None
-        assert pred.grad.abs().sum() > 0
+        expected = W_NEG * F.smooth_l1_loss(pred, target, reduction="none", beta=HUBER_BETA).item()
+        assert weighted_value_loss(pred, target).item() == pytest.approx(expected)
+
+    def test_loss_constants(self):
+        assert 1.0 < W_NEG <= 2.0
+        assert HUBER_BETA == pytest.approx(0.2)
+        assert LAMBDA_POLICY == pytest.approx(1.0)
+        assert LAMBDA_VALUE == pytest.approx(2.0)
+        assert LAMBDA_BLUEPRINT_WARMUP == pytest.approx(0.50)
 
 
-class TestPolicyLoss:
-    """Tests for policy loss function with pos_weight."""
-    
-    def test_output_is_scalar(self):
-        """Loss should return a scalar."""
-        pred = torch.randn(2, 2, 8, 8, 4)
-        target = torch.zeros(2, 2, 8, 8, 4)
-        
-        loss = policy_loss(pred, target)
-        
-        assert loss.dim() == 0  # Scalar
-    
-    def test_pos_weight_constants_exist(self):
-        """pos_weight constants should be defined."""
-        assert POS_WEIGHT_ADD > 0
-        assert POS_WEIGHT_REM > 0
-    
-    def test_pos_weight_compensates_imbalance(self):
-        """pos_weight should increase loss for false negatives."""
-        # Scenario: mostly negative targets with one positive
-        pred = torch.zeros(1, 2, 4, 4, 2)  # All predict 0 (after sigmoid)
-        target = torch.zeros(1, 2, 4, 4, 2)
-        target[0, 0, 2, 2, 1] = 1.0  # One positive in ADD channel
-        
-        loss_with_positive = policy_loss(pred, target)
-        
-        # Compare with all-negative target
-        target_all_neg = torch.zeros(1, 2, 4, 4, 2)
-        loss_all_negative = policy_loss(pred, target_all_neg)
-        
-        # Loss should be higher when we miss a positive
-        assert loss_with_positive > loss_all_negative
-    
-    def test_growth_phase_masks_remove(self):
-        """GROWTH phase should reduce weight on Remove channel."""
-        pred = torch.randn(2, 2, 8, 8, 4)
-        target = torch.ones(2, 2, 8, 8, 4)  # All ones
-        
-        loss_growth = policy_loss(pred, target, phase='GROWTH')
-        loss_normal = policy_loss(pred, target, phase=None)
-        
-        # GROWTH should have lower loss (Remove channel masked)
-        assert loss_growth < loss_normal
-    
-    def test_gradient_flow(self):
-        """Gradients should flow through loss."""
-        pred = torch.randn(2, 2, 8, 8, 4, requires_grad=True)
-        target = torch.zeros(2, 2, 8, 8, 4)
-        
-        loss = policy_loss(pred, target)
+class TestMaskedPolicyLoss:
+    def test_zero_kl_at_optimal_logits(self):
+        legal = torch.zeros(1, 2, 4, 4, 2)
+        legal[0, 0, 1, 1, 0] = 1.0
+        legal[0, 0, 2, 2, 0] = 1.0
+        target = torch.zeros_like(legal)
+        target[0, 0, 1, 1, 0] = 0.75
+        target[0, 0, 2, 2, 0] = 0.25
+
+        pred = torch.full_like(legal, 100.0)  # Huge invalid logits must be ignored!
+        pred[0, 0, 1, 1, 0] = float(torch.log(torch.tensor(0.75)))
+        pred[0, 0, 2, 2, 0] = float(torch.log(torch.tensor(0.25)))
+
+        loss = policy_loss(pred, target, legal_mask=legal)
+        assert loss.item() == pytest.approx(0.0, abs=1e-6)
+
+    def test_ignores_stationary_policy_mask_zero(self):
+        pred = torch.randn(2, 2, 4, 4, 2, requires_grad=True)
+        legal = torch.ones_like(pred)
+        target = torch.zeros_like(pred)
+        target[0, 0, 1, 1, 0] = 1.0
+        pmask = torch.tensor([0.0, 0.0])
+
+        loss = policy_loss(pred, target, legal_mask=legal, policy_mask=pmask)
+        assert loss.item() == pytest.approx(0.0)
         loss.backward()
-        
-        assert pred.grad is not None
-        assert pred.grad.abs().sum() > 0
+        assert torch.all(pred.grad == 0)
+
+    def test_float16_safe_no_nan(self):
+        pred = torch.randn(2, 2, 8, 8, 4, dtype=torch.float16, requires_grad=True)
+        legal = torch.zeros(2, 2, 8, 8, 4)
+        legal[:, 0, 2:4, 2:4, 1] = 1.0
+        target = torch.zeros(2, 2, 8, 8, 4)
+        target[:, 0, 2, 2, 1] = 1.0
+
+        loss = policy_loss(pred, target, legal_mask=legal)
+        assert torch.isfinite(loss)
+        loss.backward()
+        assert torch.isfinite(pred.grad).all()
+
+
+class TestBlueprintAndTotalLoss:
+    def test_blueprint_loss_masking(self):
+        pred = torch.zeros(2, 1, 4, 4, 2)
+        target = torch.zeros_like(pred)
+        target[:, :, 1:3, 1:3, :] = 1.0
+
+        loss_masked_all_zero = blueprint_loss(pred, target, blueprint_mask=torch.tensor([0.0, 0.0]))
+        assert loss_masked_all_zero.item() == pytest.approx(0.0)
+
+        loss_active = blueprint_loss(pred, target, blueprint_mask=torch.tensor([1.0, 1.0]))
+        assert loss_active.item() > 0.0
+
+    def test_compute_total_loss_and_grad_ratio(self):
+        model = AlphaBuilderV31(in_channels=7, feature_size=16, use_swin=False)
+        x = torch.randn(2, 7, 16, 8, 4)
+        legal = torch.ones(2, 2, 16, 8, 4)
+        t_pol = torch.zeros(2, 2, 16, 8, 4)
+        t_pol[:, 0, 4, 4, 2] = 1.0
+        t_val = torch.tensor([[0.5], [-0.4]])
+        t_bp = torch.zeros(2, 1, 16, 8, 4)
+        t_bp[:, :, 2:12, 3:5, 1:3] = 1.0
+
+        p_pred, v_pred, bp_pred = model(x, return_blueprint=True)
+        p_l = policy_loss(p_pred, t_pol, legal_mask=legal)
+        bp_l = blueprint_loss(bp_pred, t_bp)
+        ratio = compute_backbone_grad_ratio(model, p_l, bp_l, lambda_bp=0.50)
+        assert ratio is not None and ratio > 0.0
+
+        tot, metrics = compute_total_loss(
+            p_pred,
+            v_pred,
+            t_pol,
+            t_val,
+            legal_mask=legal,
+            pred_blueprint=bp_pred,
+            target_blueprint=t_bp,
+        )
+        assert tot.item() == pytest.approx(
+            LAMBDA_POLICY * metrics["policy_loss"]
+            + LAMBDA_VALUE * metrics["value_loss"]
+            + LAMBDA_BLUEPRINT_WARMUP * metrics["blueprint_loss"],
+            rel=1e-4,
+        )
 
 
 class TestTrainOneEpoch:
-    """Tests for training loop."""
-    
     @pytest.fixture
-    def simple_model(self):
-        """Create a minimal model for testing."""
+    def simple_dataloader(self):
+        class SimpleDataset(torch.utils.data.Dataset):
+            def __len__(self):
+                return 4
+
+            def __getitem__(self, idx):
+                pol = torch.zeros(2, 16, 8, 4)
+                pol[0, 3, 3, 1] = 1.0
+                bp = torch.zeros(1, 16, 8, 4)
+                bp[0, :8, 2:6, 1:3] = 1.0
+                return {
+                    "state": torch.randn(7, 16, 8, 4),
+                    "policy": pol,
+                    "legal_mask": torch.ones(2, 16, 8, 4),
+                    "policy_mask": torch.tensor(1.0),
+                    "value": torch.tensor([0.5]),
+                    "blueprint": bp,
+                    "blueprint_mask": torch.tensor(1.0),
+                }
+
+        return torch.utils.data.DataLoader(SimpleDataset(), batch_size=2)
+
+    def test_2head_and_3head_models_update(self, simple_dataloader):
+        # 2-head backward compatibility
         class SimpleModel(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.conv = nn.Conv3d(7, 16, 3, padding=1)
                 self.policy_head = nn.Conv3d(16, 2, 1)
-                self.value_head = nn.Sequential(
-                    nn.AdaptiveAvgPool3d(1),
-                    nn.Flatten(),
-                    nn.Linear(16, 1),
-                    nn.Tanh()
-                )
-            
+                self.value_head = nn.Sequential(nn.AdaptiveAvgPool3d(1), nn.Flatten(), nn.Linear(16, 1), nn.Tanh())
+
             def forward(self, x):
-                features = self.conv(x)
-                policy = self.policy_head(features)
-                value = self.value_head(features)
-                return policy, value
-        
-        return SimpleModel()
-    
-    @pytest.fixture
-    def simple_dataloader(self):
-        """Create a minimal dataloader for testing."""
-        class SimpleDataset(torch.utils.data.Dataset):
-            def __len__(self):
-                return 4
-            
-            def __getitem__(self, idx):
-                return {
-                    'state': torch.randn(7, 16, 8, 4),
-                    'policy': torch.zeros(2, 16, 8, 4),
-                    'value': torch.tensor([0.5])
-                }
-        
-        return torch.utils.data.DataLoader(SimpleDataset(), batch_size=2)
-    
-    def test_returns_metrics_dict(self, simple_model, simple_dataloader):
-        """Should return dictionary with loss metrics."""
-        optimizer = torch.optim.Adam(simple_model.parameters())
-        
-        metrics = train_one_epoch(simple_model, simple_dataloader, optimizer, torch.device('cpu'))
-        
-        assert 'loss' in metrics
-        assert 'policy_loss' in metrics
-        assert 'value_loss' in metrics
-    
-    def test_model_updates(self, simple_model, simple_dataloader):
-        """Model parameters should change after training."""
-        optimizer = torch.optim.Adam(simple_model.parameters())
-        
-        # Get initial params
-        initial_params = [p.clone() for p in simple_model.parameters()]
-        
-        # Train
-        train_one_epoch(simple_model, simple_dataloader, optimizer, torch.device('cpu'))
-        
-        # Check params changed
-        params_changed = False
-        for initial, current in zip(initial_params, simple_model.parameters()):
-            if not torch.equal(initial, current):
-                params_changed = True
-                break
-        
-        assert params_changed, "Model parameters should update during training"
-    
-    def test_loss_decreases_trend(self, simple_model, simple_dataloader):
-        """Loss should generally decrease over epochs."""
-        optimizer = torch.optim.Adam(simple_model.parameters(), lr=0.01)
-        
-        losses = []
-        for _ in range(5):
-            metrics = train_one_epoch(simple_model, simple_dataloader, optimizer, torch.device('cpu'))
-            losses.append(metrics['loss'])
-        
-        # At least the trend should be downward (last < first)
-        # Note: not guaranteed for every run, but generally true
-        assert losses[-1] < losses[0] * 2, "Loss should not explode"
+                feat = self.conv(x)
+                return self.policy_head(feat), self.value_head(feat)
 
+        m2 = SimpleModel()
+        opt2 = torch.optim.Adam(m2.parameters(), lr=1e-3)
+        metrics2 = train_one_epoch(m2, simple_dataloader, opt2, torch.device("cpu"))
+        assert "loss" in metrics2 and "policy_loss" in metrics2 and "value_loss" in metrics2
 
-class TestLossWeightConstants:
-    """Tests for loss weight constants."""
-    
-    def test_w_neg_value(self):
-        """W_NEG should be positive and > 1."""
-        assert W_NEG > 1, "W_NEG should weight negatives more"
-    
-    def test_lambda_policy_value(self):
-        """LAMBDA_POLICY should be positive."""
-        assert LAMBDA_POLICY > 0
-    
-    def test_pos_weight_add(self):
-        """POS_WEIGHT_ADD should compensate for ~10% positive class."""
-        # For 10% positive, pos_weight should be around 9-10
-        assert POS_WEIGHT_ADD >= 5
-        assert POS_WEIGHT_ADD <= 15
-    
-    def test_pos_weight_rem(self):
-        """POS_WEIGHT_REM should compensate for ~20% positive class."""
-        # For 20% positive, pos_weight should be around 4-5
-        assert POS_WEIGHT_REM >= 3
-        assert POS_WEIGHT_REM <= 10
-
+        # 3-head AlphaBuilderV31
+        m3 = AlphaBuilderV31(in_channels=7, feature_size=16, use_swin=False)
+        opt3 = torch.optim.Adam(m3.parameters(), lr=1e-3)
+        initial_bp_w = m3.blueprint_head[-1].weight.clone()
+        metrics3 = train_one_epoch(m3, simple_dataloader, opt3, torch.device("cpu"), lambda_bp=0.50)
+        assert metrics3["blueprint_loss"] > 0.0
+        assert not torch.equal(initial_bp_w, m3.blueprint_head[-1].weight)

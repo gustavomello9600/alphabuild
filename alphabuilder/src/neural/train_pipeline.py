@@ -1,203 +1,266 @@
 """
-Training Pipeline for AlphaBuilder v3.1.
+Training Pipeline for AlphaBuilder v3.3.
 
-Robust training script with:
-- Automatic hardware detection
-- Multi-GPU support via DataParallel
-- Efficient data loading with prefetching
-- TensorBoard logging
-- Checkpoint save/restore
-- Early stopping
+Supports:
+- Strict episode-level train/val split (`split_v3_3.json` or deterministic fallback) with augment=False on validation
+- Full D4 x Z2 = 16x symmetry augmentation (8x flips in dataset + 2x rot90 in train collate_fn)
+- Multi-head training: masked KL/CE policy + Huber value + Blueprint BCE+Dice
+- Multi-GPU DDP via `torchrun` (`LOCAL_RANK` / `WORLD_SIZE`) as well as single-GPU/CPU execution
+- PyTorch AMP (`torch.amp.autocast` / `GradScaler`), LR warmup + cosine annealing, grad clipping
+- Console, TensorBoard, and `metrics_history.json` logging
 """
+
 import argparse
-import time
-import sys
-from pathlib import Path
 from datetime import datetime
-from typing import Tuple, Optional, Dict
+import json
+import os
+from pathlib import Path
+import random
+import sqlite3
+import sys
+import time
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
-from torch.cuda.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-# Add project root to path
 project_root = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from alphabuilder.src.neural.model import AlphaBuilderV31
-from alphabuilder.src.neural.dataset import TopologyDatasetV31
-from alphabuilder.src.neural.trainer import policy_loss, weighted_value_loss, LAMBDA_POLICY
-from alphabuilder.src.neural.train_config import TrainConfig, get_config, CONFIGS
+from alphabuilder.src.neural.dataset import (  # noqa: E402
+    TopologyDatasetV31,
+    detect_schema_version,
+    make_symmetry_collate_fn,
+)
+from alphabuilder.src.neural.model import AlphaBuilderV31  # noqa: E402
+from alphabuilder.src.neural.train_config import CONFIGS, TrainConfig, get_config  # noqa: E402
+from alphabuilder.src.neural.trainer import (  # noqa: E402
+    blueprint_loss,
+    compute_backbone_grad_ratio,
+    compute_blueprint_dice,
+    compute_policy_top1_accuracy,
+    compute_total_loss,
+    policy_loss,
+)
 
 
-def detect_environment() -> Tuple[str, torch.device]:
-    """
-    Detect hardware and return appropriate config name and device.
-    
-    Returns:
-        (config_name, device) tuple
-    """
+def _setup_distributed() -> Tuple[bool, int, int, int]:
+    """Detect and initialize torch.distributed when launched via torchrun."""
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    if world_size > 1 and local_rank >= 0:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        if not dist.is_initialized():
+            dist.init_process_group(backend=backend)
+        rank = dist.get_rank()
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        return True, rank, local_rank, world_size
+    return False, 0, 0, 1
+
+
+def detect_environment(local_rank: int = 0, is_distributed: bool = False) -> Tuple[str, torch.device]:
+    """Detect hardware and return appropriate preset name and torch.device."""
     if torch.cuda.is_available():
         gpu_count = torch.cuda.device_count()
-        gpu_name = torch.cuda.get_device_name(0).lower()
-        
-        if 't4' in gpu_name or 'tesla' in gpu_name:
-            if gpu_count >= 2:
-                return 'kaggle_t4_dual_swin', torch.device('cuda')
-            else:
-                return 'kaggle_t4_swin', torch.device('cuda')
-        else:
-            # Generic CUDA device
-            return 'kaggle_t4_swin', torch.device('cuda')
-    
-    # Check for Intel integrated GPU (via PyTorch XPU or fallback to CPU)
+        gpu_name = torch.cuda.get_device_name(local_rank).lower()
+        dev = torch.device("cuda", local_rank) if is_distributed else torch.device("cuda")
+        if "t4" in gpu_name or "tesla" in gpu_name:
+            preset = "kaggle_t4_dual_swin" if gpu_count >= 2 else "kaggle_t4_swin"
+            return preset, dev
+        return ("kaggle_t4_dual_swin" if gpu_count >= 2 else "kaggle_t4_swin"), dev
+
     try:
-        if hasattr(torch, 'xpu') and torch.xpu.is_available():
-            return 'local_iris', torch.device('xpu')
-    except:
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return "local_iris", torch.device("xpu")
+    except Exception:
         pass
-    
-    # CPU fallback
-    return 'local_iris', torch.device('cpu')
+
+    return "local_iris", torch.device("cpu")
+
+
+def _resolve_episode_split(
+    db_path: Path,
+    val_split: float,
+    split_json: Optional[str],
+    seed: int = 42,
+) -> Tuple[List[str], List[str]]:
+    """Load split_v3_3.json or build deterministic episode-level split."""
+    if split_json:
+        data = json.loads(Path(split_json).read_text(encoding="utf-8"))
+        train_ids = [str(e) for e in data["train_episode_ids"]]
+        val_ids = [str(e) for e in data["val_episode_ids"]]
+        if set(train_ids) & set(val_ids):
+            raise RuntimeError(f"Episode overlap found in {split_json}")
+        return train_ids, val_ids
+
+    schema = detect_schema_version(db_path)
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    if schema == "v2":
+        rows = conn.execute("SELECT DISTINCT episode_id FROM episodes ORDER BY episode_id").fetchall()
+    else:
+        rows = conn.execute("SELECT DISTINCT episode_id FROM training_data ORDER BY episode_id").fetchall()
+    conn.close()
+
+    ep_ids = [str(r[0]) for r in rows]
+    rng = random.Random(seed)
+    rng.shuffle(ep_ids)
+
+    if len(ep_ids) >= 2:
+        n_val = max(1, int(round(len(ep_ids) * val_split)))
+        n_val = min(n_val, len(ep_ids) - 1)
+        val_ids = ep_ids[:n_val]
+        train_ids = ep_ids[n_val:]
+    else:
+        train_ids = ep_ids
+        val_ids = []
+
+    return train_ids, val_ids
 
 
 def create_dataloaders(
     config: TrainConfig,
-    db_path: str
-) -> Tuple[DataLoader, DataLoader]:
+    db_path: str,
+    is_distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+    is_main_process: bool = True,
+) -> Tuple[DataLoader, Optional[DataLoader]]:
     """
-    Create training and validation DataLoaders.
-    
-    Args:
-        config: Training configuration
-        db_path: Path to SQLite database
-        
-    Returns:
-        (train_loader, val_loader) tuple
+    Create episode-split training (augment=True) and validation (augment=False) DataLoaders.
     """
-    print(f"\n📂 Loading dataset from: {db_path}")
-    
-    # Load full dataset
-    full_dataset = TopologyDatasetV31(
-        db_path=Path(db_path),
+    db_file = Path(db_path)
+    if is_main_process:
+        print(f"\nLoading dataset from: {db_file}")
+
+    train_ids, val_ids = _resolve_episode_split(
+        db_file, val_split=config.val_split, split_json=config.split_json
+    )
+
+    train_dataset = TopologyDatasetV31(
+        db_path=db_file,
         augment=True,
-        preload_to_ram=True
+        preload_to_ram=True,
+        episode_ids=train_ids,
     )
-    
-    print(f"   Total samples: {len(full_dataset):,}")
-    print(f"   Memory usage: {full_dataset.get_memory_usage_mb():.1f} MB")
-    
-    # Split into train/val
-    val_size = int(len(full_dataset) * config.val_split)
-    train_size = len(full_dataset) - val_size
-    
-    train_dataset, val_dataset = random_split(
-        full_dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)
+    val_dataset = (
+        TopologyDatasetV31(
+            db_path=db_file,
+            augment=False,
+            preload_to_ram=True,
+            episode_ids=val_ids,
+        )
+        if len(val_ids) > 0
+        else None
     )
-    
-    # Disable augmentation for validation
-    # Note: This requires a wrapper since random_split returns Subset
-    
-    print(f"   Train samples: {len(train_dataset):,}")
-    print(f"   Val samples: {len(val_dataset):,}")
-    
-    # Create DataLoaders
+
+    if is_main_process:
+        print(f"   Episodes -> train: {len(train_ids)}, val: {len(val_ids)}")
+        print(f"   Train samples: {len(train_dataset):,} ({train_dataset.get_memory_usage_mb():.1f} MB RAM)")
+        if val_dataset is not None:
+            print(f"   Val samples:   {len(val_dataset):,} ({val_dataset.get_memory_usage_mb():.1f} MB RAM)")
+
+    train_sampler = (
+        DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False)
+        if is_distributed
+        else None
+    )
+    val_sampler = (
+        DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        if (is_distributed and val_dataset is not None)
+        else None
+    )
+
+    use_workers = config.num_workers > 0
+    pin_mem = config.pin_memory and torch.cuda.is_available()
+    drop_last = len(train_dataset) >= config.batch_size * max(1, world_size)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        collate_fn=make_symmetry_collate_fn(enable_rot90=config.enable_rot90_collate),
         num_workers=config.num_workers,
-        prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None,
-        pin_memory=config.pin_memory,
-        persistent_workers=config.persistent_workers if config.num_workers > 0 else False,
-        drop_last=True,  # Avoid small batches
+        prefetch_factor=config.prefetch_factor if use_workers else None,
+        pin_memory=pin_mem,
+        persistent_workers=config.persistent_workers if use_workers else False,
+        drop_last=drop_last,
     )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None,
-        pin_memory=config.pin_memory,
-        persistent_workers=config.persistent_workers if config.num_workers > 0 else False,
-    )
-    
-    batches_per_epoch = len(train_loader)
-    print(f"   Batches per epoch: {batches_per_epoch}")
-    
+
+    val_loader = None
+    if val_dataset is not None and len(val_dataset) > 0:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=config.num_workers,
+            prefetch_factor=config.prefetch_factor if use_workers else None,
+            pin_memory=pin_mem,
+            persistent_workers=config.persistent_workers if use_workers else False,
+        )
+
+    if is_main_process:
+        print(f"   Train batches/epoch (per rank): {len(train_loader)}")
+
     return train_loader, val_loader
 
 
-def create_model(config: TrainConfig, device: torch.device) -> nn.Module:
-    """
-    Create and configure model.
-    
-    Args:
-        config: Training configuration
-        device: Target device
-        
-    Returns:
-        Configured model on device
-    """
-    print(f"\n🧠 Creating model...")
-    print(f"   Architecture: {'Swin-UNETR' if config.use_swin else 'SimpleBackbone'}")
-    print(f"   Feature size: {config.feature_size}")
-    
+def create_model(
+    config: TrainConfig,
+    device: torch.device,
+    is_distributed: bool = False,
+    local_rank: int = 0,
+    is_main_process: bool = True,
+) -> nn.Module:
+    """Create AlphaBuilderV31 and wrap in DDP or DataParallel when appropriate."""
     model = AlphaBuilderV31(
         in_channels=config.in_channels,
         out_channels=config.out_channels,
         feature_size=config.feature_size,
-        use_swin=config.use_swin
-    )
-    
-    # Count parameters
+        use_swin=config.use_swin,
+    ).to(device)
+
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"   Total parameters: {total_params:,}")
-    print(f"   Trainable parameters: {trainable_params:,}")
-    
-    # Multi-GPU support
-    if torch.cuda.device_count() > 1:
-        print(f"   Using DataParallel on {torch.cuda.device_count()} GPUs")
+    if is_main_process:
+        arch = "Swin-UNETR" if config.use_swin else "SimpleBackbone"
+        print(f"\nModel: {arch} (feature_size={config.feature_size})")
+        print(f"   Parameters: {total_params:,} (trainable: {trainable_params:,})")
+
+    if is_distributed:
+        device_ids = [local_rank] if device.type == "cuda" else None
+        output_device = local_rank if device.type == "cuda" else None
+        model = DDP(
+            model,
+            device_ids=device_ids,
+            output_device=output_device,
+            find_unused_parameters=(config.lambda_bp <= 0.0),
+        )
+        if is_main_process:
+            print(f"   Wrapped in DistributedDataParallel (world_size={dist.get_world_size()})")
+    elif device.type == "cuda" and torch.cuda.device_count() > 1:
+        if is_main_process:
+            print(f"   Wrapped in DataParallel ({torch.cuda.device_count()} GPUs)")
         model = nn.DataParallel(model)
-    
-    model = model.to(device)
-    
+
     return model
 
 
-def optimize_for_xpu(model: nn.Module, optimizer: torch.optim.Optimizer, device: torch.device):
-    """
-    Apply Intel IPEX optimizations for XPU devices.
-    
-    Args:
-        model: Neural network model
-        optimizer: Optimizer
-        device: Target device
-        
-    Returns:
-        (optimized_model, optimized_optimizer) tuple
-    """
-    if device.type != 'xpu':
-        return model, optimizer
-    
-    try:
-        import intel_extension_for_pytorch as ipex
-        print(f"   Applying IPEX optimizations for XPU...")
-        model, optimizer = ipex.optimize(model, optimizer=optimizer)
-        print(f"   ✓ IPEX optimization applied")
-    except ImportError:
-        print(f"   ⚠ IPEX not available, running without optimizations")
-    except Exception as e:
-        print(f"   ⚠ IPEX optimization failed: {e}")
-    
-    return model, optimizer
+def _reduce_sums(sums: List[float], device: torch.device, is_distributed: bool) -> List[float]:
+    if not is_distributed:
+        return sums
+    tensor = torch.tensor(sums, dtype=torch.float64, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return tensor.tolist()
 
 
 def train_epoch(
@@ -205,137 +268,207 @@ def train_epoch(
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    scaler: Optional[GradScaler],
-    use_amp: bool,
-    log_every: int = 100
+    scaler: Optional[torch.amp.GradScaler],
+    config: TrainConfig,
+    is_distributed: bool = False,
+    is_main_process: bool = True,
 ) -> Dict[str, float]:
-    """
-    Train for one epoch.
-    
-    Args:
-        model: Neural network model
-        dataloader: Training data loader
-        optimizer: Optimizer
-        device: Target device
-        scaler: GradScaler for mixed precision
-        use_amp: Whether to use automatic mixed precision
-        log_every: Log progress every N steps
-        
-    Returns:
-        Dictionary with loss metrics
-    """
+    """Train one epoch with AMP, grad clipping, and optional backbone grad-norm check."""
     model.train()
-    
-    total_loss = 0.0
-    total_policy_loss = 0.0
-    total_value_loss = 0.0
-    num_batches = 0
-    
-    pbar = tqdm(dataloader, desc="Training", leave=False)
-    
+    use_amp = bool(config.use_amp and device.type == "cuda")
+
+    sum_loss = 0.0
+    sum_pol = 0.0
+    sum_val = 0.0
+    sum_bp = 0.0
+    n_samples = 0
+    grad_ratio: Optional[float] = None
+
+    pbar = tqdm(dataloader, desc="Train", leave=False, disable=not is_main_process)
     for batch_idx, batch in enumerate(pbar):
-        # Move to device
-        state = batch['state'].to(device, non_blocking=True)
-        target_policy = batch['policy'].to(device, non_blocking=True)
-        target_value = batch['value'].to(device, non_blocking=True)
-        
+        state = batch["state"].to(device, non_blocking=True)
+        target_policy = batch["policy"].to(device, non_blocking=True)
+        target_value = batch["value"].to(device, non_blocking=True)
+        legal_mask = batch["legal_mask"].to(device, non_blocking=True) if "legal_mask" in batch else None
+        policy_mask = batch["policy_mask"].to(device, non_blocking=True) if "policy_mask" in batch else None
+        target_bp = batch["blueprint"].to(device, non_blocking=True) if "blueprint" in batch else None
+        bp_mask = batch["blueprint_mask"].to(device, non_blocking=True) if "blueprint_mask" in batch else None
+
+        bs = state.shape[0]
         optimizer.zero_grad(set_to_none=True)
-        
-        # Forward pass with optional AMP
-        if use_amp and scaler is not None:
-            with autocast():
-                pred_policy, pred_value = model(state)
-                v_loss = weighted_value_loss(pred_value, target_value)
-                p_loss = policy_loss(pred_policy, target_policy)
-                loss = v_loss + LAMBDA_POLICY * p_loss
-            
-            # Backward pass with scaling
+
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            outputs = model(state, return_blueprint=(config.lambda_bp > 0.0 and target_bp is not None))
+            if len(outputs) == 3:
+                pred_policy, pred_value, pred_bp = outputs
+            else:
+                pred_policy, pred_value = outputs
+                pred_bp = None
+
+            loss, metrics = compute_total_loss(
+                pred_policy=pred_policy,
+                pred_value=pred_value,
+                target_policy=target_policy,
+                target_value=target_value,
+                legal_mask=legal_mask,
+                policy_mask=policy_mask,
+                pred_blueprint=pred_bp,
+                target_blueprint=target_bp,
+                blueprint_mask=bp_mask,
+                lambda_policy=config.lambda_policy,
+                lambda_value=config.lambda_value,
+                lambda_bp=config.lambda_bp,
+            )
+
+        # Sample gradient norm ratio once at batch 0 on main process (unscaled float32 losses)
+        if batch_idx == 0 and is_main_process and pred_bp is not None and bp_mask is not None and (bp_mask > 0.5).any():
+            try:
+                p_diag = policy_loss(pred_policy, target_policy, legal_mask=legal_mask, policy_mask=policy_mask)
+                bp_diag = blueprint_loss(pred_bp, target_bp, blueprint_mask=bp_mask)
+                grad_ratio = compute_backbone_grad_ratio(model, p_diag, bp_diag, lambda_bp=config.lambda_bp)
+            except Exception:
+                grad_ratio = None
+
+        if scaler is not None and use_amp:
             scaler.scale(loss).backward()
+            if config.grad_clip_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
-            pred_policy, pred_value = model(state)
-            v_loss = weighted_value_loss(pred_value, target_value)
-            p_loss = policy_loss(pred_policy, target_policy)
-            loss = v_loss + LAMBDA_POLICY * p_loss
-            
             loss.backward()
+            if config.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
             optimizer.step()
-        
-        # Track metrics
-        total_loss += loss.item()
-        total_policy_loss += p_loss.item()
-        total_value_loss += v_loss.item()
-        num_batches += 1
-        
-        # Update progress bar
-        if batch_idx % 10 == 0:
-            pbar.set_postfix({
-                'loss': f"{loss.item():.4f}",
-                'p_loss': f"{p_loss.item():.4f}",
-                'v_loss': f"{v_loss.item():.4f}",
-            })
-    
-    return {
-        'loss': total_loss / max(num_batches, 1),
-        'policy_loss': total_policy_loss / max(num_batches, 1),
-        'value_loss': total_value_loss / max(num_batches, 1),
+
+        sum_loss += metrics["loss"] * bs
+        sum_pol += metrics["policy_loss"] * bs
+        sum_val += metrics["value_loss"] * bs
+        sum_bp += metrics["blueprint_loss"] * bs
+        n_samples += bs
+
+        if is_main_process and batch_idx % 10 == 0:
+            pbar.set_postfix(
+                loss=f"{metrics['loss']:.4f}",
+                pol=f"{metrics['policy_loss']:.4f}",
+                val=f"{metrics['value_loss']:.4f}",
+                bp=f"{metrics['blueprint_loss']:.4f}",
+            )
+
+    sum_loss, sum_pol, sum_val, sum_bp, total_n = _reduce_sums(
+        [sum_loss, sum_pol, sum_val, sum_bp, float(n_samples)], device, is_distributed
+    )
+    denom = max(total_n, 1.0)
+    out = {
+        "loss": sum_loss / denom,
+        "policy_loss": sum_pol / denom,
+        "value_loss": sum_val / denom,
+        "blueprint_loss": sum_bp / denom,
     }
+    if grad_ratio is not None:
+        out["bp_pol_grad_ratio"] = grad_ratio
+    return out
 
 
 def validate_epoch(
     model: nn.Module,
-    dataloader: DataLoader,
+    dataloader: Optional[DataLoader],
     device: torch.device,
-    use_amp: bool
+    config: TrainConfig,
+    is_distributed: bool = False,
+    is_main_process: bool = True,
 ) -> Dict[str, float]:
-    """
-    Validate for one epoch.
-    
-    Args:
-        model: Neural network model
-        dataloader: Validation data loader
-        device: Target device
-        use_amp: Whether to use automatic mixed precision
-        
-    Returns:
-        Dictionary with loss metrics
-    """
+    """Validate for one epoch with detailed policy top-1, value MAE, and blueprint Dice."""
+    if dataloader is None:
+        return {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "blueprint_loss": 0.0}
+
     model.eval()
-    
-    total_loss = 0.0
-    total_policy_loss = 0.0
-    total_value_loss = 0.0
-    num_batches = 0
-    
+    use_amp = bool(config.use_amp and device.type == "cuda")
+
+    sum_loss = 0.0
+    sum_pol = 0.0
+    sum_val = 0.0
+    sum_bp = 0.0
+    sum_mae = 0.0
+    sum_top1 = 0.0
+    cnt_top1 = 0.0
+    sum_dice = 0.0
+    cnt_dice = 0.0
+    n_samples = 0
+
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Validating", leave=False):
-            state = batch['state'].to(device, non_blocking=True)
-            target_policy = batch['policy'].to(device, non_blocking=True)
-            target_value = batch['value'].to(device, non_blocking=True)
-            
-            if use_amp:
-                with autocast():
-                    pred_policy, pred_value = model(state)
-                    v_loss = weighted_value_loss(pred_value, target_value)
-                    p_loss = policy_loss(pred_policy, target_policy)
-                    loss = v_loss + LAMBDA_POLICY * p_loss
-            else:
-                pred_policy, pred_value = model(state)
-                v_loss = weighted_value_loss(pred_value, target_value)
-                p_loss = policy_loss(pred_policy, target_policy)
-                loss = v_loss + LAMBDA_POLICY * p_loss
-            
-            total_loss += loss.item()
-            total_policy_loss += p_loss.item()
-            total_value_loss += v_loss.item()
-            num_batches += 1
-    
-    return {
-        'loss': total_loss / max(num_batches, 1),
-        'policy_loss': total_policy_loss / max(num_batches, 1),
-        'value_loss': total_value_loss / max(num_batches, 1),
+        for batch in tqdm(dataloader, desc="Val", leave=False, disable=not is_main_process):
+            state = batch["state"].to(device, non_blocking=True)
+            target_policy = batch["policy"].to(device, non_blocking=True)
+            target_value = batch["value"].to(device, non_blocking=True)
+            legal_mask = batch["legal_mask"].to(device, non_blocking=True) if "legal_mask" in batch else None
+            policy_mask = batch["policy_mask"].to(device, non_blocking=True) if "policy_mask" in batch else None
+            target_bp = batch["blueprint"].to(device, non_blocking=True) if "blueprint" in batch else None
+            bp_mask = batch["blueprint_mask"].to(device, non_blocking=True) if "blueprint_mask" in batch else None
+
+            bs = state.shape[0]
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                outputs = model(state, return_blueprint=(config.lambda_bp > 0.0 and target_bp is not None))
+                if len(outputs) == 3:
+                    pred_policy, pred_value, pred_bp = outputs
+                else:
+                    pred_policy, pred_value = outputs
+                    pred_bp = None
+
+                _, metrics = compute_total_loss(
+                    pred_policy=pred_policy,
+                    pred_value=pred_value,
+                    target_policy=target_policy,
+                    target_value=target_value,
+                    legal_mask=legal_mask,
+                    policy_mask=policy_mask,
+                    pred_blueprint=pred_bp,
+                    target_blueprint=target_bp,
+                    blueprint_mask=bp_mask,
+                    lambda_policy=config.lambda_policy,
+                    lambda_value=config.lambda_value,
+                    lambda_bp=config.lambda_bp,
+                )
+
+            sum_loss += metrics["loss"] * bs
+            sum_pol += metrics["policy_loss"] * bs
+            sum_val += metrics["value_loss"] * bs
+            sum_bp += metrics["blueprint_loss"] * bs
+            sum_mae += float((pred_value.float() - target_value.float()).abs().sum().item())
+            n_samples += bs
+
+            top1 = compute_policy_top1_accuracy(pred_policy, target_policy, legal_mask=legal_mask, policy_mask=policy_mask)
+            if top1 is not None:
+                valid_p_cnt = float((policy_mask > 0.5).sum().item()) if policy_mask is not None else float(bs)
+                sum_top1 += top1 * max(1.0, valid_p_cnt)
+                cnt_top1 += max(1.0, valid_p_cnt)
+
+            if pred_bp is not None and target_bp is not None:
+                dice = compute_blueprint_dice(pred_bp, target_bp, blueprint_mask=bp_mask)
+                if dice is not None:
+                    valid_b_cnt = float((bp_mask > 0.5).sum().item()) if bp_mask is not None else float(bs)
+                    sum_dice += dice * max(1.0, valid_b_cnt)
+                    cnt_dice += max(1.0, valid_b_cnt)
+
+    sum_loss, sum_pol, sum_val, sum_bp, sum_mae, sum_top1, cnt_top1, sum_dice, cnt_dice, total_n = _reduce_sums(
+        [sum_loss, sum_pol, sum_val, sum_bp, sum_mae, sum_top1, cnt_top1, sum_dice, cnt_dice, float(n_samples)],
+        device,
+        is_distributed,
+    )
+    denom = max(total_n, 1.0)
+    out = {
+        "loss": sum_loss / denom,
+        "policy_loss": sum_pol / denom,
+        "value_loss": sum_val / denom,
+        "blueprint_loss": sum_bp / denom,
+        "value_mae": sum_mae / denom,
     }
+    if cnt_top1 > 0:
+        out["policy_top1_acc"] = sum_top1 / cnt_top1
+    if cnt_dice > 0:
+        out["blueprint_dice"] = sum_dice / cnt_dice
+    return out
 
 
 def save_checkpoint(
@@ -344,259 +477,291 @@ def save_checkpoint(
     epoch: int,
     metrics: Dict[str, float],
     config: TrainConfig,
-    path: Path
-):
-    """Save training checkpoint."""
-    # Handle DataParallel wrapper
-    model_state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-    
+    path: Path,
+) -> None:
+    """Save training checkpoint compatible with AlphaBuilderInference."""
+    raw_model = model.module if hasattr(model, "module") else model
     checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model_state,
-        'optimizer_state_dict': optimizer.state_dict(),
-        'metrics': metrics,
-        'config': {
-            'use_swin': config.use_swin,
-            'feature_size': config.feature_size,
-            'in_channels': config.in_channels,
-            'out_channels': config.out_channels,
-        }
+        "epoch": epoch,
+        "model_state_dict": raw_model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "metrics": metrics,
+        "val_loss": float(metrics.get("loss", float("inf"))),
+        "config": {
+            "use_swin": config.use_swin,
+            "feature_size": config.feature_size,
+            "in_channels": config.in_channels,
+            "out_channels": config.out_channels,
+            "lambda_bp": config.lambda_bp,
+        },
     }
-    
     torch.save(checkpoint, path)
 
 
 def load_checkpoint(
     path: Path,
     model: nn.Module,
-    optimizer: Optional[torch.optim.Optimizer] = None
+    optimizer: Optional[torch.optim.Optimizer] = None,
 ) -> int:
-    """
-    Load training checkpoint.
-    
-    Returns:
-        Starting epoch number
-    """
-    checkpoint = torch.load(path, map_location='cpu')
-    
-    # Handle DataParallel wrapper
-    if hasattr(model, 'module'):
-        model.module.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        model.load_state_dict(checkpoint['model_state_dict'])
-    
-    if optimizer is not None:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    
-    return checkpoint['epoch'] + 1
+    """Load checkpoint and return next epoch index."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    target_model = model.module if hasattr(model, "module") else model
+    raw_sd = checkpoint["model_state_dict"]
+    state_dict = {(k[7:] if k.startswith("module.") else k): v for k, v in raw_sd.items()}
+    target_model.load_state_dict(state_dict)
+    if optimizer is not None and "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    return int(checkpoint["epoch"]) + 1
+
+
+def _build_scheduler(optimizer: torch.optim.Optimizer, config: TrainConfig):
+    warmup_ep = max(0, min(config.warmup_epochs, max(0, config.epochs - 1)))
+    if warmup_ep > 0 and config.epochs > 1:
+        warmup = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_ep)
+        cosine = CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, config.epochs - warmup_ep),
+            eta_min=config.learning_rate * 0.01,
+        )
+        return SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_ep])
+    return CosineAnnealingLR(optimizer, T_max=max(1, config.epochs), eta_min=config.learning_rate * 0.01)
 
 
 def main(
     config_name: Optional[str] = None,
     epochs: Optional[int] = None,
     db_path: Optional[str] = None,
+    split_json: Optional[str] = None,
+    checkpoint_dir: Optional[str] = None,
+    log_dir: Optional[str] = None,
+    batch_size: Optional[int] = None,
+    lr: Optional[float] = None,
+    lambda_bp: Optional[float] = None,
+    use_swin: Optional[bool] = None,
+    num_workers: Optional[int] = None,
     resume: Optional[str] = None,
-):
-    """
-    Main training function.
-    
-    Args:
-        config_name: Name of pre-defined config (auto-detected if None)
-        epochs: Override number of epochs
-        db_path: Override database path
-        resume: Path to checkpoint to resume from
-    """
-    print("=" * 60)
-    print("🏗️  AlphaBuilder v3.1 - Training Pipeline")
-    print("=" * 60)
-    
-    # Detect environment
-    detected_config, device = detect_environment()
-    config_name = config_name or detected_config
-    
-    print(f"\n⚙️  Configuration: {config_name}")
-    print(f"   Device: {device}")
-    
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            print(f"   GPU {i}: {torch.cuda.get_device_name(i)}")
-    
-    # Load config
-    config = get_config(config_name)
-    
-    # Override values if provided
-    if epochs is not None:
-        config.epochs = epochs
-    if db_path is not None:
-        config.db_path = db_path
-    
-    # Create timestamp for this run
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"{config_name}_{timestamp}"
-    
-    # Create log directory
-    log_dir = Path(config.log_dir) / run_name
-    log_dir.mkdir(parents=True, exist_ok=True)
-    
-    # TensorBoard setup
-    writer = None
-    if config.use_tensorboard:
-        try:
-            from torch.utils.tensorboard import SummaryWriter
-            writer = SummaryWriter(log_dir)
-            print(f"   TensorBoard: {log_dir}")
-        except ImportError:
-            print("   TensorBoard: Not available")
-    
-    # Create dataloaders
-    train_loader, val_loader = create_dataloaders(config, config.db_path)
-    
-    # Create model
-    model = create_model(config, device)
-    
-    # Create optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay
-    )
-    
-    # Apply IPEX optimizations for XPU
-    model, optimizer = optimize_for_xpu(model, optimizer, device)
-    
-    # Learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=config.epochs,
-        eta_min=config.learning_rate * 0.01
-    )
-    
-    # Mixed precision scaler
-    scaler = GradScaler() if config.use_amp and device.type == 'cuda' else None
-    
-    # Resume from checkpoint if provided
-    start_epoch = 0
-    if resume:
-        print(f"\n📂 Resuming from: {resume}")
-        start_epoch = load_checkpoint(Path(resume), model, optimizer)
-        print(f"   Resuming from epoch {start_epoch}")
-    
-    # Early stopping state
-    best_val_loss = float('inf')
-    patience_counter = 0
-    
-    # Training loop
-    print(f"\n🚀 Starting training: {config.epochs} epochs")
-    print("-" * 60)
-    
-    for epoch in range(start_epoch, config.epochs):
-        epoch_start = time.time()
-        
-        # Train
-        train_metrics = train_epoch(
-            model, train_loader, optimizer, device,
-            scaler, config.use_amp, config.log_every_n_steps
+) -> None:
+    is_distributed, rank, local_rank, world_size = _setup_distributed()
+    is_main_process = rank == 0
+
+    try:
+        detected_config, device = detect_environment(local_rank=local_rank, is_distributed=is_distributed)
+        config_name = config_name or detected_config
+        config = get_config(config_name)
+
+        if epochs is not None:
+            config.epochs = epochs
+        if db_path is not None:
+            config.db_path = db_path
+        if split_json is not None:
+            config.split_json = split_json
+        if checkpoint_dir is not None:
+            config.checkpoint_dir = checkpoint_dir
+        if log_dir is not None:
+            config.log_dir = log_dir
+        if batch_size is not None:
+            config.batch_size = batch_size
+        if lr is not None:
+            config.learning_rate = lr
+        if lambda_bp is not None:
+            config.lambda_bp = lambda_bp
+        if use_swin is not None:
+            config.use_swin = use_swin
+        if num_workers is not None:
+            config.num_workers = num_workers
+
+        Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        Path(config.log_dir).mkdir(parents=True, exist_ok=True)
+
+        if is_main_process:
+            print("=" * 64)
+            print(f"AlphaBuilder v3.3 Training Pipeline | config={config_name} | device={device}")
+            print(f"  per_gpu_bs={config.batch_size} | world_size={world_size} | global_bs={config.batch_size * world_size}")
+            print(f"  loss_weights: pol={config.lambda_policy}, val={config.lambda_value}, bp={config.lambda_bp}")
+            print("=" * 64)
+
+        writer = None
+        if is_main_process and config.use_tensorboard:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+                run_name = f"{config_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                tb_dir = Path(config.log_dir) / run_name
+                tb_dir.mkdir(parents=True, exist_ok=True)
+                writer = SummaryWriter(tb_dir)
+            except ImportError:
+                writer = None
+
+        train_loader, val_loader = create_dataloaders(
+            config,
+            config.db_path,
+            is_distributed=is_distributed,
+            rank=rank,
+            world_size=world_size,
+            is_main_process=is_main_process,
         )
-        
-        # Validate
-        val_metrics = validate_epoch(model, val_loader, device, config.use_amp)
-        
-        # Update scheduler
-        scheduler.step()
-        current_lr = scheduler.get_last_lr()[0]
-        
-        epoch_time = time.time() - epoch_start
-        samples_per_sec = len(train_loader.dataset) / epoch_time
-        
-        # Log to console
-        print(f"\nEpoch {epoch + 1}/{config.epochs} ({epoch_time:.1f}s, {samples_per_sec:.0f} samples/sec)")
-        print(f"  Train | Loss: {train_metrics['loss']:.4f} | Policy: {train_metrics['policy_loss']:.4f} | Value: {train_metrics['value_loss']:.4f}")
-        print(f"  Val   | Loss: {val_metrics['loss']:.4f} | Policy: {val_metrics['policy_loss']:.4f} | Value: {val_metrics['value_loss']:.4f}")
-        print(f"  LR: {current_lr:.2e}")
-        
-        # Log to TensorBoard
-        if writer:
-            global_step = (epoch + 1) * len(train_loader)
-            writer.add_scalar('loss/train', train_metrics['loss'], epoch)
-            writer.add_scalar('loss/val', val_metrics['loss'], epoch)
-            writer.add_scalar('loss/train_policy', train_metrics['policy_loss'], epoch)
-            writer.add_scalar('loss/train_value', train_metrics['value_loss'], epoch)
-            writer.add_scalar('loss/val_policy', val_metrics['policy_loss'], epoch)
-            writer.add_scalar('loss/val_value', val_metrics['value_loss'], epoch)
-            writer.add_scalar('lr', current_lr, epoch)
-            writer.add_scalar('throughput/samples_per_sec', samples_per_sec, epoch)
-        
-        # Save checkpoints
-        checkpoint_dir = Path(config.checkpoint_dir)
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save best model
-        if val_metrics['loss'] < best_val_loss:
-            best_val_loss = val_metrics['loss']
-            patience_counter = 0
-            save_checkpoint(
-                model, optimizer, epoch, val_metrics, config,
-                checkpoint_dir / "best_model.pt"
-            )
-            print(f"  ✓ New best model saved (val_loss: {best_val_loss:.4f})")
-        else:
-            patience_counter += 1
-        
-        # Save periodic checkpoints
-        if (epoch + 1) % config.save_every_n_epochs == 0:
-            save_checkpoint(
-                model, optimizer, epoch, val_metrics, config,
-                checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pt"
-            )
-        
-        # Save last model (always)
-        save_checkpoint(
-            model, optimizer, epoch, val_metrics, config,
-            checkpoint_dir / "last_model.pt"
+
+        model = create_model(
+            config,
+            device,
+            is_distributed=is_distributed,
+            local_rank=local_rank,
+            is_main_process=is_main_process,
         )
-        
-        # Early stopping check
-        if patience_counter >= config.patience:
-            print(f"\n⚠️  Early stopping triggered (patience={config.patience})")
-            break
-    
-    # Final summary
-    print("\n" + "=" * 60)
-    print("🎉 Training Complete!")
-    print(f"   Best validation loss: {best_val_loss:.4f}")
-    print(f"   Checkpoints saved to: {checkpoint_dir}")
-    if writer:
-        print(f"   TensorBoard logs: {log_dir}")
-    print("=" * 60)
-    
-    if writer:
-        writer.close()
+
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+        scheduler = _build_scheduler(optimizer, config)
+        use_amp = bool(config.use_amp and device.type == "cuda")
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
+
+        start_epoch = 0
+        if resume:
+            if is_main_process:
+                print(f"Resuming from checkpoint: {resume}")
+            start_epoch = load_checkpoint(Path(resume), model, optimizer)
+
+        best_val_loss = float("inf")
+        patience_counter = 0
+        history: List[dict] = []
+        ckpt_dir = Path(config.checkpoint_dir)
+
+        for epoch in range(start_epoch, config.epochs):
+            epoch_start = time.time()
+            if isinstance(train_loader.sampler, DistributedSampler):
+                train_loader.sampler.set_epoch(epoch)
+
+            train_metrics = train_epoch(
+                model,
+                train_loader,
+                optimizer,
+                device,
+                scaler,
+                config,
+                is_distributed=is_distributed,
+                is_main_process=is_main_process,
+            )
+            val_metrics = validate_epoch(
+                model,
+                val_loader,
+                device,
+                config,
+                is_distributed=is_distributed,
+                is_main_process=is_main_process,
+            )
+
+            scheduler.step()
+            current_lr = optimizer.param_groups[0]["lr"]
+            epoch_time = time.time() - epoch_start
+            samples_per_sec = len(train_loader.dataset) / max(epoch_time, 1e-6)
+
+            stop_signal = False
+            if is_main_process:
+                print(
+                    f"\nEpoch {epoch + 1}/{config.epochs} ({epoch_time:.1f}s, {samples_per_sec:.0f} samples/s, lr={current_lr:.2e})"
+                )
+                print(
+                    f"  Train | Loss={train_metrics['loss']:.4f} Pol={train_metrics['policy_loss']:.4f} "
+                    f"Val={train_metrics['value_loss']:.4f} BP={train_metrics['blueprint_loss']:.4f}"
+                    + (
+                        f" grad_ratio={train_metrics['bp_pol_grad_ratio']:.3f}"
+                        if "bp_pol_grad_ratio" in train_metrics
+                        else ""
+                    )
+                )
+                if val_loader is not None:
+                    print(
+                        f"  Val   | Loss={val_metrics['loss']:.4f} Pol={val_metrics['policy_loss']:.4f} "
+                        f"Val={val_metrics['value_loss']:.4f} BP={val_metrics['blueprint_loss']:.4f} "
+                        f"MAE={val_metrics.get('value_mae', 0.0):.4f} "
+                        f"Top1={val_metrics.get('policy_top1_acc', 0.0):.3f} "
+                        f"Dice={val_metrics.get('blueprint_dice', 0.0):.3f}"
+                    )
+
+                history.append(
+                    {
+                        "epoch": epoch + 1,
+                        "lr": current_lr,
+                        "elapsed_sec": round(epoch_time, 2),
+                        "samples_per_sec": round(samples_per_sec, 1),
+                        "train": train_metrics,
+                        "val": val_metrics,
+                    }
+                )
+                (ckpt_dir / "metrics_history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+
+                if writer is not None:
+                    for k, v in train_metrics.items():
+                        writer.add_scalar(f"train/{k}", v, epoch)
+                    for k, v in val_metrics.items():
+                        writer.add_scalar(f"val/{k}", v, epoch)
+                    writer.add_scalar("lr", current_lr, epoch)
+
+                monitor_loss = val_metrics["loss"] if val_loader is not None else train_metrics["loss"]
+                if monitor_loss < best_val_loss - config.min_delta:
+                    best_val_loss = monitor_loss
+                    patience_counter = 0
+                    save_checkpoint(model, optimizer, epoch, val_metrics, config, ckpt_dir / "best_model.pt")
+                    print(f"  -> New best checkpoint saved ({best_val_loss:.4f})")
+                else:
+                    patience_counter += 1
+
+                if (epoch + 1) % config.save_every_n_epochs == 0:
+                    save_checkpoint(model, optimizer, epoch, val_metrics, config, ckpt_dir / f"checkpoint_epoch_{epoch + 1}.pt")
+                save_checkpoint(model, optimizer, epoch, val_metrics, config, ckpt_dir / "last_model.pt")
+
+                if patience_counter >= config.patience:
+                    print(f"\nEarly stopping triggered (patience={config.patience})")
+                    stop_signal = True
+
+            if is_distributed:
+                stop_tensor = torch.tensor([1 if stop_signal else 0], dtype=torch.int32, device=device)
+                dist.broadcast(stop_tensor, src=0)
+                stop_signal = bool(stop_tensor.item())
+
+            if stop_signal:
+                break
+
+        if writer is not None:
+            writer.close()
+
+        if is_main_process:
+            print(f"\nTraining complete! Best monitored loss: {best_val_loss:.4f} | dir={ckpt_dir}")
+    finally:
+        if is_distributed and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AlphaBuilder v3.1 Training")
-    parser.add_argument(
-        "--config", type=str, default=None,
-        help=f"Config preset: {list(CONFIGS.keys())}"
-    )
-    parser.add_argument(
-        "--epochs", type=int, default=None,
-        help="Override number of epochs"
-    )
-    parser.add_argument(
-        "--db-path", type=str, default=None,
-        help="Override database path"
-    )
-    parser.add_argument(
-        "--resume", type=str, default=None,
-        help="Resume from checkpoint path"
-    )
-    
+    parser = argparse.ArgumentParser(description="AlphaBuilder v3.3 Training Pipeline")
+    parser.add_argument("--config", type=str, default=None, help=f"Preset: {list(CONFIGS.keys())}")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--db-path", type=str, default=None)
+    parser.add_argument("--split-json", type=str, default=None)
+    parser.add_argument("--checkpoint-dir", type=str, default=None)
+    parser.add_argument("--log-dir", type=str, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--lambda-bp", type=float, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--use-swin", dest="use_swin", action="store_true", default=None)
+    parser.add_argument("--no-swin", dest="use_swin", action="store_false")
+    parser.add_argument("--resume", type=str, default=None)
     args = parser.parse_args()
-    
+
     main(
         config_name=args.config,
         epochs=args.epochs,
         db_path=args.db_path,
+        split_json=args.split_json,
+        checkpoint_dir=args.checkpoint_dir,
+        log_dir=args.log_dir,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        lambda_bp=args.lambda_bp,
+        use_swin=args.use_swin,
+        num_workers=args.num_workers,
         resume=args.resume,
     )

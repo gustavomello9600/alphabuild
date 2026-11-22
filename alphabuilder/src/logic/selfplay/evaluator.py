@@ -1,25 +1,30 @@
 """
-FEM Evaluator for Self-Play MCTS.
+FEM Evaluator for Self-Play MCTS (v3.3).
 
-Provides a simple interface to calculate compliance and max displacement
-for a given density grid using FEniCSx / FEniTop.
-
-This is used in Phase 2 of self-play to get ground truth rewards.
+Aligned physically 1-to-1 with `alphabuilder/src/logic/harvest/optimization.py`:
+- Same E = 100.0, nu = 0.25, SIMP p = 3.0, eps = 1e-6
+- Exact DG0 element density mapping without boundary truncation
+- Exact FULL_CLAMP vs RAIL_XY Dirichlet BCs + Z-translation NullSpace + 6-mode RBM NearNullSpace
+- Exact volumetric body force `-1.125` on `get_load_region_bounds` (works for interior & tip loads)
+- Same symmetric SOR Chebyshev GAMG solver + automatic GMRES fallback
 """
 
-import numpy as np
-from typing import Dict, Any, Tuple, Optional
 from dataclasses import dataclass
+from typing import Any, Dict, Optional
+import numpy as np
+
+from alphabuilder.src.logic.harvest.generators import get_load_region_bounds
 
 try:
     from mpi4py import MPI
-    from dolfinx import mesh, fem
-    from dolfinx.mesh import create_box, CellType
-    from dolfinx.fem import functionspace, Function, dirichletbc, locate_dofs_topological, Constant, form
-    from dolfinx.fem.petsc import LinearProblem
+    from dolfinx import fem
+    from dolfinx.mesh import CellType, create_box, locate_entities_boundary
+    from dolfinx.fem import Constant, Function, dirichletbc, form, functionspace, locate_dofs_topological
     from petsc4py import PETSc
     import ufl
     import basix.ufl
+    from alphabuilder.src.logic.fenitop.utility import LinearProblem as FEniTopLinearProblem
+
     HAS_FENICS = True
 except ImportError:
     HAS_FENICS = False
@@ -29,6 +34,7 @@ except ImportError:
 @dataclass
 class FEMResult:
     """Result from FEM evaluation."""
+
     compliance: float
     max_displacement: float
     vol_frac: float
@@ -40,254 +46,212 @@ class FEMResult:
 def evaluate_fem(
     density: np.ndarray,
     load_config: Dict[str, Any],
-    E: float = 100.0,  # Match harvest data: Young's modulus = 100
-    nu: float = 0.25,  # Match harvest data: Poisson's ratio = 0.25
-    force_magnitude: float = -2.0  # Match harvest data: traction = (0, -2.0, 0)
+    E: float = 100.0,
+    nu: float = 0.25,
+    force_magnitude: float = -1.125,
+    bc_type: Optional[str] = None,
 ) -> FEMResult:
     """
-    Evaluate a density grid using FEM to get compliance and max displacement.
-    
-    Uses the same FEM parameters as the harvest data optimization (optimization.py):
-    - E = 100, nu = 0.25
-    - Surface traction load at right boundary (x=Lx) in load region
-    - Fixed displacement BC at left boundary (x=0)
-    
-    Args:
-        density: Density grid (nx, ny, nz) with values in [0, 1]
-        load_config: Dictionary with 'x', 'y', 'z_start', 'z_end' keys
-        E: Young's modulus (default 100 to match harvest)
-        nu: Poisson's ratio (default 0.25 to match harvest)
-        force_magnitude: Applied traction force (default -2.0 to match harvest)
-        
-    Returns:
-        FEMResult with compliance, max_displacement, and validity
+    Evaluate a voxel density grid using FEniCSx linear elasticity matching FEniTop harvest physics.
     """
     if not HAS_FENICS:
         return FEMResult(
-            compliance=float('inf'),
-            max_displacement=float('inf'),
+            compliance=float("inf"),
+            max_displacement=float("inf"),
             vol_frac=0.0,
             valid=False,
-            error_msg="FEniCSx not available"
+            error_msg="FEniCSx not available",
         )
-    
+
+    linear_problem = None
     try:
-        comm = MPI.COMM_WORLD
+        comm = MPI.COMM_SELF
         nx, ny, nz = density.shape
-        
-        # Volume fraction
         vol_frac = float(np.mean(density > 0.5))
-        
+
         if vol_frac < 0.001:
             return FEMResult(
-                compliance=float('inf'),
-                max_displacement=float('inf'),
+                compliance=float("inf"),
+                max_displacement=float("inf"),
                 vol_frac=vol_frac,
                 valid=False,
-                error_msg="Empty structure"
+                error_msg="Empty structure",
             )
-        
-        # Physical dimensions (1:1 voxel mapping)
+
         Lx, Ly, Lz = float(nx), float(ny), float(nz)
-        
-        # Create mesh
-        domain = create_box(
-            comm, 
-            [[0, 0, 0], [Lx, Ly, Lz]], 
-            [nx, ny, nz], 
-            CellType.hexahedron
-        )
-        
-        # Vector function space for displacement
-        v_element = basix.ufl.element(
-            "Lagrange", 
-            domain.topology.cell_name(), 
-            1, 
-            shape=(domain.geometry.dim,)
-        )
+        domain = create_box(comm, [[0.0, 0.0, 0.0], [Lx, Ly, Lz]], [nx, ny, nz], CellType.hexahedron)
+
+        v_element = basix.ufl.element("Lagrange", domain.topology.cell_name(), 1, shape=(domain.geometry.dim,))
         V = functionspace(domain, v_element)
-        
-        # Scalar function space for density (CG1 - like FEniTop's rho_phys_field)
-        # Using CG1 instead of DG0 provides proper interpolation across element boundaries
-        # This matches FEniTop's approach and produces consistent compliance values
-        s_element = basix.ufl.element("Lagrange", domain.topology.cell_name(), 1)
-        S = functionspace(domain, s_element)
-        
-        # Material field (CG1)
-        rho = Function(S)
-        
-        # Map density grid to CG1 field using node coordinates
-        # This samples the voxel grid at node locations, providing smooth interpolation
-        coords = S.tabulate_dof_coordinates()
-        x_idx = np.floor(coords[:, 0]).astype(int)
-        y_idx = np.floor(coords[:, 1]).astype(int)
-        z_idx = np.floor(coords[:, 2]).astype(int)
-        
-        # Clip to valid range
-        x_idx = np.clip(x_idx, 0, nx - 1)
-        y_idx = np.clip(y_idx, 0, ny - 1)
-        z_idx = np.clip(z_idx, 0, nz - 1)
-        
-        # Sample density at node locations
-        rho.x.array[:] = density[x_idx, y_idx, z_idx]
-        
-        # SIMP penalization (p=3, same as harvest) - FEniTop formula
+
+        s0_element = basix.ufl.element("DG", domain.topology.cell_name(), 0)
+        S0 = functionspace(domain, s0_element)
+
+        rho = Function(S0)
+        cell_coords = S0.tabulate_dof_coordinates()
+        cx = np.clip(np.floor(cell_coords[:, 0]).astype(int), 0, nx - 1)
+        cy = np.clip(np.floor(cell_coords[:, 1]).astype(int), 0, ny - 1)
+        cz = np.clip(np.floor(cell_coords[:, 2]).astype(int), 0, nz - 1)
+        rho.x.array[:] = density[cx, cy, cz].astype(np.float64)
+
         p = 3.0
-        eps = 1e-6  # Match FEniTop epsilon
-        E_eff = (eps + (1 - eps) * rho**p) * E
-        
-        # Lame parameters
-        mu = E_eff / (2 * (1 + nu))
-        lmbda = E_eff * nu / ((1 + nu) * (1 - 2 * nu))
-        
-        # Strain and stress
+        eps = 1e-6
+        E_eff = (eps + (1.0 - eps) * rho**p) * float(E)
+        mu = E_eff / (2.0 * (1.0 + nu))
+        lmbda = E_eff * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
+
         def epsilon(u):
             return ufl.sym(ufl.grad(u))
-        
+
         def sigma(u):
-            return lmbda * ufl.tr(epsilon(u)) * ufl.Identity(len(u)) + 2 * mu * epsilon(u)
-        
-        # Trial and test functions
+            return lmbda * ufl.tr(epsilon(u)) * ufl.Identity(len(u)) + 2.0 * mu * epsilon(u)
+
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
-        
-        # Bilinear form
-        a = ufl.inner(sigma(u), epsilon(v)) * ufl.dx
-        
-        # Load region parameters (match harvest data)
-        ly = float(load_config.get('y', ny // 2))
-        lz_s = float(load_config.get('z_start', 0))
-        lz_e = float(load_config.get('z_end', nz))
-        lz_center = (lz_s + lz_e) / 2.0
-        load_half_width = 1.0
-        
-        # Surface traction at right boundary (x=Lx) in load region
-        # This matches the harvest data setup exactly (UPDATED to match load_config.x)
-        load_x_pos = float(load_config.get('x')) + 1.0
-        def right_load_boundary(x):
-            """Right face (x=Lx) within load region."""
-            return (
-                np.isclose(x[0], load_x_pos) &
-                (x[1] >= ly - load_half_width - 0.5) & (x[1] <= ly + load_half_width + 0.5) &
-                (x[2] >= lz_center - load_half_width - 0.5) & (x[2] <= lz_center + load_half_width + 0.5)
+        u_sol = Function(V)
+        lam_sol = Function(V)
+
+        fdim = domain.topology.dim - 1
+        resolved_bc = str(bc_type or load_config.get("bc_type", "FULL_CLAMP")).upper()
+        left_facets = locate_entities_boundary(domain, fdim, lambda x: np.isclose(x[0], 0.0))
+
+        if resolved_bc == "RAIL_XY":
+            dofs_x = locate_dofs_topological(V.sub(0), fdim, left_facets)
+            dofs_y = locate_dofs_topological(V.sub(1), fdim, left_facets)
+            bcs = [
+                dirichletbc(Constant(domain, 0.0), dofs_x, V.sub(0)),
+                dirichletbc(Constant(domain, 0.0), dofs_y, V.sub(1)),
+            ]
+            nullspace_axes = (2,)
+        else:
+            dofs_all = locate_dofs_topological(V, fdim, left_facets)
+            bcs = [
+                dirichletbc(Constant(domain, np.zeros(3, dtype=np.float64)), dofs_all, V),
+            ]
+            nullspace_axes = None
+
+        lx, y_min, y_max, z_min, z_max = get_load_region_bounds((nx, ny, nz), load_config)
+        body_force = Function(V)
+        body_force.interpolate(
+            lambda x: np.stack(
+                [
+                    np.zeros(x.shape[1]),
+                    force_magnitude
+                    * (
+                        (x[0] >= float(lx) - 1e-6)
+                        & (x[0] <= float(lx + 1) + 1e-6)
+                        & (x[1] >= float(y_min) - 1e-6)
+                        & (x[1] <= float(y_max) + 1e-6)
+                        & (x[2] >= float(z_min) - 1e-6)
+                        & (x[2] <= float(z_max) + 1e-6)
+                    ),
+                    np.zeros(x.shape[1]),
+                ]
             )
-        
-        # Locate facets for traction BC
-        fdim = domain.topology.dim - 1
-        load_facets = mesh.locate_entities_boundary(domain, fdim, right_load_boundary)
-        
-        # Create facet tags for load region
-        facet_indices = np.array(load_facets, dtype=np.int32)
-        facet_markers = np.ones_like(facet_indices, dtype=np.int32)  # Tag = 1 for load region
-        sorted_indices = np.argsort(facet_indices)
-        facet_tags = mesh.meshtags(domain, fdim, facet_indices[sorted_indices], facet_markers[sorted_indices])
-        
-        # Define exterior facet measure with tags
-        ds = ufl.Measure("ds", domain=domain, subdomain_data=facet_tags)
-        
-        # Traction vector (0, force_magnitude, 0) - matches harvest: (0, -2.0, 0)
-        T = Constant(domain, np.array([0.0, force_magnitude, 0.0], dtype=PETSc.ScalarType))
-        
-        # Linear form: surface traction on load region (tag=1)
-        L = ufl.dot(T, v) * ds(1)
-        
-        # Boundary condition (fix X=0 plane) - same as harvest
-        def left_boundary(x):
-            return np.isclose(x[0], 0.0)
-        
-        fdim = domain.topology.dim - 1
-        left_facets = mesh.locate_entities_boundary(domain, fdim, left_boundary)
-        u_zero = np.array([0.0, 0.0, 0.0], dtype=PETSc.ScalarType)
-        bc = dirichletbc(u_zero, locate_dofs_topological(V, fdim, left_facets), V)
-        
-        # Solve using CG + GAMG (Algebraic Multigrid) - optimized for elasticity
-        # GAMG provides 31x speedup over Jacobi for this problem size
-        # OpenMP threading uses all CPU cores regardless of MPI processes
-        problem = LinearProblem(
-            a, L, bcs=[bc],
-            petsc_options={
-                "ksp_type": "cg",
-                "pc_type": "gamg",
-                "ksp_rtol": 1e-6,
-                "ksp_max_it": 500,
-                "mg_levels_ksp_type": "chebyshev",
-                "mg_levels_pc_type": "jacobi",
-            },
-            petsc_options_prefix="fem_eval"
         )
-        
-        u_sol = problem.solve()
-        
-        # Compliance: C = u^T * K * u = F^T * u (energy)
-        # Using C = ∫ σ(u):ε(u) dx
-        compliance_form = form(ufl.inner(sigma(u_sol), epsilon(u_sol)) * ufl.dx)
-        compliance = comm.allreduce(
-            fem.assemble_scalar(compliance_form), 
-            op=MPI.SUM
+
+        dx = ufl.Measure("dx", domain=domain, metadata={"quadrature_degree": 2})
+        lhs = ufl.inner(sigma(u), epsilon(v)) * dx
+        rhs = ufl.dot(body_force, v) * dx
+
+        petsc_options = {
+            "ksp_type": "cg",
+            "pc_type": "gamg",
+            "ksp_rtol": 1e-5,
+            "ksp_max_it": 500,
+            "pc_gamg_type": "agg",
+            "pc_gamg_agg_nsmooths": 1,
+            "pc_gamg_threshold": 0.02,
+            "mg_levels_ksp_type": "chebyshev",
+            "mg_levels_pc_type": "sor",
+            "mg_levels_pc_sor_symmetric": None,
+        }
+
+        linear_problem = FEniTopLinearProblem(
+            u_sol,
+            lam_sol,
+            lhs,
+            rhs,
+            l_vec=None,
+            spring_vec=None,
+            bcs=bcs,
+            petsc_options=petsc_options,
+            nullspace_axes=nullspace_axes,
         )
-        
-        # Max displacement
+        linear_problem.solve_fem()
+
+        compliance_form = form(ufl.inner(sigma(u_sol), epsilon(u_sol)) * dx)
+        compliance = float(fem.assemble_scalar(compliance_form))
+
         u_array = u_sol.x.array.reshape(-1, 3)
         displacement_magnitudes = np.linalg.norm(u_array, axis=1)
-        max_displacement = float(np.max(displacement_magnitudes))
-        
-        # --- Gather Global Displacement Map ---
-        # Only include displacement values where there is actual material
-        # Use np.maximum.at to handle multiple FEM nodes mapping to same grid cell
-        local_grid = np.zeros((nx, ny, nz), dtype=np.float32)
-        node_densities = density[x_idx, y_idx, z_idx]
-        has_material = node_densities > 0.5
-        
-        # Use maximum to aggregate (handles multiple nodes per cell correctly)
-        np.maximum.at(
-            local_grid,
-            (x_idx[has_material], y_idx[has_material], z_idx[has_material]),
-            displacement_magnitudes[has_material].astype(np.float32)
+        max_displacement = float(np.max(displacement_magnitudes)) if displacement_magnitudes.size > 0 else 0.0
+
+        # Map nodal CG1 displacements cleanly to exact (nx, ny, nz) hexahedral cell maxima
+        v_coords = V.tabulate_dof_coordinates()
+        vx = np.clip(np.rint(v_coords[:, 0]).astype(int), 0, nx)
+        vy = np.clip(np.rint(v_coords[:, 1]).astype(int), 0, ny)
+        vz = np.clip(np.rint(v_coords[:, 2]).astype(int), 0, nz)
+
+        disp_nodal = np.zeros((nx + 1, ny + 1, nz + 1), dtype=np.float32)
+        disp_nodal[vx, vy, vz] = displacement_magnitudes.astype(np.float32)
+        cell_disp = np.maximum.reduce(
+            [
+                disp_nodal[:-1, :-1, :-1],
+                disp_nodal[1:, :-1, :-1],
+                disp_nodal[:-1, 1:, :-1],
+                disp_nodal[:-1, :-1, 1:],
+                disp_nodal[1:, 1:, :-1],
+                disp_nodal[1:, :-1, 1:],
+                disp_nodal[:-1, 1:, 1:],
+                disp_nodal[1:, 1:, 1:],
+            ]
         )
-        
-        # Reduce to get global grid (max is more appropriate than sum for overlapping regions)
-        global_displacement_map = np.zeros_like(local_grid)
-        comm.Allreduce(local_grid, global_displacement_map, op=MPI.MAX)
-        
+        displacement_map = np.where(density > 0.5, cell_disp, 0.0).astype(np.float32)
+
+        if not np.isfinite(compliance) or not np.isfinite(max_displacement):
+            return FEMResult(
+                compliance=float("inf"),
+                max_displacement=float("inf"),
+                vol_frac=vol_frac,
+                valid=False,
+                error_msg="Non-finite FEM result",
+            )
+
         return FEMResult(
-            compliance=float(compliance),
+            compliance=compliance,
             max_displacement=max_displacement,
             vol_frac=vol_frac,
             valid=True,
-            displacement_map=global_displacement_map
+            displacement_map=displacement_map,
         )
-        
+
     except Exception as e:
         return FEMResult(
-            compliance=float('inf'),
-            max_displacement=float('inf'),
+            compliance=float("inf"),
+            max_displacement=float("inf"),
             vol_frac=0.0,
             valid=False,
-            error_msg=str(e)
+            error_msg=str(e),
         )
+    finally:
+        if linear_problem is not None:
+            for attr in ("solver", "lhs_mat", "rhs_vec", "spring_vec", "l_vec", "near_nullspace", "nullspace"):
+                obj = getattr(linear_problem, attr, None)
+                if obj is not None:
+                    try:
+                        obj.destroy()
+                    except Exception:
+                        pass
+                    setattr(linear_problem, attr, None)
 
 
 def evaluate_main_island(
     density: np.ndarray,
     load_config: Dict[str, Any],
     island_mask: np.ndarray,
-    **kwargs
+    **kwargs,
 ) -> FEMResult:
-    """
-    Evaluate only the main island of a structure.
-    
-    This masks out disconnected islands and evaluates only the
-    connected component that links support to load.
-    
-    Args:
-        density: Full density grid
-        load_config: Load configuration
-        island_mask: Boolean mask of the main island
-        **kwargs: Additional args passed to evaluate_fem
-        
-    Returns:
-        FEMResult for the main island only
-    """
-    # Create density with only main island
+    """Evaluate only the main connected structural component."""
     main_density = np.where(island_mask, density, 0.0).astype(np.float32)
     return evaluate_fem(main_density, load_config, **kwargs)
