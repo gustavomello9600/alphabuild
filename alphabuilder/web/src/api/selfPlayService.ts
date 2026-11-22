@@ -323,11 +323,12 @@ export class SelfPlayReplayService {
         this.worker.postMessage({
             type: 'LOAD_CHUNK',
             payload: {
+                source: 'selfplay',
                 gameId: this.gameId,
                 start,
                 end,
                 isDeprecated: this.deprecated,
-                apiBase: 'http://localhost:8000' // Hardcoded for now or get from env
+                apiBase: 'http://localhost:8000'
             }
         });
     }
