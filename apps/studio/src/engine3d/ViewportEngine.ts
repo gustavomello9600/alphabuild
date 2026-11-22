@@ -124,6 +124,30 @@ export class ViewportEngine {
     this.hoverHandler = handler;
   }
 
+  pickVoxel(event: { clientX: number; clientY: number }): VoxelPick | null {
+    if (!this.frame) return null;
+    return this.picker.pick(
+      event,
+      this.canvas,
+      this.camera,
+      this.voxels.mesh,
+      this.frame.voxelIds,
+    );
+  }
+
+  pickFloor(event: { clientX: number; clientY: number }): THREE.Vector3 | null {
+    return this.picker.pickPlane(
+      event,
+      this.canvas,
+      this.camera,
+      new THREE.Plane(new THREE.Vector3(0, 1, 0), 0),
+    );
+  }
+
+  getDims(): [number, number, number] {
+    return this.dims;
+  }
+
   applyFrame(frame: ParsedAbMesh): void {
     const firstFrame = this.frame === null;
     const changedDims =

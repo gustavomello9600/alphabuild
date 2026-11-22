@@ -391,6 +391,11 @@ pub struct StartSessionRequest {
     pub episode_config: Option<serde_json::Value>,
     pub phase1_mcts: Option<serde_json::Value>,
     pub phase2_mcts: Option<serde_json::Value>,
+    pub strategy: Option<String>,
+    pub target_vol_frac: Option<f64>,
+    pub max_iter: Option<u32>,
+    pub r_min: Option<f64>,
+    pub seed: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

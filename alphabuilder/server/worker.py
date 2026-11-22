@@ -533,6 +533,9 @@ class LiveSession:
 
     # ---------------------------------------------------------------- runner
     def _run_loop(self) -> None:
+        if self.request.kind == "SIMP":
+            self._run_simp_loop()
+            return
         try:
             while not self._cancel.is_set():
                 with self._lock:
@@ -607,6 +610,157 @@ class LiveSession:
         except BaseException as exc:  # noqa: BLE001
             traceback.print_exc()
             self._finish("FAILED", f"{type(exc).__name__}: {exc}", error=str(exc))
+
+    def _run_simp_loop(self) -> None:
+        try:
+            outcomes = self.manager.worker.submit(self._compute_simp, priority=1).result()
+            if not outcomes:
+                self._finish("FAILED", "SIMP_EMPTY_HISTORY")
+                return
+            for outcome in outcomes:
+                if self._cancel.is_set():
+                    self._finish("CANCELLED", "CANCELLED")
+                    return
+                while self._pause.is_set() and not self._cancel.is_set():
+                    self._pause.wait(0.05)
+                if self._cancel.is_set():
+                    self._finish("CANCELLED", "CANCELLED")
+                    return
+                with self._lock:
+                    self.density = outcome.density
+                    self.phase = "REFINEMENT"
+                    self.step = outcome.step
+                    self.frames[outcome.step] = outcome.frame
+                    self.history.append(outcome.metadata)
+                    self.final_score = outcome.final_score
+                    self.final_compliance = outcome.final_compliance
+                    self.final_volume = outcome.final_volume
+                self._publish(
+                    (
+                        "text",
+                        {
+                            "type": "step_progress",
+                            "step": outcome.step,
+                            "phase": "REFINEMENT",
+                            "sims_done": outcome.step,
+                            "sims_total": outcomes[-1].step,
+                            "cache_hits": 0,
+                            "elapsed_ms": outcome.metadata.get("step_elapsed_ms", 0.0),
+                        },
+                    )
+                )
+                self._publish(("binary", outcome.frame))
+                self.publish_state()
+            self._finish("COMPLETED", "CONVERGENCE")
+        except BaseException as exc:  # noqa: BLE001
+            traceback.print_exc()
+            self._finish("FAILED", f"{type(exc).__name__}: {exc}", error=str(exc))
+
+    def _compute_simp(self) -> list[_StepOutcome]:
+        from alphabuilder.src.core.physics_model import PhysicalProperties
+        from alphabuilder.src.logic.harvest.config import SIMPConfig
+        from alphabuilder.src.logic.harvest.optimization import run_fenitop_optimization
+        from alphabuilder.src.logic.selfplay.reward import (
+            calculate_compliance_score,
+            calculate_displacement_penalty,
+            calculate_reward,
+            calculate_volume_bonus,
+        )
+
+        settings = self.request.simp_config
+        if settings is None:
+            from .schemas import SimpSettings
+
+            settings = SimpSettings()
+        started = time.perf_counter()
+        load_config = self.load_config.model_dump()
+        load_config["bc_type"] = self.bc_type
+        props = PhysicalProperties(E=100.0, nu=0.25)
+        simp_config = SIMPConfig(
+            vol_frac=settings.target_vol_frac,
+            max_iter=settings.max_iter,
+            r_min=settings.r_min,
+            load_config=load_config,
+        )
+        initial = (self.density > 0.5).astype(np.float32)
+        history = run_fenitop_optimization(
+            self.dims,
+            props,
+            simp_config,
+            initial_density=initial,
+            strategy=settings.strategy,
+            record_displacement_map=True,
+        )
+        outcomes: list[_StepOutcome] = []
+        for entry in history:
+            density = np.asarray(entry.get("density_map"), dtype=np.float32)
+            if density.shape != self.dims:
+                density = np.asarray(self.density, dtype=np.float32)
+            volume = float(entry.get("vol_frac", float(np.mean(density > 0.5))))
+            compliance = float(entry.get("compliance", 0.0))
+            max_disp = float(entry.get("max_displacement", 0.0))
+            fem_score = float(entry.get("fem_score", 0.0))
+            displacement = entry.get("displacement_map")
+            reward = calculate_reward(compliance, volume, True, max_disp)
+            matrix: dict[str, Any] = {
+                "step": int(entry.get("step", len(outcomes))),
+                "phase": "REFINEMENT",
+                "value": fem_score,
+                "value_target": entry.get("final_fem_score"),
+                "fem_reward": reward,
+                "compliance_fem": compliance,
+                "max_displacement": max_disp,
+                "volume_fraction": volume,
+                "is_connected": True,
+                "n_islands": 1,
+                "loose_voxels": 0,
+                "connected_load_fraction": 1.0,
+                "island_penalty": 0.0,
+                "reward_components": {},
+                "reward_v33": {
+                    "compliance_score": float(calculate_compliance_score(compliance)),
+                    "volume_bonus": float(calculate_volume_bonus(volume)),
+                    "fem_score": fem_score,
+                    "displacement_penalty": float(calculate_displacement_penalty(max_disp)),
+                    "island_penalty": 0.0,
+                    "connectivity_bonus": 0.0,
+                    "pbrs_delta": None,
+                    "total_reward": float(reward),
+                    "is_collapsed": reward == -1.0,
+                },
+                "mcts_stats": None,
+                "selected_actions": [],
+                "step_elapsed_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "fem_enabled": True,
+                "resolution": list(self.dims),
+                "bc_type": self.bc_type,
+                "load_config": self.load_config.model_dump(),
+            }
+            tensors: list[wire.WireTensor] = [
+                wire.dense_f16(wire.TAG_DENSITY, self.dims, density.reshape(-1))
+            ]
+            if displacement is not None:
+                disp = np.asarray(displacement, dtype=np.float32)
+                if disp.shape == self.dims:
+                    tensors.append(wire.dense_f16(wire.TAG_DISPLACEMENT_MAG, self.dims, disp.reshape(-1)))
+            frame = wire.encode_packet(
+                wire.PAYLOAD_STEP_FRAME, matrix, tensors, compress=True, flags=0x01
+            )
+            outcomes.append(
+                _StepOutcome(
+                    density=density,
+                    phase="REFINEMENT",
+                    step=int(matrix["step"]),
+                    metadata=matrix,
+                    frame=frame,
+                    end_reason=None,
+                    fem_enabled=True,
+                    final_score=float(reward),
+                    final_compliance=compliance,
+                    final_volume=volume,
+                )
+            )
+        return outcomes
 
     def _finish(self, status: str, reason: str, error: Optional[str] = None) -> None:
         with self._lock:

@@ -323,6 +323,26 @@ button {
 .right-dock[data-collapsed="true"] {
   transform: translateX(calc(100% + 18px));
 }
+.studio-panel {
+  position: absolute;
+  z-index: 15;
+  top: 68px;
+  right: 16px;
+  bottom: 104px;
+  width: 324px;
+  border-radius: var(--radius-lg);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  pointer-events: auto;
+}
+.studio-panel__body {
+  overflow-y: auto;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
 .right-dock__content {
   overflow-y: auto;
   padding: 12px;
@@ -1044,4 +1064,10 @@ input[type="checkbox"] {
   opacity: 0;
   pointer-events: none;
   transition: opacity 180ms var(--ease-out);
+}
+
+
+.app-shell[data-figure="true"] .studio-panel {
+  opacity: 0;
+  pointer-events: none;
 }

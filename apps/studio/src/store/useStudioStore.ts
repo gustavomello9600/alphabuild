@@ -3,10 +3,13 @@ import type {
   BcType,
   CachedInferOverlay,
   EntryMetadata,
+  ForceVector,
   LoadConfig,
   LocalTopologyReport,
+  ParsedAbMesh,
   SessionHandle,
   StudioVoxelState,
+  SupportVoxel,
 } from "../types/contracts";
 import { studioAnalyzeLocal } from "../lib/ipc";
 
@@ -17,12 +20,19 @@ interface StudioStore {
   bcType: BcType;
   loadConfig: LoadConfig;
   solidVoxels: Set<number>;
+  customSupports: SupportVoxel[] | null;
+  customForces: ForceVector[] | null;
+  inferenceValue: number | null;
+  inferenceMs: number | null;
+  inferenceDevice: string | null;
+  inferenceError: string | null;
   report: LocalTopologyReport | null;
   overlay: CachedInferOverlay | null;
   tool: StudioTool;
   brushSize: 1 | 3;
   liveXray: boolean;
   session: SessionHandle | null;
+  sessionFrame: ParsedAbMesh | null;
   sessionStatus: string;
   sessionStep: number;
   sessionProgress: number;
@@ -34,11 +44,17 @@ interface StudioStore {
   setBrushSize: (size: 1 | 3) => void;
   setLiveXray: (value: boolean) => void;
   setVoxel: (flatIdx: number, solid: boolean, brush?: 1 | 3) => void;
+  setSolidVoxels: (voxels: Set<number>) => void;
+  setSupportVoxel: (flatIdx: number, enabled: boolean) => void;
+  setLoadFromVoxel: (x: number, y: number, z: number) => void;
+  setInference: (value: number | null, ms: number | null, device: string | null) => void;
+  setInferenceError: (error: string | null) => void;
   clear: () => void;
   loadMetadata: (metadata: EntryMetadata) => void;
   setOverlay: (overlay: CachedInferOverlay | null) => void;
   analyze: () => Promise<void>;
   setSession: (session: SessionHandle | null) => void;
+  setSessionFrame: (frame: ParsedAbMesh | null) => void;
   setSessionStatus: (status: string, step?: number) => void;
   setSessionProgress: (value: number) => void;
   setSessionError: (error: string | null) => void;
@@ -58,12 +74,19 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
   bcType: "FULL_CLAMP",
   loadConfig: defaultLoadConfig,
   solidVoxels: new Set<number>(),
+  customSupports: null,
+  customForces: null,
+  inferenceValue: null,
+  inferenceMs: null,
+  inferenceDevice: null,
+  inferenceError: null,
   report: null,
   overlay: null,
   tool: "paint",
   brushSize: 1,
   liveXray: false,
   session: null,
+  sessionFrame: null,
   sessionStatus: "IDLE",
   sessionStep: 0,
   sessionProgress: 0,
@@ -97,15 +120,51 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     }
     set({ solidVoxels: next });
   },
-  clear: () => set({ solidVoxels: new Set(), report: null, overlay: null }),
+  setSolidVoxels: (solidVoxels) => set({ solidVoxels, report: null }),
+  setSupportVoxel: (flatIdx, enabled) => {
+    const state = get();
+    const dims = state.resolution;
+    const plane = dims[1] * dims[2];
+    const x = Math.floor(flatIdx / plane);
+    const y = Math.floor((flatIdx % plane) / dims[2]);
+    const z = flatIdx % dims[2];
+    const existing = new Map((state.customSupports ?? []).map((item) => [`${item.x},${item.y},${item.z}`, item]));
+    const key = `${x},${y},${z}`;
+    if (enabled) existing.set(key, { x, y, z, mask_x: true, mask_y: true, mask_z: true });
+    else existing.delete(key);
+    set({
+      customSupports: Array.from(existing.values()),
+      bcType: "CUSTOM",
+    });
+  },
+  setLoadFromVoxel: (x, y, z) => {
+    const state = get();
+    const [d, h, w] = state.resolution;
+    set({
+      loadConfig: {
+        ...state.loadConfig,
+        x: Math.min(d - 1, Math.max(0, Math.round(x))),
+        y: Math.min(h - 1, Math.max(0, Math.round(y))),
+        z_start: Math.min(w - 1, Math.max(0, Math.round(z))),
+        z_end: Math.min(w - 1, Math.max(0, Math.round(z) + 1)),
+      },
+    });
+  },
+  setInference: (inferenceValue, inferenceMs, inferenceDevice) =>
+    set({ inferenceValue, inferenceMs, inferenceDevice, inferenceError: null }),
+  setInferenceError: (inferenceError) => set({ inferenceError }),
+  clear: () => set({ solidVoxels: new Set(), report: null, overlay: null, customSupports: null, customForces: null, inferenceValue: null }),
   loadMetadata: (metadata) =>
     set({
       resolution: metadata.resolution,
       bcType: metadata.bc_type,
       loadConfig: metadata.load_config,
       solidVoxels: new Set(),
+      customSupports: null,
+      customForces: null,
       report: null,
       overlay: null,
+      inferenceValue: null,
     }),
   setOverlay: (overlay) => set({ overlay }),
   analyze: async () => {
@@ -117,6 +176,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     }
   },
   setSession: (session) => set({ session, sessionStatus: session?.status ?? "IDLE" }),
+  setSessionFrame: (sessionFrame) => set({ sessionFrame }),
   setSessionStatus: (sessionStatus, step) =>
     set((state) => ({ sessionStatus, sessionStep: step ?? state.sessionStep })),
   setSessionProgress: (sessionProgress) => set({ sessionProgress }),
@@ -127,8 +187,8 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       resolution: state.resolution,
       bc_type: state.bcType,
       load_config: state.loadConfig,
-      custom_supports: null,
-      custom_forces: null,
+      custom_supports: state.customSupports,
+      custom_forces: state.customForces,
       solid_voxels: Array.from(state.solidVoxels).sort((a, b) => a - b),
     };
   },

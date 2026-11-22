@@ -370,6 +370,11 @@ export interface StartSessionRequest {
   episode_config?: Record<string, unknown> | null;
   phase1_mcts?: Record<string, unknown> | null;
   phase2_mcts?: Record<string, unknown> | null;
+  strategy?: "FULL_DOMAIN" | "BEZIER";
+  target_vol_frac?: number;
+  max_iter?: number;
+  r_min?: number;
+  seed?: number;
 }
 
 export interface SessionHandle {

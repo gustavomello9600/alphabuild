@@ -2,9 +2,11 @@ import { useState } from "react";
 import {
   ChevronLeft,
   ChevronRight,
+  CircleDot,
   Eraser,
   Ghost,
   Layers,
+  Move3d,
   Paintbrush,
   ScanLine,
   SlidersHorizontal,
@@ -263,6 +265,22 @@ function StudioTools() {
             onClick={() => setTool("erase")}
           >
             <Eraser size={12} /> Remover
+          </button>
+          <button
+            type="button"
+            className="pill-button"
+            data-active={tool === "load"}
+            onClick={() => setTool("load")}
+          >
+            <Move3d size={12} /> Carga
+          </button>
+          <button
+            type="button"
+            className="pill-button"
+            data-active={tool === "support"}
+            onClick={() => setTool("support")}
+          >
+            <CircleDot size={12} /> Suporte
           </button>
         </div>
         <div className="panel-heading">

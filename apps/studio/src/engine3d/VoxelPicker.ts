@@ -3,6 +3,7 @@ import * as THREE from "three";
 export interface VoxelPick {
   voxelId: number;
   point: THREE.Vector3;
+  normal: THREE.Vector3;
 }
 
 export class VoxelPicker {
@@ -32,7 +33,8 @@ export class VoxelPicker {
     }
     const voxelId = voxelIds[vertexIndex];
     if (voxelId === undefined) return null;
-    return { voxelId, point: hit.point.clone() };
+    const normal = hit.face.normal.clone().transformDirection(mesh.matrixWorld);
+    return { voxelId, point: hit.point.clone(), normal };
   }
 
   pickPlane(

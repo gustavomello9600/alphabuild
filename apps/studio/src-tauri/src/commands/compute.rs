@@ -592,25 +592,40 @@ pub async fn session_start(
     req: StartSessionRequest,
 ) -> Result<SessionHandle, String> {
     let connection = state.active_connection()?;
-    let body = json!({
-        "kind": if req.kind.is_empty() { "MCTS_LIVE".to_string() } else { req.kind.clone() },
-        "resolution": req.resolution,
-        "bc_type": req.bc_type,
-        "load_config": req.load_config,
-        "initial_solid_voxels": req.initial_solid_voxels,
-        "resume_game_id": req.resume_game_id,
-        "persist_to_db": req.persist_to_db,
-        "db_path_id": req.db_path_id,
-        "start_paused": req.start_paused,
-        "include_blueprint": req.include_blueprint,
-        "allow_neural_only_phase2": req.allow_neural_only_phase2,
-        "episode_config": req.episode_config.unwrap_or_else(|| json!({})),
-        "phase1_mcts": req.phase1_mcts.unwrap_or_else(|| json!({})),
-        "phase2_mcts": req.phase2_mcts.unwrap_or_else(|| json!({}))
-    });
+    let is_simp = req.kind == "SIMP";
+    let path = if is_simp { "/api/v1/simp/start" } else { "/api/v1/sessions" };
+    let body = if is_simp {
+        json!({
+            "resolution": req.resolution,
+            "bc_type": req.bc_type,
+            "load_config": req.load_config,
+            "strategy": req.strategy.unwrap_or_else(|| "FULL_DOMAIN".to_string()),
+            "target_vol_frac": req.target_vol_frac.unwrap_or(0.15),
+            "max_iter": req.max_iter.unwrap_or(80),
+            "r_min": req.r_min.unwrap_or(1.5),
+            "seed": req.seed.unwrap_or(42)
+        })
+    } else {
+        json!({
+            "kind": if req.kind.is_empty() { "MCTS_LIVE".to_string() } else { req.kind.clone() },
+            "resolution": req.resolution,
+            "bc_type": req.bc_type,
+            "load_config": req.load_config,
+            "initial_solid_voxels": req.initial_solid_voxels,
+            "resume_game_id": req.resume_game_id,
+            "persist_to_db": req.persist_to_db,
+            "db_path_id": req.db_path_id,
+            "start_paused": req.start_paused,
+            "include_blueprint": req.include_blueprint,
+            "allow_neural_only_phase2": req.allow_neural_only_phase2,
+            "episode_config": req.episode_config.unwrap_or_else(|| json!({})),
+            "phase1_mcts": req.phase1_mcts.unwrap_or_else(|| json!({})),
+            "phase2_mcts": req.phase2_mcts.unwrap_or_else(|| json!({}))
+        })
+    };
     let response = ensure_success(
         connection
-            .request(reqwest::Method::POST, "/api/v1/sessions")
+            .request(reqwest::Method::POST, path)
             .json(&body)
             .send()
             .await

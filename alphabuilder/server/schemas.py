@@ -144,6 +144,14 @@ class MctsSettings(_StrictModel):
     mixmax_beta: float = 0.75
 
 
+class SimpSettings(_StrictModel):
+    strategy: Literal["FULL_DOMAIN", "BEZIER"] = "FULL_DOMAIN"
+    target_vol_frac: float = 0.15
+    max_iter: int = 80
+    r_min: float = 1.5
+    seed: int = 42
+
+
 class EpisodeSettings(_StrictModel):
     max_steps: int = 600
     max_phase1_steps: int = 200
@@ -184,6 +192,7 @@ class SessionCreateRequest(_StrictModel):
             mixmax_beta=1.0,
         )
     )
+    simp_config: Optional[SimpSettings] = None
 
 
 class SessionCommandRequest(_StrictModel):

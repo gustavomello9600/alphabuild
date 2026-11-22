@@ -12,17 +12,35 @@ import {
 import { useAppStore } from "../store/useAppStore";
 import { useComputeStore } from "../store/useComputeStore";
 import { formatMilliseconds } from "../lib/formatters";
+import type { ComputeProfile } from "../types/contracts";
 
 export function ComputePopover() {
   const open = useAppStore((state) => state.computeOpen);
   const setOpen = useAppStore((state) => state.setComputeOpen);
   const store = useComputeStore();
   const [harvestUrl, setHarvestUrl] = useState("");
+  const [pythonBin, setPythonBin] = useState("python3");
+  const [port, setPort] = useState(8765);
+  const [draftName, setDraftName] = useState("");
+  const [draftUrl, setDraftUrl] = useState("");
+  const [draftToken, setDraftToken] = useState("");
+  const [draftMode, setDraftMode] = useState<ComputeProfile["mode"]>("remote");
+  const [draftPython, setDraftPython] = useState("python3");
 
   useEffect(() => {
     if (!open) return;
     void store.loadProfiles();
   }, [open]);
+
+  useEffect(() => {
+    const selected = store.profiles.find((profile) => profile.id === store.activeProfileId) ?? store.profiles[0];
+    if (!selected) return;
+    setDraftName(selected.name);
+    setDraftUrl(selected.base_url);
+    setDraftToken(selected.api_token ?? "");
+    setDraftMode(selected.mode);
+    setDraftPython(selected.python_bin ?? "python3");
+  }, [store.profiles, store.activeProfileId]);
 
   useEffect(() => {
     if (!open || !store.connection?.connected) return;
@@ -75,6 +93,68 @@ export function ComputePopover() {
               Nenhum perfil persistido. O aplicativo desktop cria os três perfis padrão.
             </div>
           ) : null}
+          <div className="divider" />
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <div className="panel-heading">
+              <span>Editar perfil</span>
+              <span className="mono">{store.activeProfileId ?? "novo"}</span>
+            </div>
+            <input
+              className="field-input"
+              placeholder="Nome do perfil"
+              value={draftName}
+              onChange={(event) => setDraftName(event.target.value)}
+            />
+            <input
+              className="field-input"
+              placeholder="http://127.0.0.1:8765"
+              value={draftUrl}
+              onChange={(event) => setDraftUrl(event.target.value)}
+            />
+            <input
+              className="field-input"
+              type="password"
+              placeholder="Bearer token (vazio em loopback)"
+              value={draftToken}
+              onChange={(event) => setDraftToken(event.target.value)}
+            />
+            <div style={{ display: "flex", gap: 4 }}>
+              <select
+                className="field-input"
+                value={draftMode}
+                onChange={(event) => setDraftMode(event.target.value as ComputeProfile["mode"])}
+              >
+                <option value="remote">remote</option>
+                <option value="local_sidecar">local_sidecar</option>
+              </select>
+              <input
+                className="field-input"
+                placeholder="python3"
+                value={draftPython}
+                onChange={(event) => setDraftPython(event.target.value)}
+              />
+            </div>
+            <button
+              type="button"
+              className="pill-button"
+              onClick={() => {
+                const id =
+                  store.activeProfileId ??
+                  `profile-${Date.now().toString(36)}`;
+                const profile: ComputeProfile = {
+                  id,
+                  name: draftName || "Novo perfil",
+                  mode: draftMode,
+                  base_url: draftUrl,
+                  api_token: draftToken,
+                  python_bin: draftPython || undefined,
+                };
+                void store.saveProfile(profile);
+              }}
+            >
+              Salvar perfil
+            </button>
+          </div>
         </section>
 
         {store.connection ? (
@@ -124,24 +204,38 @@ export function ComputePopover() {
             </span>
           </div>
           <div style={{ display: "flex", gap: 4 }}>
+            <input
+              className="field-input"
+              style={{ width: 110 }}
+              value={pythonBin}
+              onChange={(event) => setPythonBin(event.target.value)}
+              placeholder="python3"
+            />
+            <input
+              className="field-input"
+              style={{ width: 64 }}
+              type="number"
+              value={port}
+              onChange={(event) => setPort(Number(event.target.value))}
+            />
             <button
               type="button"
               className="pill-button pill-button--accent"
-              onClick={() => void store.startSidecar("python3", 8765)}
+              onClick={() => void store.startSidecar(pythonBin, port)}
             >
               <Play size={12} /> Iniciar
             </button>
             <button
               type="button"
               className="pill-button"
-              onClick={() => void store.stopSidecar(8765)}
+              onClick={() => void store.stopSidecar(port)}
             >
               <Square size={12} /> Parar
             </button>
             <button
               type="button"
               className="icon-button"
-              onClick={() => void store.refreshSidecar(8765)}
+              onClick={() => void store.refreshSidecar(port)}
             >
               <RefreshCw size={12} />
             </button>

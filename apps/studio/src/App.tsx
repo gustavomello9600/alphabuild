@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { Database, FolderOpen } from "lucide-react";
 import { TopBar } from "./components/TopBar";
 import { ViewportCanvas } from "./components/ViewportCanvas";
@@ -18,6 +18,7 @@ import { useInspectorStore } from "./store/useInspectorStore";
 import { useComputeStore } from "./store/useComputeStore";
 import { useCompareStore } from "./store/useCompareStore";
 import { useStudioStore } from "./store/useStudioStore";
+import { parseAbMesh01 } from "./lib/abmesh";
 import { getActiveEngine } from "./lib/engineBus";
 import {
   isTauriRuntime,
@@ -25,8 +26,7 @@ import {
   onSessionProgress,
   onSessionState,
   onSessionStepReady,
-  pickDatabaseFile,
-  openDatabaseFile,
+  sessionGetStepMesh,
 } from "./lib/ipc";
 import type { LensMode } from "./types/contracts";
 
@@ -49,12 +49,11 @@ export default function App() {
   const setExportOpen = useAppStore((state) => state.setExportOpen);
   const setComputeOpen = useAppStore((state) => state.setComputeOpen);
   const metadata = useInspectorStore((state) => state.metadata);
-  const setMode = useAppStore((state) => state.setMode);
   const setComputeConnection = useComputeStore((state) => state.setConnection);
   const loadProfiles = useComputeStore((state) => state.loadProfiles);
   const setSessionStatus = useStudioStore((state) => state.setSessionStatus);
   const setSessionProgress = useStudioStore((state) => state.setSessionProgress);
-  const [dropHint, setDropHint] = useState(false);
+  const setSessionFrame = useStudioStore((state) => state.setSessionFrame);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -71,9 +70,21 @@ export default function App() {
           event.sims_total > 0 ? (event.sims_done / event.sims_total) * 100 : 0,
         );
       }),
-      onSessionStepReady((event) =>
-        setSessionStatus("RUNNING", event.step),
-      ),
+      onSessionStepReady((event) => {
+        setSessionStatus("RUNNING", event.step);
+        setSessionProgress(100);
+        void sessionGetStepMesh(event.session_id, event.step)
+          .then((buffer) => {
+            const parsed = parseAbMesh01(buffer);
+            setSessionFrame(parsed);
+            if (useAppStore.getState().mode === "studio") {
+              getActiveEngine()?.applyFrame(parsed);
+            }
+          })
+          .catch(() => {
+            /* the Tauri bridge will retry via events */
+          });
+      }),
     ];
     return () => {
       void Promise.all(unlisteners).then((callbacks) => callbacks.forEach((fn) => fn()));
@@ -82,6 +93,7 @@ export default function App() {
     loadProfiles,
     setComputeConnection,
     setSessionProgress,
+    setSessionFrame,
     setSessionStatus,
   ]);
 
@@ -187,48 +199,8 @@ export default function App() {
     return () => window.removeEventListener("keydown", handle);
   }, [setComputeOpen, setExportOpen, setFigureMode, setLibraryOpen, setPaletteOpen]);
 
-  useEffect(() => {
-    if (!isTauriRuntime()) return;
-    let disposed = false;
-    let unlisten: (() => void) | null = null;
-    void import("@tauri-apps/api/webview").then(async ({ getCurrentWebview }) => {
-      const unsubscribe = await getCurrentWebview().onDragDropEvent(async (event) => {
-        if (event.payload.type === "enter") setDropHint(true);
-        if (event.payload.type === "leave") setDropHint(false);
-        if (event.payload.type === "drop") {
-          setDropHint(false);
-          const path = event.payload.paths.find((candidate) => candidate.endsWith(".db"));
-          if (!path) return;
-          try {
-            const descriptor = await openDatabaseFile(path);
-            const inspector = useInspectorStore.getState();
-            inspector.closeEntry();
-            setLibraryOpen(true);
-            void descriptor;
-            setMode("inspector");
-          } catch {
-            setLibraryOpen(true);
-          }
-        }
-      });
-      if (disposed) unsubscribe();
-      else unlisten = unsubscribe;
-    });
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, [setLibraryOpen, setMode]);
-
-  async function handleOpenDatabase() {
-    const path = await pickDatabaseFile();
-    if (!path) return;
-    try {
-      await openDatabaseFile(path);
-      setLibraryOpen(true);
-    } catch {
-      setLibraryOpen(true);
-    }
+  function handleOpenDatabase() {
+    setLibraryOpen(true);
   }
 
   const hasEntry = Boolean(metadata);
@@ -245,11 +217,6 @@ export default function App() {
       {mode === "inspector" && hasEntry ? (
         <div className="bottom-dock">
           <LensToolbar />
-          <TimelineDock />
-        </div>
-      ) : null}
-      {mode === "studio" ? (
-        <div className="bottom-dock">
           <TimelineDock />
         </div>
       ) : null}
@@ -304,7 +271,6 @@ export default function App() {
           Sair do Modo TCC (P)
         </button>
       ) : null}
-      {dropHint ? <div className="drop-overlay">Solte o arquivo .db para abrir</div> : null}
       <LibraryDrawer />
       <VoxelTooltip />
       <ExportModal />

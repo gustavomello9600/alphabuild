@@ -410,13 +410,38 @@ async def fem_evaluate(request: Request):
 
 @router.post("/simp/start", status_code=201)
 async def simp_start(request: Request, body: SimpStartRequest) -> dict:
+    ctx = request.app.state.ctx
     if not has_fenics():
         raise ApiError(
             501, "CAPABILITY_UNAVAILABLE", "SIMP requires FEniCSx/fenitop on this host."
         )
     _ensure_not_running(request)
-    raise ApiError(
-        501,
-        "CAPABILITY_UNAVAILABLE",
-        "SIMP streaming requires the fenitop runtime (implemented in the Studio compute worker).",
+    from ..schemas import EpisodeSettings, SessionCreateRequest, SimpSettings
+
+    session_request = SessionCreateRequest(
+        kind="SIMP",
+        resolution=body.resolution,
+        bc_type=body.bc_type,
+        load_config=body.load_config,
+        initial_solid_voxels=[],
+        persist_to_db=False,
+        start_paused=False,
+        include_blueprint=False,
+        allow_neural_only_phase2=True,
+        episode_config=EpisodeSettings(max_steps=body.max_iter, max_phase1_steps=body.max_iter),
+        simp_config=SimpSettings(
+            strategy=body.strategy,
+            target_vol_frac=body.target_vol_frac,
+            max_iter=body.max_iter,
+            r_min=body.r_min,
+            seed=body.seed,
+        ),
     )
+    session = ctx.sessions.create(session_request)
+    return {
+        "session_id": session.session_id,
+        "game_id": session.game_id,
+        "status": session.status,
+        "fem_enabled": True,
+        "ws_url": f"/api/v1/ws/sessions/{session.session_id}",
+    }
