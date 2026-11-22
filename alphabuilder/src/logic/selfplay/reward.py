@@ -5,11 +5,11 @@ Implements an additive reward formula:
   R = compliance_score(C) + volume_bonus(V) - island_penalty
 
 Where:
-- Compliance score uses log10 mapping: C=10→0.80, C=1M→0.00
+- Compliance score uses calibrated v3.3 log10 mapping: C=100→0.80, C=1000→0.45, C>=1e6→-0.60
 - Volume is ALWAYS inversely proportional: lower V = higher reward
 - Island penalty is applied as before
 
-Reference: Updated reward specification (Dec 2024)
+Reference: Calibrated on v3.3 100-episode Pilot (Nov 2026)
 """
 
 import numpy as np
@@ -17,18 +17,18 @@ from typing import Optional, Tuple, Dict, Any
 from scipy import ndimage
 
 # =============================================================================
-# New Formula Constants
+# New Formula Constants (Calibrated v3.3)
 # =============================================================================
 
-# Compliance scoring (log10 mapping)
-COMPLIANCE_BASE = 0.80       # Base score at C=10 (log10(10)=1)
-COMPLIANCE_SLOPE = 0.16      # Score decrease per log10 unit
-COMPLIANCE_MIN = -0.50       # Minimum compliance score (very bad structure)
-COMPLIANCE_MAX = 0.85        # Maximum compliance score (excellent structure)
+# Compliance scoring (log10 mapping, calibrated on Pilot Phase-2 p10..p90=[2.30, 3.84])
+COMPLIANCE_BASE = 1.15       # Calibrated v3.3: C=100 (log10=2) -> 0.80, C=1000 (log10=3) -> 0.45
+COMPLIANCE_SLOPE = 0.35      # Score decrease per log10 unit
+COMPLIANCE_MIN = -0.60       # Minimum compliance score (C >= 1e6)
+COMPLIANCE_MAX = 0.90        # Maximum compliance score (very stiff structures)
 
 # Volume scoring (always inversely proportional)
 VOLUME_REFERENCE = 0.10      # Reference volume (V=0.10 gives no bonus/penalty)
-VOLUME_SENSITIVITY = 2.0     # Bonus/penalty per 0.1 volume change
+VOLUME_SENSITIVITY = 2.5     # Bonus/penalty per 0.1 volume change (V=0.15 -> -0.125)
 VOLUME_BONUS_MAX = 0.30      # Max bonus for very low V
 VOLUME_PENALTY_MAX = 0.60    # Max penalty for very high V
 
@@ -51,15 +51,16 @@ INITIAL_CANTILEVER_PROBLEM_REAL_SCALE_FACTOR = 500000.0
 
 def calculate_compliance_score(compliance: float) -> float:
     """
-    Calculate the compliance component of the reward using log10 mapping.
-    
-    Mapping:
-    - C=10 (log10=1) → 0.80
-    - C=1,000,000 (log10=6) → 0.00
-    
+    Calculate the compliance component of the reward using calibrated log10 mapping.
+
+    Mapping (v3.3):
+    - C=100 (log10=2) → 0.80
+    - C=1,000 (log10=3) → 0.45
+    - C=1,000,000 (log10=6) → -0.60
+
     Args:
         compliance: Energy of deformation (Joules). Lower is better.
-        
+
     Returns:
         Compliance score in [COMPLIANCE_MIN, COMPLIANCE_MAX]
     """

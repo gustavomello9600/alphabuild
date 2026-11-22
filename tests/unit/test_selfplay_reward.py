@@ -27,38 +27,40 @@ from alphabuilder.src.logic.selfplay.reward import (
 class TestRewardFunctions:
 
     def test_calculate_compliance_score(self):
-        """Test log10-based compliance scoring."""
-        # C=10 (log10=1) should give 0.80
-        assert calculate_compliance_score(10) == pytest.approx(0.80, abs=0.01)
-        # C=1000 (log10=3) should give 0.48
-        assert calculate_compliance_score(1000) == pytest.approx(0.48, abs=0.01)
-        # C=1M (log10=6) should give 0.00
-        assert calculate_compliance_score(1_000_000) == pytest.approx(0.00, abs=0.01)
+        """Test calibrated v3.3 log10-based compliance scoring."""
+        # C=10 (log10=1) -> clipped to COMPLIANCE_MAX=0.90
+        assert calculate_compliance_score(10) == pytest.approx(0.90, abs=0.01)
+        # C=100 (log10=2) -> 0.80
+        assert calculate_compliance_score(100) == pytest.approx(0.80, abs=0.01)
+        # C=1000 (log10=3) -> 0.45
+        assert calculate_compliance_score(1000) == pytest.approx(0.45, abs=0.01)
+        # C=1M (log10=6) -> -0.60
+        assert calculate_compliance_score(1_000_000) == pytest.approx(-0.60, abs=0.01)
         # C=0 or negative should return max score
-        assert calculate_compliance_score(0) == pytest.approx(0.85, abs=0.01)
+        assert calculate_compliance_score(0) == pytest.approx(0.90, abs=0.01)
 
     def test_calculate_volume_bonus(self):
         """Test volume bonus/penalty calculation."""
         # V=0.10 (reference) should give 0.0
         assert calculate_volume_bonus(0.10) == pytest.approx(0.0, abs=0.01)
-        # V=0.05 should give +0.10 bonus
-        assert calculate_volume_bonus(0.05) == pytest.approx(0.10, abs=0.01)
-        # V=0.20 should give -0.20 penalty
-        assert calculate_volume_bonus(0.20) == pytest.approx(-0.20, abs=0.01)
+        # V=0.05 should give +0.125 bonus
+        assert calculate_volume_bonus(0.05) == pytest.approx(0.125, abs=0.01)
+        # V=0.20 should give -0.25 penalty
+        assert calculate_volume_bonus(0.20) == pytest.approx(-0.25, abs=0.01)
 
     def test_calculate_reward_targets(self):
-        """Test that reward matches user targets at V=0.1."""
+        """Test that reward matches calibrated v3.3 targets at V=0.1."""
         targets = [
-            (10, 0.80),
-            (100, 0.70),
-            (1000, 0.50),
-            (10000, 0.30),
-            (100000, 0.10),
-            (1000000, 0.00)
+            (10, 0.90),
+            (100, 0.80),
+            (1000, 0.45),
+            (10000, 0.10),
+            (100000, -0.25),
+            (1000000, -0.60),
         ]
         for compliance, target in targets:
             reward = calculate_reward(compliance, 0.1, is_valid=True)
-            assert reward == pytest.approx(target, abs=0.10), f"C={compliance} failed"
+            assert reward == pytest.approx(target, abs=0.02), f"C={compliance} failed"
 
     def test_calculate_reward_volume_monotonic(self):
         """Lower volume should ALWAYS give higher reward."""
@@ -96,10 +98,10 @@ class TestRewardFunctions:
         assert reason == "MAX_STEPS_REACHED"
 
     def test_legacy_raw_score(self):
-        """Test legacy raw score for backward compatibility."""
+        """Test raw score matches calibrated compliance + volume sum."""
         compliance = 0.5
         vol_frac = 0.2
-        expected_score = -np.log(compliance) - ALPHA_VOL * vol_frac
+        expected_score = calculate_compliance_score(compliance) + calculate_volume_bonus(vol_frac)
         assert calculate_raw_score(compliance, vol_frac) == pytest.approx(expected_score)
 
 class TestIslandAnalysis:
