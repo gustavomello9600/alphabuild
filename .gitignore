@@ -27,11 +27,24 @@ dist/
 .npm/
 alphabuilder/web/node_modules/
 alphabuilder/web/dist/
+apps/studio/node_modules/
+apps/studio/dist/
+
+# Rust / Tauri (manter Cargo.lock versionado para builds reproduzíveis!)
+target/
+apps/studio/src-tauri/target/
+apps/studio/src-tauri/gen/schemas/
 
 # Data
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.sqlite
 data/*.db
+
+# OS / Misc
+Thumbs.db
 
 # Coverage
 .coverage
