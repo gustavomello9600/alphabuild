@@ -288,7 +288,13 @@ function CompareSync() {
   const entryId = useInspectorStore((state) => state.entryId);
   const mode = useAppStore((state) => state.mode);
   useEffect(() => {
-    if (mode === "compare" && source && entryId && inspectorMetadata) {
+    if (
+      mode === "compare" &&
+      source &&
+      entryId &&
+      inspectorMetadata &&
+      !useCompareStore.getState().slotA
+    ) {
       setSlot("a", { source, entryId, metadata: inspectorMetadata });
     }
   }, [mode, source, entryId, inspectorMetadata, setSlot]);

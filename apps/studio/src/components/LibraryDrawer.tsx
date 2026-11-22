@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { useAppStore } from "../store/useAppStore";
 import { useInspectorStore } from "../store/useInspectorStore";
+import { useCompareStore } from "../store/useCompareStore";
 import {
   getEntryMetadata,
   isTauriRuntime,
@@ -37,6 +38,8 @@ function sourceOf(descriptor: DatabaseDescriptor): DataSourceRef {
 
 export function LibraryDrawer() {
   const open = useAppStore((state) => state.libraryOpen);
+  const mode = useAppStore((state) => state.mode);
+  const activeSlot = useCompareStore((state) => state.activeSlot);
   const setOpen = useAppStore((state) => state.setLibraryOpen);
   const setMode = useAppStore((state) => state.setMode);
   const [databases, setDatabases] = useState<DatabaseDescriptor[]>([]);
@@ -61,7 +64,13 @@ export function LibraryDrawer() {
 
   useEffect(() => {
     void refreshDatabases();
-  }, [refreshDatabases]);
+    const handle = () => {
+      void refreshDatabases();
+      setOpen(true);
+    };
+    window.addEventListener("ab://library-refresh", handle);
+    return () => window.removeEventListener("ab://library-refresh", handle);
+  }, [refreshDatabases, setOpen]);
 
   useEffect(() => {
     let disposed = false;
@@ -135,6 +144,12 @@ export function LibraryDrawer() {
     try {
       const source = sourceOf(selected);
       const metadata = await getEntryMetadata(source, entry.entry_id);
+      if (mode === "compare") {
+        const compare = useCompareStore.getState();
+        compare.setSlot(compare.activeSlot, { source, entryId: entry.entry_id, metadata });
+        setOpen(false);
+        return;
+      }
       useInspectorStore.getState().openEntry(source, entry.entry_id, metadata);
       setMode("inspector");
       setOpen(false);
@@ -151,6 +166,11 @@ export function LibraryDrawer() {
         <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
           <LibraryGlyph />
           <span className="dock-title">Biblioteca de Dados</span>
+          {mode === "compare" ? (
+            <span className="badge" data-tone="accent">
+              SLOT {activeSlot.toUpperCase()}
+            </span>
+          ) : null}
         </div>
         <button
           type="button"

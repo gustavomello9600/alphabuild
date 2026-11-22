@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import {
   Box,
   Camera,
+  Cpu,
+  Database,
   Download,
   Ghost,
   Library,
@@ -12,8 +14,12 @@ import {
   Sun,
 } from "lucide-react";
 import { useAppStore } from "../store/useAppStore";
+import { useComputeStore } from "../store/useComputeStore";
+import { useCompareStore } from "../store/useCompareStore";
 import { useInspectorStore } from "../store/useInspectorStore";
 import { getActiveEngine } from "../lib/engineBus";
+import { isTauriRuntime, listLocalDatabases, openDatabaseFile } from "../lib/ipc";
+import type { DatabaseDescriptor } from "../types/contracts";
 
 interface Command {
   id: string;
@@ -28,6 +34,7 @@ export function CommandPalette() {
   const setOpen = useAppStore((state) => state.setPaletteOpen);
   const setMode = useAppStore((state) => state.setMode);
   const toggleLibrary = useAppStore((state) => state.toggleLibrary);
+  const setLibraryOpen = useAppStore((state) => state.setLibraryOpen);
   const setExportOpen = useAppStore((state) => state.setExportOpen);
   const toggleTheme = useAppStore((state) => state.toggleTheme);
   const setFigureMode = useAppStore((state) => state.setFigureMode);
@@ -39,6 +46,22 @@ export function CommandPalette() {
   const setRho = useInspectorStore((state) => state.setUseRhoCont);
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
+  const [databases, setDatabases] = useState<DatabaseDescriptor[]>([]);
+  const profiles = useComputeStore((state) => state.profiles);
+  const models = useComputeStore((state) => state.models);
+  const activateProfile = useComputeStore((state) => state.activateProfile);
+  const loadModel = useComputeStore((state) => state.loadModel);
+  const setCompareSlot = useCompareStore((state) => state.setActiveSlot);
+
+  useEffect(() => {
+    if (!open || !isTauriRuntime()) return;
+    void listLocalDatabases()
+      .then(setDatabases)
+      .catch(() => setDatabases([]));
+    const compute = useComputeStore.getState();
+    void compute.loadProfiles();
+    if (compute.connection?.connected) void compute.loadModels();
+  }, [open]);
 
   const commands = useMemo<Command[]>(() => {
     const list: Command[] = [
@@ -127,6 +150,64 @@ export function CommandPalette() {
         run: () => setLens("strain"),
       },
     ];
+    for (const database of databases) {
+      list.push({
+        id: `db-${database.db_id}`,
+        label: `Abrir banco: ${database.name}`,
+        hint: database.kind,
+        icon: Database,
+        run: () => {
+          void openDatabaseFile(database.db_id)
+            .then(() => {
+              window.dispatchEvent(new CustomEvent("ab://library-refresh"));
+              setLibraryOpen(true);
+            })
+            .catch(() => setLibraryOpen(true));
+        },
+      });
+    }
+    for (const profile of profiles) {
+      list.push({
+        id: `profile-${profile.id}`,
+        label: `Ativar compute: ${profile.name}`,
+        hint: profile.base_url,
+        icon: Cpu,
+        run: () => void activateProfile(profile.id),
+      });
+    }
+    for (const model of models) {
+      list.push({
+        id: `model-${model.model_id}`,
+        label: `Carregar checkpoint: ${model.model_id}`,
+        hint: `${model.size_mb.toFixed(1)} MB`,
+        icon: Cpu,
+        run: () => void loadModel(model.model_id),
+      });
+    }
+    list.push(
+      {
+        id: "compare-slot-a",
+        label: "Comparador: carregar Slot A",
+        hint: "A/B",
+        icon: Box,
+        run: () => {
+          setMode("compare");
+          setCompareSlot("a");
+          setLibraryOpen(true);
+        },
+      },
+      {
+        id: "compare-slot-b",
+        label: "Comparador: carregar Slot B",
+        hint: "A/B",
+        icon: Box,
+        run: () => {
+          setMode("compare");
+          setCompareSlot("b");
+          setLibraryOpen(true);
+        },
+      },
+    );
     if (metadata) {
       list.push(
         {
@@ -172,6 +253,13 @@ export function CommandPalette() {
     setStep,
     setBlueprint,
     setRho,
+    databases,
+    profiles,
+    models,
+    activateProfile,
+    loadModel,
+    setCompareSlot,
+    setLibraryOpen,
   ]);
 
   const filtered = commands.filter((command) =>

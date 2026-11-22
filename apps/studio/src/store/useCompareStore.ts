@@ -20,13 +20,19 @@ interface CompareStore {
   stepB: number;
   normalized: boolean;
   syncCamera: boolean;
+  linkMode: "index" | "normalized";
+  fraction: number;
+  activeSlot: "a" | "b";
   metrics: ComparisonMetrics | null;
   loading: boolean;
   error: string | null;
   setSlot: (slot: "a" | "b", value: CompareSlot | null) => void;
   setStep: (slot: "a" | "b", step: number) => void;
+  setLinkedStep: (value: number) => void;
+  setFraction: (value: number) => void;
   setNormalized: (value: boolean) => void;
   setSyncCamera: (value: boolean) => void;
+  setActiveSlot: (slot: "a" | "b") => void;
   compare: () => Promise<void>;
 }
 
@@ -37,6 +43,9 @@ export const useCompareStore = create<CompareStore>((set, get) => ({
   stepB: 0,
   normalized: false,
   syncCamera: true,
+  linkMode: "index",
+  fraction: 0,
+  activeSlot: "a",
   metrics: null,
   loading: false,
   error: null,
@@ -52,8 +61,33 @@ export const useCompareStore = create<CompareStore>((set, get) => ({
     if (slot === "a") set({ stepA: clamped });
     else set({ stepB: clamped });
   },
-  setNormalized: (normalized) => set({ normalized }),
+  setLinkedStep: (value) => {
+    const state = get();
+    const maxA = state.slotA ? Math.max(0, state.slotA.metadata.total_steps - 1) : 0;
+    const maxB = state.slotB ? Math.max(0, state.slotB.metadata.total_steps - 1) : 0;
+    if (state.linkMode === "normalized") {
+      const fraction = Math.min(1, Math.max(0, value));
+      set({
+        fraction,
+        stepA: Math.round(fraction * maxA),
+        stepB: Math.round(fraction * maxB),
+      });
+    } else {
+      const step = Math.min(Math.max(maxA, maxB), Math.max(0, Math.round(value)));
+      set({ stepA: Math.min(step, maxA), stepB: Math.min(step, maxB) });
+    }
+  },
+  setFraction: (value) => {
+    const state = get();
+    const fraction = Math.min(1, Math.max(0, value));
+    const maxA = state.slotA ? Math.max(0, state.slotA.metadata.total_steps - 1) : 0;
+    const maxB = state.slotB ? Math.max(0, state.slotB.metadata.total_steps - 1) : 0;
+    set({ fraction, stepA: Math.round(fraction * maxA), stepB: Math.round(fraction * maxB) });
+  },
+  setNormalized: (normalized) =>
+    set({ normalized, linkMode: normalized ? "normalized" : "index" }),
   setSyncCamera: (syncCamera) => set({ syncCamera }),
+  setActiveSlot: (activeSlot) => set({ activeSlot }),
   compare: async () => {
     const state = get();
     if (!state.slotA || !state.slotB) {
