@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 import json
 
+from alphabuilder.src.logic.storage import (
+    deserialize_array as _storage_deserialize_array,
+    deserialize_sparse as _storage_deserialize_sparse,
+)
 from alphabuilder.src.neural.augmentation import (
     rotate_90_z, flip_y, random_pad_to_target, erosion_attack, 
     load_multiplier, sabotage, saboteur
@@ -29,32 +33,13 @@ def sparse_decode(indices: np.ndarray, values: np.ndarray, shape: tuple) -> np.n
 
 
 def deserialize_sparse(blob: bytes) -> Tuple[np.ndarray, np.ndarray]:
-    """Deserialize sparse arrays from compressed bytes."""
-    data = pickle.loads(zlib.decompress(blob))
-    n = data['n']
-    indices = np.frombuffer(data['indices'], dtype=np.int32).copy()[:n]
-    values = np.frombuffer(data['values'], dtype=np.float32).copy()[:n]
-    return indices, values
+    """Deserialize sparse arrays from compressed bytes (COO1 and legacy pickle)."""
+    return _storage_deserialize_sparse(blob)
 
 
 def deserialize_array(blob: bytes) -> np.ndarray:
-    """
-    Deserialize numpy array from compressed bytes.
-    
-    Supports both formats:
-    - New: np.save format (Kaggle-compatible, version independent)
-    - Old: pickle format (legacy, NumPy version dependent)
-    """
-    decompressed = zlib.decompress(blob)
-    
-    # Try np.load format first (starts with numpy magic bytes)
-    if decompressed[:6] == b'\x93NUMPY':
-        import io
-        buffer = io.BytesIO(decompressed)
-        return np.load(buffer, allow_pickle=False)
-    
-    # Fall back to pickle format (legacy)
-    return pickle.loads(decompressed)
+    """Deserialize numpy array from compressed bytes (.npy and legacy pickle)."""
+    return _storage_deserialize_array(blob)
 
 
 def deserialize_state_legacy(blob: bytes) -> np.ndarray:
@@ -156,7 +141,7 @@ class TopologyDatasetV31(Dataset):
             
             if self.preload_to_ram:
                 # Decode everything now
-                density = deserialize_array(density_blob)
+                density = deserialize_array(density_blob).astype(np.float32)
                 
                 # Decode sparse policy
                 if add_blob:
@@ -311,13 +296,13 @@ class TopologyDatasetV31(Dataset):
             """, (ep_id, step))
             row = cursor.fetchone()
             
-            density = deserialize_array(row[0])
+            density = deserialize_array(row[0]).astype(np.float32)
             
             # Load episode info
             cursor.execute("SELECT bc_masks_blob, forces_blob, resolution FROM episodes WHERE episode_id = ?", (ep_id,))
             ep_row = cursor.fetchone()
-            bc_masks = deserialize_array(ep_row[0])
-            forces = deserialize_array(ep_row[1])
+            bc_masks = deserialize_array(ep_row[0]).astype(np.float32)
+            forces = deserialize_array(ep_row[1]).astype(np.float32)
             resolution = tuple(json.loads(ep_row[2]))
             
             state = np.concatenate([density[None], bc_masks, forces], axis=0).astype(np.float32)

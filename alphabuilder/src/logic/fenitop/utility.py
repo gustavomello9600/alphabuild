@@ -53,8 +53,67 @@ def create_mechanism_vectors(func_space, in_spring, out_spring):
     return spring_vec, l_vec
 
 
+def _create_rbm_near_nullspace(u_func):
+    """Build 6 orthonormal 3D rigid-body modes for AMG elasticity preconditioning."""
+    V = u_func.function_space
+    comm = V.mesh.comm
+    n_local = V.dofmap.index_map.size_local
+    coords = V.tabulate_dof_coordinates()[:n_local]
+    x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
+    ones = np.ones(n_local, dtype=np.float64)
+    zeros = np.zeros(n_local, dtype=np.float64)
+
+    modes = [
+        np.column_stack([ones, zeros, zeros]),
+        np.column_stack([zeros, ones, zeros]),
+        np.column_stack([zeros, zeros, ones]),
+        np.column_stack([-y, x, zeros]),
+        np.column_stack([z, zeros, -x]),
+        np.column_stack([zeros, -z, y]),
+    ]
+
+    basis = []
+    for m in modes:
+        pv = u_func.x.petsc_vec.duplicate()
+        arr = pv.getArray()
+        arr[:] = m.ravel()
+        pv.assemble()
+        for b in basis:
+            alpha = pv.dot(b)
+            pv.axpy(-alpha, b)
+        norm = pv.norm()
+        if norm > 1e-12:
+            pv.scale(1.0 / norm)
+            basis.append(pv)
+        else:
+            pv.destroy()
+
+    return PETSc.NullSpace().create(vectors=basis, comm=comm)
+
+
+def _create_translation_nullspace(u_func, axes):
+    """Build orthonormal global rigid-body translation nullspace vectors along given axes."""
+    V = u_func.function_space
+    comm = V.mesh.comm
+    bs = V.dofmap.index_map_bs
+    basis = []
+    for axis in axes:
+        pv = u_func.x.petsc_vec.duplicate()
+        pv.set(0.0)
+        arr = pv.getArray()
+        arr[int(axis)::bs] = 1.0
+        pv.assemble()
+        norm = pv.norm()
+        if norm > 1e-12:
+            pv.scale(1.0 / norm)
+            basis.append(pv)
+        else:
+            pv.destroy()
+    return PETSc.NullSpace().create(vectors=basis, comm=comm)
+
+
 class LinearProblem:
-    def __init__(self, u, lam, lhs, rhs, l_vec, spring_vec, bcs=[], petsc_options={}):
+    def __init__(self, u, lam, lhs, rhs, l_vec, spring_vec, bcs=[], petsc_options={}, nullspace_axes=None):
         """Initialize a linear problem."""
         # Safe initialization for __del__
         self.solver = None
@@ -62,6 +121,8 @@ class LinearProblem:
         self.rhs_vec = None
         self.spring_vec = None
         self.l_vec = None
+        self.near_nullspace = None
+        self.nullspace = None
         
         # Initialization
         self.u, self.lam = u, lam
@@ -71,6 +132,14 @@ class LinearProblem:
         
         self.lhs_form, self.rhs_form = form(lhs), form(rhs)
         self.lhs_mat = create_matrix(self.lhs_form)
+
+        if self.u.function_space.dofmap.index_map_bs == 3:
+            self.near_nullspace = _create_rbm_near_nullspace(self.u)
+            self.lhs_mat.setNearNullSpace(self.near_nullspace)
+
+        if nullspace_axes:
+            self.nullspace = _create_translation_nullspace(self.u, nullspace_axes)
+            self.lhs_mat.setNullSpace(self.nullspace)
         
         # In dolfinx v0.8, assemble_vector(form) creates and returns the vector
         self.rhs_vec = assemble_vector(self.rhs_form)
@@ -98,6 +167,8 @@ class LinearProblem:
         # assemble_vector already assembled it, just update ghosts and apply BCs
         self.rhs_vec.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
         set_bc(self.rhs_vec, self.bcs)
+        if self.nullspace is not None:
+            self.nullspace.remove(self.rhs_vec)
 
     def solve_fem(self):
         """Solve K*x=F for FEM."""
@@ -107,11 +178,29 @@ class LinearProblem:
         if self.spring_vec is not None:
             self.lhs_mat.setDiagonal(self.lhs_mat.getDiagonal()+self.spring_vec)
         self.solver.solve(self.rhs_vec, self.u_wrap)
+        reason = self.solver.getConvergedReason()
+        if reason < 0:
+            orig_type = self.solver.getType()
+            if orig_type != PETSc.KSP.Type.GMRES:
+                self.solver.setType(PETSc.KSP.Type.GMRES)
+                self.solver.solve(self.rhs_vec, self.u_wrap)
+                fallback_reason = self.solver.getConvergedReason()
+                self.solver.setType(orig_type)
+                if self.u.function_space.mesh.comm.rank == 0:
+                    print(
+                        f"  WARNING: KSP {orig_type} diverged (reason={reason}); "
+                        f"GMRES fallback reason={fallback_reason}",
+                        flush=True,
+                    )
+        if self.nullspace is not None:
+            self.nullspace.remove(self.u_wrap)
         self.u.x.scatter_forward()
 
     def solve_adjoint(self):
         """Solve K*lambda=-L for the adjoint equation."""
         self.solver.solve(-self.l_vec, self.lam_wrap)
+        if self.nullspace is not None:
+            self.nullspace.remove(self.lam_wrap)
         self.lam.x.scatter_forward()
 
     def __del__(self):

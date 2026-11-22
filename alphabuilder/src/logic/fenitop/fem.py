@@ -89,22 +89,16 @@ def form_fem(fem, opt):
                 bc_val = Constant(mesh, np.array(value, dtype=float))
                 bcs.append(dirichletbc(bc_val, dofs, V))
             else:
-                # Apply to specific component (subspace)
-                # We need to collapse the subspace to get the correct V.sub(i)
-                V_sub, _ = V.sub(subspace_idx).collapse()
-                dofs_sub = locate_dofs_topological((V.sub(subspace_idx), V_sub), fdim, facets)
-                
-                # locate_dofs_topological returns a list [dofs_in_V] when passed a tuple
-                dofs_array = dofs_sub[0]
-                
-                # Handle value: if it's a scalar, use it directly. If it's a vector/list, pick component.
-                if np.isscalar(value) or isinstance(value, float) or isinstance(value, int):
+                # Apply scalar Constant to specific component subspace V.sub(subspace_idx)
+                dofs_sub = locate_dofs_topological(V.sub(subspace_idx), fdim, facets)
+
+                if np.isscalar(value) or isinstance(value, (float, int)):
                     scalar_val = value
                 else:
                     scalar_val = value[subspace_idx]
-                    
-                bc_const = Constant(mesh, float(scalar_val)) # Ensure float type
-                bcs.append(dirichletbc(bc_const, dofs_array, V.sub(subspace_idx)))
+
+                bc_const = Constant(mesh, float(scalar_val))
+                bcs.append(dirichletbc(bc_const, dofs_sub, V.sub(subspace_idx)))
 
     # Fallback to old 'disp_bc' if 'bcs' not present (Legacy FEniTop support)
     elif "disp_bc" in fem:
@@ -148,7 +142,8 @@ def form_fem(fem, opt):
         spring_vec, opt["l_vec"] = create_mechanism_vectors(
             V, opt["in_spring"], opt["out_spring"])
     linear_problem = LinearProblem(u_field, lambda_field, lhs, rhs, opt["l_vec"],
-                                   spring_vec, bcs, fem["petsc_options"])
+                                   spring_vec, bcs, fem["petsc_options"],
+                                   nullspace_axes=fem.get("nullspace_axes"))
 
     # Define optimization-related variables
     opt["f_int"] = ufl.inner(sigma(u_field), epsilon(v))*dx

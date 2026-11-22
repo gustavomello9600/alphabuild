@@ -1,6 +1,7 @@
 """
 FEniTop Integration for Topology Optimization.
 """
+import sys
 import numpy as np
 from typing import List, Dict, Any, Tuple
 from tqdm import tqdm
@@ -13,14 +14,31 @@ from dolfinx.fem import functionspace
 from alphabuilder.src.core.physics_model import PhysicalProperties
 from alphabuilder.src.logic.fenitop.topopt import topopt
 from alphabuilder.src.logic.harvest.config import SIMPConfig
+from alphabuilder.src.logic.harvest.generators import get_load_region_bounds
 from alphabuilder.src.logic.selfplay.reward import calculate_fem_score
+
+
+def _cg1_nodal_to_cell_mean(nodal_grid: np.ndarray) -> np.ndarray:
+    """Average 8 hexahedral corner nodal values to produce exact cell-wise (nx, ny, nz) grid."""
+    return 0.125 * (
+        nodal_grid[:-1, :-1, :-1]
+        + nodal_grid[1:, :-1, :-1]
+        + nodal_grid[:-1, 1:, :-1]
+        + nodal_grid[:-1, :-1, 1:]
+        + nodal_grid[1:, 1:, :-1]
+        + nodal_grid[1:, :-1, 1:]
+        + nodal_grid[:-1, 1:, 1:]
+        + nodal_grid[1:, 1:, 1:]
+    )
+
 
 def run_fenitop_optimization(
     resolution: Tuple[int, int, int],
     props: PhysicalProperties,
     simp_config: SIMPConfig,
     initial_density: np.ndarray = None,
-    strategy: str = 'BEZIER'
+    strategy: str = 'BEZIER',
+    record_displacement_map: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Run Topology Optimization using FEniTop Core.
@@ -59,11 +77,24 @@ def run_fenitop_optimization(
         
         grid_mapper = (x_idx, y_idx, z_idx)
     
-    # --- Load Configuration ---
+    # --- Load & BC Configuration ---
     load_cfg = simp_config.load_config
-    load_y_center = float(load_cfg['y'])
-    load_z_center = (float(load_cfg['z_start']) + float(load_cfg['z_end'])) / 2.0
-    load_half_width = 1.0
+    lx, y_min, y_max, z_min, z_max = get_load_region_bounds(resolution, load_cfg)
+    bc_type = str(load_cfg.get('bc_type', 'FULL_CLAMP')).upper()
+
+    if bc_type == 'RAIL_XY':
+        # X and Y fixed at X=0; Z remains free (sliding rail) with explicit rigid-body TZ nullspace
+        bcs = [
+            (0.0, lambda x: np.isclose(x[0], 0.0), 0),
+            (0.0, lambda x: np.isclose(x[0], 0.0), 1),
+        ]
+        nullspace_axes = (2,)
+    else:
+        # FULL_CLAMP: all 3 displacement DOFs fixed at X=0
+        bcs = [
+            ([0.0, 0.0, 0.0], lambda x: np.isclose(x[0], 0.0), None),
+        ]
+        nullspace_axes = None
     
     # --- FEM Parameters ---
     fem = {
@@ -71,14 +102,15 @@ def run_fenitop_optimization(
         "mesh_serial": mesh_serial,
         "young's modulus": 100,
         "poisson's ratio": 0.25,
-        "disp_bc": lambda x: np.isclose(x[0], 0),
+        "bcs": bcs,
+        "nullspace_axes": nullspace_axes,
         "traction_bcs": [],
         "body_force": lambda x: np.stack([
             np.zeros(x.shape[1]),
-            -2.0 * (
-                (x[0] >= float(load_cfg['x'])) & (x[0] <= float(load_cfg['x']) + 1.0) &
-                (x[1] >= load_y_center - load_half_width - 0.5) & (x[1] <= load_y_center + load_half_width + 0.5) &
-                (x[2] >= load_z_center - load_half_width - 0.5) & (x[2] <= load_z_center + load_half_width + 0.5)
+            -1.125 * (
+                (x[0] >= float(lx) - 1e-6) & (x[0] <= float(lx + 1) + 1e-6) &
+                (x[1] >= float(y_min) - 1e-6) & (x[1] <= float(y_max) + 1e-6) &
+                (x[2] >= float(z_min) - 1e-6) & (x[2] <= float(z_max) + 1e-6)
             ),
             np.zeros(x.shape[1])
         ]),
@@ -86,11 +118,14 @@ def run_fenitop_optimization(
         "petsc_options": {
             "ksp_type": "cg",
             "pc_type": "gamg",
-            "ksp_rtol": 1e-4,
-            "ksp_max_it": 1000,
+            "ksp_rtol": 1e-5,
+            "ksp_max_it": 500,
             "pc_gamg_type": "agg",
             "pc_gamg_agg_nsmooths": 1,
-            "pc_gamg_threshold": 0.01,
+            "pc_gamg_threshold": 0.02,
+            "mg_levels_ksp_type": "chebyshev",
+            "mg_levels_pc_type": "sor",
+            "mg_levels_pc_sor_symmetric": None,
         },
     }
     
@@ -110,7 +145,11 @@ def run_fenitop_optimization(
         "max_iter": max_iter,
         "opt_tol": 1e-4,
         "vol_frac": simp_config.vol_frac,
-        "solid_zone": lambda x: np.full(x.shape[1], False),
+        "solid_zone": lambda x: (
+            (x[0] >= float(lx)) & (x[0] <= float(lx + 1)) &
+            (x[1] >= float(y_min)) & (x[1] <= float(y_max)) &
+            (x[2] >= float(z_min)) & (x[2] <= float(z_max))
+        ),
         "void_zone": lambda x: np.full(x.shape[1], False),
         "penalty": 3.0,
         "epsilon": 1e-6,
@@ -126,7 +165,13 @@ def run_fenitop_optimization(
     history = []
     pbar = None
     if comm.rank == 0:
-        pbar = tqdm(total=max_iter, desc="SIMP", leave=False, unit="it")
+        pbar = tqdm(
+            total=max_iter,
+            desc="SIMP",
+            leave=False,
+            unit="it",
+            disable=not sys.stderr.isatty(),
+        )
     
     def record_step(data):
         if comm.rank == 0:
@@ -135,21 +180,32 @@ def run_fenitop_optimization(
             if grid_mapper is None:
                 rho_3d = np.full((nx, ny, nz), simp_config.vol_frac, dtype=np.float32)
             elif len(rho_flat) != len(grid_mapper[0]):
-                print(f"  WARNING: Size mismatch in record_step")
+                print("  WARNING: Size mismatch in record_step")
                 rho_3d = np.full((nx, ny, nz), simp_config.vol_frac, dtype=np.float32)
             else:
-                rho_nodal = np.zeros((nx+1, ny+1, nz+1), dtype=np.float32)
+                rho_nodal = np.zeros((nx + 1, ny + 1, nz + 1), dtype=np.float32)
                 rho_nodal[grid_mapper[0], grid_mapper[1], grid_mapper[2]] = rho_flat
-                rho_3d = rho_nodal[:-1, :-1, :-1]
+                rho_3d = _cg1_nodal_to_cell_mean(rho_nodal).astype(np.float32)
                 
-            # Process displacement map if available
+            # Process displacement magnitude without truncating free boundary nodes
+            max_disp = 0.0
             disp_3d = None
             if 'displacement_map' in data and data['displacement_map'] is not None:
                 disp_flat = data['displacement_map']
-                if grid_mapper is not None and len(disp_flat) == len(grid_mapper[0]):
-                    disp_nodal = np.zeros((nx+1, ny+1, nz+1), dtype=np.float32)
+                max_disp = float(np.max(disp_flat)) if len(disp_flat) > 0 else 0.0
+                if record_displacement_map and grid_mapper is not None and len(disp_flat) == len(grid_mapper[0]):
+                    disp_nodal = np.zeros((nx + 1, ny + 1, nz + 1), dtype=np.float32)
                     disp_nodal[grid_mapper[0], grid_mapper[1], grid_mapper[2]] = disp_flat
-                    disp_3d = disp_nodal[:-1, :-1, :-1]
+                    disp_3d = np.maximum.reduce([
+                        disp_nodal[:-1, :-1, :-1],
+                        disp_nodal[1:, :-1, :-1],
+                        disp_nodal[:-1, 1:, :-1],
+                        disp_nodal[:-1, :-1, 1:],
+                        disp_nodal[1:, 1:, :-1],
+                        disp_nodal[1:, :-1, 1:],
+                        disp_nodal[:-1, 1:, 1:],
+                        disp_nodal[1:, 1:, 1:],
+                    ]).astype(np.float32)
 
             # Calculate metrics
             cur_iter = data['iter']
@@ -163,6 +219,7 @@ def run_fenitop_optimization(
                 'density_map': rho_3d,
                 'compliance': comp,
                 'vol_frac': vol,
+                'max_displacement': max_disp,
                 'fem_score': fem_score,
                 'mixing_factor': mixing_factor,
                 'displacement_map': disp_3d,
@@ -181,7 +238,7 @@ def run_fenitop_optimization(
 
     # --- Run Optimization ---
     if comm.rank == 0:
-        print(f"  FEniTop: iter={max_iter}, V={simp_config.vol_frac:.2f}, r={filter_r:.1f}, strategy={strategy}")
+        print(f"  FEniTop: iter={max_iter}, V={simp_config.vol_frac:.2f}, r={filter_r:.1f}, strategy={strategy}, bc={bc_type}")
     topopt(fem, opt, initial_density=initial_density, callback=record_step)
     
     if comm.rank == 0 and pbar:

@@ -39,3 +39,13 @@ NORMALIZE_TARGETS = True
 
 # --- Boundary Condition Types (Spec 2.1) ---
 BC_TYPES = ['FULL_CLAMP', 'RAIL_XY']
+
+# --- AlphaBuilder v3.3 Harvest Settings ---
+SCHEMA_VERSION = "v3.3"
+PHASE1_NUM_SLICES = 50
+PHASE1_GEO_BETA = 0.5          # Geodesic frontier decay weight
+PHASE1_GAMMA = 0.99            # Temporal discount factor for Phase 1 value targets
+REFINEMENT_NOISE_THRESHOLD = 0.005
+REFINEMENT_SHARPNESS = 1.0     # Exponent gamma_sharp for joint Add/Remove normalization
+BEZIER_NUM_CURVES_MIN = 1
+BEZIER_NUM_CURVES_MAX = 3

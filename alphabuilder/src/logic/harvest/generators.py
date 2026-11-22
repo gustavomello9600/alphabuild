@@ -5,6 +5,29 @@ import random
 import numpy as np
 from typing import Tuple, Dict, Any, List
 
+def get_load_region_bounds(
+    resolution: Tuple[int, int, int],
+    load_config: Dict[str, Any]
+) -> Tuple[int, int, int, int, int]:
+    """
+    Compute canonical voxel bounds (lx, y_min, y_max, z_min, z_max) for the load patch.
+
+    Centralizes load patch indexing so generators, harvest force tensors,
+    tensor_utils, and connectivity checks match the volumetric load in FEniTop.
+    """
+    nx, ny, nz = resolution
+    lx = min(max(0, int(load_config['x'])), nx - 1)
+    ly = float(load_config['y'])
+    lz_center = (float(load_config['z_start']) + float(load_config['z_end'])) / 2.0
+    load_half_width = 1.0
+
+    y_min = max(0, int(ly - load_half_width))
+    y_max = min(ny, int(ly + load_half_width) + 1)
+    z_min = max(0, int(lz_center - load_half_width))
+    z_max = min(nz, int(lz_center + load_half_width) + 1)
+    return lx, y_min, y_max, z_min, z_max
+
+
 def quadratic_bezier(p0, p1, p2, t):
     """Calculate point on quadratic Bézier curve at t."""
     return (1 - t)**2 * p0 + 2 * (1 - t) * t * p1 + t**2 * p2
@@ -21,15 +44,15 @@ def generate_bezier_structure(
     # Safe Background: 0.15 to allow sensitivity flow (Vanishing Gradient Fix)
     voxel_grid = np.full(resolution, 0.15, dtype=np.float32)
     
-    # 1. Determine Number of Curves
-    num_curves = random.randint(2, 4)
+    # 1. Determine Number of Curves (Spec 2.1: 1 to 3)
+    num_curves = random.randint(1, 3)
     
     # Load Point (Target)
-    target_x = load_config['x']
-    target_y = load_config['y']
-    target_z_center = (load_config['z_start'] + load_config['z_end']) / 2.0
+    lx, y_lmin, y_lmax, z_lmin, z_lmax = get_load_region_bounds(resolution, load_config)
+    target_y = float(load_config['y'])
+    target_z_center = (float(load_config['z_start']) + float(load_config['z_end'])) / 2.0
     
-    p2 = np.array([target_x, target_y, target_z_center])
+    p2 = np.array([float(lx), target_y, target_z_center])
     
     # Track final section positions for anchor placement
     final_positions = []
@@ -53,11 +76,12 @@ def generate_bezier_structure(
         num_steps = 100
         t_values = np.linspace(0, 1, num_steps)
         
-        # Section dimensions with BIAS toward smaller values using triangular distribution
-        w_tip = random.triangular(2, 2.5, 6)    # Bias toward 2-3
-        w_base = random.triangular(w_tip, w_tip + 0.5, 8)  # Slightly larger than tip
-        h_tip = random.triangular(2, 3, 12)     # Bias toward 2-4, max reduced to 12
-        h_base = random.triangular(h_tip, h_tip + 2, min(h_tip + 10, 20))  # Controlled growth
+        # Section dimensions with BIAS toward smaller values: random.triangular(low, high, mode)
+        w_tip = random.triangular(2.0, 6.0, 2.5)
+        w_base = random.triangular(w_tip, 8.0, min(w_tip + 0.5, 8.0))
+        h_tip = random.triangular(2.0, 12.0, 3.0)
+        h_max = min(h_tip + 10.0, 20.0)
+        h_base = random.triangular(h_tip, h_max, min(h_tip + 2.0, h_max))
         
         for i, t in enumerate(t_values):
             # Current point on curve
@@ -95,44 +119,39 @@ def generate_bezier_structure(
             
     # Ensure Wall Connection (X=0) - small base plate
     mid_y, mid_z = ny//2, nz//2
-    voxel_grid[0:2, mid_y-3:mid_y+3, mid_z-2:mid_z+2] = 1.0
+    voxel_grid[0:2, max(0, mid_y-3):min(ny, mid_y+3), max(0, mid_z-2):min(nz, mid_z+2)] = 1.0
 
-    # Load Anchor: Must cover ALL final Bezier curve endpoints (bounding box approach)
+    # Load Anchor centered around load_config['x']: Must cover ALL final Bezier endpoints + load patch
     if final_positions:
-        # Calculate bounding box of all final positions
-        all_y = [p[1] for p in final_positions]
-        all_z = [p[2] for p in final_positions]
+        all_y = [p[1] for p in final_positions] + [float(y_lmin), float(y_lmax - 1)]
+        all_z = [p[2] for p in final_positions] + [float(z_lmin), float(z_lmax - 1)]
         
         min_y, max_y = min(all_y), max(all_y)
         min_z, max_z = min(all_z), max(all_z)
         
-        # Add padding based on section sizes
-        max_w = max([s[0] for s in final_sections])
-        max_h = max([s[1] for s in final_sections])
+        max_w = max(s[0] for s in final_sections)
+        max_h = max(s[1] for s in final_sections)
         
-        # Anchor covers the bounding box with padding
-        anchor_depth = 3
         y_padding = max(2, int(max_h / 2) + 1)
         z_padding = max(2, int(max_w / 2) + 1)
         
-        x_s = max(0, nx - anchor_depth)
-        x_e = nx
+        x_s = max(0, lx - 1)
+        x_e = min(nx, lx + 2)
         y_s = max(0, int(min_y - y_padding))
         y_e = min(ny, int(max_y + y_padding))
         z_s = max(0, int(min_z - z_padding))
         z_e = min(nz, int(max_z + z_padding))
     else:
-        # Fallback to load config
-        anchor_depth = 3
-        x_s = max(0, nx - anchor_depth)
-        x_e = nx
+        x_s = max(0, lx - 1)
+        x_e = min(nx, lx + 2)
         y_s = max(0, int(load_config['y'] - 4))
         y_e = min(ny, int(load_config['y'] + 4))
-        z_center = (load_config['z_start'] + load_config['z_end']) / 2.0
-        z_s = max(0, int(z_center - 3))
-        z_e = min(nz, int(z_center + 3))
+        z_s = max(0, int(target_z_center - 3))
+        z_e = min(nz, int(target_z_center + 3))
     
     voxel_grid[x_s:x_e, y_s:y_e, z_s:z_e] = 1.0
+    # Guarantee full coverage on exact load application patch
+    voxel_grid[lx, y_lmin:y_lmax, z_lmin:z_lmax] = 1.0
         
     return voxel_grid
 
@@ -142,25 +161,26 @@ def generate_seeded_cantilever(
 ) -> np.ndarray:
     """
     Generate a seeded initialization for Full Domain strategy.
-    Creates a gray background with a solid bar connecting load to support.
+    Creates a gray background with a solid bar connecting load_config['x'] to support.
     """
     nx, ny, nz = resolution
     
     # 1. Gray Background (0.35)
     grid = np.full(resolution, 0.35, dtype=np.float32)
     
-    # 2. Define Seed Bar (Load -> Support)
-    ly = load_config['y']
-    lz_center = (load_config['z_start'] + load_config['z_end']) / 2
+    # 2. Define Seed Bar (Support -> Load at lx)
+    lx, y_lmin, y_lmax, z_lmin, z_lmax = get_load_region_bounds(resolution, load_config)
+    ly = float(load_config['y'])
+    lz_center = (float(load_config['z_start']) + float(load_config['z_end'])) / 2.0
     
-    # Point A: Load (at free end)
-    p1 = np.array([nx - 1, ly, lz_center])
+    # Point A: Load (at load_config['x'])
+    p1 = np.array([float(lx), ly, lz_center])
     
     # Point B: Support Center (X=0)
     p0 = np.array([0.0, ny / 2.0, nz / 2.0])
     
     # Rasterize Line
-    num_steps = int(np.linalg.norm(p1 - p0)) * 2
+    num_steps = max(10, int(np.linalg.norm(p1 - p0)) * 2)
     t_values = np.linspace(0, 1, num_steps)
     
     thickness = 2 # Radius of the bar
@@ -176,18 +196,17 @@ def generate_seeded_cantilever(
         
         grid[x_min:x_max, y_min:y_max, z_min:z_max] = 1.0
     
-    # 3. Load Anchor at free end (ensures connection with 2x2 load region)
-    anchor_depth = 4
+    # 3. Load Anchor centered around lx (ensures connection with load patch)
     anchor_margin = 3
-    
-    x_s = max(0, nx - anchor_depth)
-    x_e = nx
+    x_s = max(0, lx - 2)
+    x_e = min(nx, lx + 2)
     y_s = max(0, int(ly - anchor_margin))
     y_e = min(ny, int(ly + anchor_margin + 1))
     z_s = max(0, int(lz_center - anchor_margin))
     z_e = min(nz, int(lz_center + anchor_margin + 1))
     
     grid[x_s:x_e, y_s:y_e, z_s:z_e] = 1.0
+    grid[lx, y_lmin:y_lmax, z_lmin:z_lmax] = 1.0
         
     return grid
 

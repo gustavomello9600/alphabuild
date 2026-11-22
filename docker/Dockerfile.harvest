@@ -1,0 +1,20 @@
+FROM ghcr.io/fenics/dolfinx/dolfinx:stable
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 \
+    PYTHONPATH="/workspace/alphabuild:/usr/local/dolfinx-real/lib/python3.12/dist-packages:/usr/local/lib"
+
+RUN /dolfinx-env/bin/python3 -m pip install --no-cache-dir scipy tqdm
+
+WORKDIR /workspace/alphabuild
+
+COPY alphabuilder/__init__.py alphabuilder/__init__.py
+COPY alphabuilder/src alphabuilder/src
+COPY run_data_harvest.py run_data_harvest.py
+COPY scripts scripts
+
+ENTRYPOINT ["/dolfinx-env/bin/python3"]
