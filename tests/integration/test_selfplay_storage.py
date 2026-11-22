@@ -121,6 +121,7 @@ class TestSelfPlayStorage:
             max_displacement=10.0,
             island_penalty=0.1,
             volume_fraction=0.25,
+            reward_components={"base_reward": 0.1, "total": 0.5},
             executed_actions=[(0, 1, 1, 1)] # Simulate PV sequence
         )
         
@@ -136,6 +137,7 @@ class TestSelfPlayStorage:
         assert loaded.max_displacement == pytest.approx(10.0)
         assert loaded.island_penalty == pytest.approx(0.1)
         assert loaded.volume_fraction == pytest.approx(0.25)
+        assert loaded.reward_components == {"base_reward": 0.1, "total": 0.5}
         
         # Check visits from visit_distribution or executed_actions
         # record_step logic: if executed_actions provided, it records them.

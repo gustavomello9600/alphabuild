@@ -27,7 +27,10 @@ from pathlib import Path
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
-from alphabuilder.src.logic.selfplay.storage import initialize_selfplay_db
+from alphabuilder.src.logic.selfplay.storage import (
+    initialize_selfplay_db,
+    get_incomplete_games,
+)
 from alphabuilder.src.neural.inference import AlphaBuilderInference
 from alphabuilder.src.logic.selfplay.runner import (
     run_episode,
@@ -44,8 +47,41 @@ def parse_args():
     parser.add_argument("--resolution", type=str, default="64x32x8")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--device", type=str, default="auto", help="Device: auto, xpu, cuda, cpu, npu")
-    parser.add_argument("--resume", type=str, default=None, help="Resume game by ID")
+    parser.add_argument("--unguided-value", action="store_false", dest="guided_value", default=True,
+                       help="Disable guided value (analytical bonuses in search)")
+    
+    # Resume functionality
+    parser.add_argument("--resume", type=str, default=None, metavar="GAME_ID",
+                       help="Resume a specific game by ID")
+    parser.add_argument("--resume-latest", action="store_true",
+                       help="Resume the most recent incomplete game")
+    parser.add_argument("--list-incomplete", action="store_true",
+                       help="List incomplete games that can be resumed")
+    
     return parser.parse_args()
+
+
+def list_incomplete_games(db_path: Path, max_steps: int):
+    """Print a list of incomplete games that can be resumed."""
+    games = get_incomplete_games(db_path, max_steps)
+    
+    if not games:
+        print("No incomplete games found.")
+        return
+    
+    print(f"\n{'='*80}")
+    print(f"Incomplete Games (can be resumed)")
+    print(f"{'='*80}")
+    print(f"{'Game ID':<40} {'Steps':<8} {'Score':<10} {'Created At'}")
+    print(f"{'-'*80}")
+    
+    for game in games:
+        score_str = f"{game.final_score:.4f}" if game.final_score is not None else "---"
+        print(f"{game.game_id:<40} {game.total_steps:<8} {score_str:<10} {game.created_at}")
+    
+    print(f"\nTo resume a game, use:")
+    print(f"  python run_selfplay.py --resume <GAME_ID>")
+    print(f"  python run_selfplay.py --resume-latest")
 
 
 def main():
@@ -63,39 +99,57 @@ def main():
     db_path = Path(args.db_path)
     initialize_selfplay_db(db_path)
     
+    # Handle --list-incomplete
+    if args.list_incomplete:
+        list_incomplete_games(db_path, args.max_steps)
+        return
+    
+    # Episode config
+    config = EpisodeConfig(
+        max_steps=args.max_steps,
+        resolution=resolution,
+        use_guided_value=args.guided_value
+    )
+    
+    # Handle resume modes
+    if args.resume_latest:
+        games = get_incomplete_games(db_path, args.max_steps)
+        if not games:
+            print("No incomplete games to resume. Starting new episode...")
+            args.resume = None
+        else:
+            args.resume = games[0].game_id
+            print(f"Resuming most recent incomplete game: {args.resume}")
+    
     # Load model
     print(f"Loading model from {args.checkpoint}...")
     model = AlphaBuilderInference(args.checkpoint, device=args.device)
     print(f"Model loaded: {model}")
     
-    # Episode config
-    config = EpisodeConfig(
-        max_steps=args.max_steps,
-        resolution=resolution
-    )
-    
-    # Run episodes
-    results = []
-    
-    # Resume mode
+    # Resume a specific game
     if args.resume:
+        game_id, score, steps = resume_episode(model, db_path, args.resume, config)
+        
+        print(f"\n\n{'='*60}")
+        print("Resume Complete!")
+        print(f"{'='*60}")
+        print(f"Game ID: {game_id}")
+        print(f"Final score: {score:.4f}")
+        print(f"Total steps: {steps}")
+        print(f"Database: {db_path}")
+        return
+    
+    # Run new episodes
+    results = []
+    for i in range(args.episodes):
         print(f"\n\n{'#'*60}")
-        print(f"# Resuming Episode: {args.resume}")
+        print(f"# Episode {i+1}/{args.episodes}")
         print(f"{'#'*60}")
         
-        game_id, score, steps = resume_episode(model, db_path, args.resume, config)
+        game_id, score, steps = run_episode(model, db_path, config)
         results.append((game_id, score, steps))
-    else:
-        # New episodes
-        for i in range(args.episodes):
-            print(f"\n\n{'#'*60}")
-            print(f"# Episode {i+1}/{args.episodes}")
-            print(f"{'#'*60}")
-            
-            game_id, score, steps = run_episode(model, db_path, config)
-            results.append((game_id, score, steps))
-            
-            gc.collect()
+        
+        gc.collect()
     
     # Summary
     print(f"\n\n{'='*60}")
@@ -110,3 +164,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
