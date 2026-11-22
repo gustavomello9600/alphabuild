@@ -454,6 +454,84 @@ pub fn compute_legal_moves(
     })
 }
 
+/// Joint masked softmax over legal add/remove actions (v3.3 policy contract).
+pub fn masked_softmax_policy(
+    policy_add: &[f32],
+    policy_remove: &[f32],
+    valid_add: &[bool],
+    valid_remove: &[bool],
+    temperature: f32,
+) -> CoreResult<(Vec<f32>, Vec<f32>)> {
+    if policy_add.len() != policy_remove.len()
+        || policy_add.len() != valid_add.len()
+        || policy_remove.len() != valid_remove.len()
+    {
+        return Err(CoreError::InvalidInput {
+            message: "masked_softmax tensor length mismatch".to_string(),
+        });
+    }
+    let temp = temperature.max(1e-6);
+    let mut combined = Vec::with_capacity(policy_add.len() + policy_remove.len());
+    for (idx, &value) in policy_add.iter().enumerate() {
+        combined.push(if valid_add[idx] {
+            value / temp
+        } else {
+            f32::NEG_INFINITY
+        });
+    }
+    for (idx, &value) in policy_remove.iter().enumerate() {
+        combined.push(if valid_remove[idx] {
+            value / temp
+        } else {
+            f32::NEG_INFINITY
+        });
+    }
+    let max = combined.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return Ok((vec![0.0; policy_add.len()], vec![0.0; policy_remove.len()]));
+    }
+    let mut total = 0.0_f64;
+    let mut exps = vec![0.0_f32; combined.len()];
+    for (idx, &value) in combined.iter().enumerate() {
+        if value.is_finite() {
+            let e = (value - max).exp();
+            exps[idx] = e;
+            total += e as f64;
+        }
+    }
+    let spatial = policy_add.len();
+    let (add_probs, rem_probs) = if total < 1e-12 {
+        (vec![0.0; spatial], vec![0.0; policy_remove.len()])
+    } else {
+        let add: Vec<f32> = exps[..spatial]
+            .iter()
+            .map(|&v| (v as f64 / total) as f32)
+            .collect();
+        let rem: Vec<f32> = exps[spatial..]
+            .iter()
+            .map(|&v| (v as f64 / total) as f32)
+            .collect();
+        (add, rem)
+    };
+    Ok((add_probs, rem_probs))
+}
+
+/// Policy detection rule: negative logits or max > 1.001 mean raw logits.
+pub fn policy_is_logits(policy_add: &[f32], policy_remove: &[f32]) -> bool {
+    let mut max_value = f32::NEG_INFINITY;
+    for &value in policy_add.iter().chain(policy_remove.iter()) {
+        if value.abs() > 1e-7 {
+            if value < -1e-4 {
+                return true;
+            }
+            if value > max_value {
+                max_value = value;
+            }
+        }
+    }
+    max_value > 1.001
+}
+
 /// Strain / displacement maps and normalized inputs for the GPU shader.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StrainResult {

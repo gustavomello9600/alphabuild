@@ -1,0 +1,75 @@
+@font-face {
+  font-family: "Inter";
+  src: url("../fonts/inter-400.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Space Grotesk";
+  src: url("../fonts/space-grotesk-500.woff2") format("woff2");
+  font-weight: 300 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("../fonts/jetbrains-mono-400.woff2") format("woff2");
+  font-weight: 100 800;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root[data-theme="dark"] {
+  --bg-void: #050608;
+  --bg-surface: #0e1015;
+  --bg-elevated: #161922;
+  --border-subtle: rgba(255, 255, 255, 0.08);
+  --border-active: rgba(0, 240, 255, 0.42);
+  --text-primary: #eef2f8;
+  --text-secondary: #8f9bb0;
+  --text-muted: #545e72;
+  --accent-cyan: #00f0ff;
+  --accent-emerald: #00e599;
+  --accent-magenta: #ff2466;
+  --accent-orange: #ff7a1a;
+  --accent-violet: #8b5cf6;
+  --accent-gold: #f5b700;
+  --surface-alpha: 0.86;
+  --shadow-panel: 0 18px 50px rgba(0, 0, 0, 0.45);
+  --hairline: rgba(255, 255, 255, 0.06);
+  --scrim: rgba(2, 4, 8, 0.54);
+}
+
+:root[data-theme="tcc-light"] {
+  --bg-void: #ffffff;
+  --bg-surface: #f6f8fb;
+  --bg-elevated: #ffffff;
+  --border-subtle: rgba(15, 23, 42, 0.12);
+  --border-active: #0284c7;
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #94a3b8;
+  --accent-cyan: #0284c7;
+  --accent-emerald: #059669;
+  --accent-magenta: #e11d48;
+  --accent-orange: #ea580c;
+  --accent-violet: #7c3aed;
+  --accent-gold: #d97706;
+  --surface-alpha: 0.92;
+  --shadow-panel: 0 18px 44px rgba(15, 23, 42, 0.12);
+  --hairline: rgba(15, 23, 42, 0.06);
+  --scrim: rgba(248, 250, 252, 0.6);
+}
+
+:root {
+  --font-display: "Space Grotesk", "Inter", system-ui, sans-serif;
+  --font-ui: "Inter", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", monospace;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 17px;
+  --radius-xl: 22px;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+}

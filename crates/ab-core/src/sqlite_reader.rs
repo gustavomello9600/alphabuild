@@ -4,10 +4,12 @@
 //! `SQLITE_OPEN_NO_MUTEX`, so the Studio can inspect a live WAL database
 //! written by harvest/self-play workers without risking corruption.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, OpenFlags, ToSql};
 use serde::{Deserialize, Serialize};
 
 use crate::codecs::coo1::Coo1;
@@ -349,6 +351,111 @@ impl SqliteReader {
             real_scale_factor: row.get(13)?,
             stiffness_e: row.get(14)?,
         }))
+    }
+}
+
+/// Dynamically typed SQL value used by the dataset command layer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+impl SqlValue {
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            SqlValue::Integer(v) => Some(*v),
+            SqlValue::Real(v) => Some(*v as i64),
+            SqlValue::Text(v) => v.parse().ok(),
+            _ => None,
+        }
+    }
+
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            SqlValue::Real(v) => Some(*v),
+            SqlValue::Integer(v) => Some(*v as f64),
+            SqlValue::Text(v) => v.parse().ok(),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            SqlValue::Text(v) => Some(v.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn as_blob(&self) -> Option<&[u8]> {
+        match self {
+            SqlValue::Blob(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, SqlValue::Null)
+    }
+}
+
+impl ToSql for SqlValue {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        use rusqlite::types::ToSqlOutput;
+        match self {
+            SqlValue::Null => Ok(ToSqlOutput::Borrowed(ValueRef::Null)),
+            SqlValue::Integer(value) => Ok(ToSqlOutput::Borrowed(ValueRef::Integer(*value))),
+            SqlValue::Real(value) => Ok(ToSqlOutput::Borrowed(ValueRef::Real(*value))),
+            SqlValue::Text(value) => Ok(ToSqlOutput::Borrowed(ValueRef::Text(value.as_bytes()))),
+            SqlValue::Blob(value) => Ok(ToSqlOutput::Borrowed(ValueRef::Blob(value))),
+        }
+    }
+}
+
+fn sql_value_from_ref(value: ValueRef<'_>) -> SqlValue {
+    match value {
+        ValueRef::Null => SqlValue::Null,
+        ValueRef::Integer(v) => SqlValue::Integer(v),
+        ValueRef::Real(v) => SqlValue::Real(v),
+        ValueRef::Text(v) => SqlValue::Text(String::from_utf8_lossy(v).to_string()),
+        ValueRef::Blob(v) => SqlValue::Blob(v.to_vec()),
+    }
+}
+
+impl SqliteReader {
+    /// Run a read-only dynamic query and materialize rows as snake_case maps.
+    pub fn query_rows(
+        &self,
+        sql: &str,
+        params: &[SqlValue],
+    ) -> CoreResult<Vec<HashMap<String, SqlValue>>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let columns: Vec<String> = stmt
+            .column_names()
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let mut map = HashMap::new();
+            for (idx, name) in columns.iter().enumerate() {
+                map.insert(name.clone(), sql_value_from_ref(row.get_ref(idx)?));
+            }
+            out.push(map);
+        }
+        Ok(out)
+    }
+
+    pub fn query_row(
+        &self,
+        sql: &str,
+        params: &[SqlValue],
+    ) -> CoreResult<Option<HashMap<String, SqlValue>>> {
+        Ok(self.query_rows(sql, params)?.into_iter().next())
     }
 }
 

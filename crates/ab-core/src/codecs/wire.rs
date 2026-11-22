@@ -451,6 +451,118 @@ impl WirePacket {
     }
 }
 
+/// Concatenate complete `STEP_FRAME` packets into a `STEP_BATCH` packet.
+pub fn encode_step_batch(frames: &[Vec<u8>]) -> CoreResult<Vec<u8>> {
+    let lengths: Vec<usize> = frames.iter().map(|frame| frame.len()).collect();
+    let header = serde_json::json!({
+        "count": frames.len(),
+        "frame_byte_lengths": lengths,
+    });
+    let header_bytes = serde_json::to_vec(&header)?;
+    let header_padded = (header_bytes.len() + 3) & !3;
+    let mut block = Vec::new();
+    for frame in frames {
+        if !frame.len().is_multiple_of(4) {
+            return Err(CoreError::Wire {
+                message: "STEP_FRAME packets must be 4-byte aligned".to_string(),
+            });
+        }
+        block.extend_from_slice(frame);
+    }
+    let mut out = Vec::with_capacity(ABWIRE01_HEADER_LEN + header_padded + block.len());
+    out.extend_from_slice(ABWIRE01_MAGIC);
+    out.extend_from_slice(&payload_type::STEP_BATCH.to_le_bytes());
+    out.extend_from_slice(&0_u32.to_le_bytes());
+    out.extend_from_slice(&(header_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(header_padded as u32).to_le_bytes());
+    out.extend_from_slice(&0_u32.to_le_bytes());
+    out.extend_from_slice(&(block.len() as u32).to_le_bytes());
+    out.extend_from_slice(&header_bytes);
+    out.resize(out.len() + (header_padded - header_bytes.len()), 0);
+    out.extend_from_slice(&block);
+    Ok(out)
+}
+
+/// Decode a `STEP_BATCH` packet into its constituent `STEP_FRAME` packets.
+pub fn decode_step_batch(raw: &[u8]) -> CoreResult<Vec<WirePacket>> {
+    if raw.len() < ABWIRE01_HEADER_LEN || &raw[0..8] != ABWIRE01_MAGIC {
+        return Err(CoreError::Wire {
+            message: "invalid STEP_BATCH magic".to_string(),
+        });
+    }
+    let kind = read_u32(raw, 8)?;
+    if kind != payload_type::STEP_BATCH {
+        return Err(CoreError::Wire {
+            message: format!("expected STEP_BATCH (4), got {kind}"),
+        });
+    }
+    let flags = read_u32(raw, 12)?;
+    let header_len = read_u32(raw, 16)? as usize;
+    let header_padded = read_u32(raw, 20)? as usize;
+    let block_len = read_u32(raw, 28)? as usize;
+    if header_padded < header_len || !header_padded.is_multiple_of(4) {
+        return Err(CoreError::Wire {
+            message: "invalid STEP_BATCH header lengths".to_string(),
+        });
+    }
+    let header_end = ABWIRE01_HEADER_LEN + header_padded;
+    let block_end = header_end + block_len;
+    if block_end > raw.len() {
+        return Err(CoreError::Wire {
+            message: "truncated STEP_BATCH".to_string(),
+        });
+    }
+    let header_text = std::str::from_utf8(
+        &raw[ABWIRE01_HEADER_LEN..ABWIRE01_HEADER_LEN + header_len],
+    )
+    .map_err(|e| CoreError::Wire {
+        message: format!("STEP_BATCH header is not UTF-8: {e}"),
+    })?;
+    let header: serde_json::Value = serde_json::from_str(header_text)?;
+    let count = header.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let lengths: Vec<usize> = header
+        .get("frame_byte_lengths")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .map(|v| v.as_u64().unwrap_or(0) as usize)
+                .collect()
+        })
+        .unwrap_or_default();
+    if lengths.len() != count {
+        return Err(CoreError::Wire {
+            message: "STEP_BATCH frame_byte_lengths/count mismatch".to_string(),
+        });
+    }
+    let block_raw = &raw[header_end..block_end];
+    let block = if flags & wire_flags::ZLIB_TENSOR_BLOCK != 0 {
+        crate::codecs::zlib_decompress(block_raw, 128 * 1024 * 1024)?
+    } else {
+        block_raw.to_vec()
+    };
+    if lengths.iter().sum::<usize>() != block.len() {
+        return Err(CoreError::Wire {
+            message: "STEP_BATCH lengths do not cover the tensor block".to_string(),
+        });
+    }
+    let mut frames = Vec::with_capacity(count);
+    let mut cursor = 0_usize;
+    for length in lengths {
+        let end = cursor + length;
+        let slice = &block[cursor..end];
+        let (packet, consumed) = WirePacket::decode_prefix(slice)?;
+        if consumed != length {
+            return Err(CoreError::Wire {
+                message: format!("STEP_FRAME length mismatch: {consumed} != {length}"),
+            });
+        }
+        frames.push(packet);
+        cursor = end;
+    }
+    Ok(frames)
+}
+
 /// `ABMESH01` packet: header + surface-culled mesh + overlays + metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AbMeshPacket {
