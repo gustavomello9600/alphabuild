@@ -43,10 +43,18 @@ class DummyModel:
         return value, p_add, p_rem, blueprint
 
     def predict_batch(self, states):
-        return [self.predict(state) for state in states]
+        values, p_adds, p_rems = [], [], []
+        for state in states:
+            v, pa, pr = self.predict(state)
+            values.append(v)
+            p_adds.append(pa)
+            p_rems.append(pr)
+        return values, p_adds, p_rems
 
 
-def make_app(tmp_path: Path, token: str = "") -> tuple[TestClient, ServerConfig]:
+def make_app(
+    tmp_path: Path, token: str = "", model_factory=None
+) -> tuple[TestClient, ServerConfig]:
     checkpoints = tmp_path / "checkpoints"
     data_dir = tmp_path / "data"
     checkpoints.mkdir(parents=True, exist_ok=True)
@@ -56,7 +64,7 @@ def make_app(tmp_path: Path, token: str = "") -> tuple[TestClient, ServerConfig]
         checkpoints_dir=checkpoints,
         data_dir=data_dir,
         api_token=token,
-        model_factory=lambda path, device: DummyModel(),
+        model_factory=model_factory or (lambda path, device: DummyModel()),
     )
     return TestClient(create_app(config)), config
 
@@ -339,7 +347,8 @@ def test_websocket_full_session_flow(tmp_path: Path, monkeypatch: pytest.MonkeyP
                 ws,
                 lambda kind, payload: kind == "binary" and len(payload) > 32,
             )
-            assert any(kind == "text" and payload["type"] == "step_progress" for kind, payload in frames)
+            if first["step"] == 0:
+                assert any(kind == "text" and payload["type"] == "step_progress" for kind, payload in frames)
             binary = next(payload for kind, payload in frames if kind == "binary")
             packet = wire.decode_packet(binary)
             assert packet.payload_type == wire.PAYLOAD_STEP_FRAME
@@ -382,6 +391,7 @@ def test_websocket_full_session_flow(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
             ws.send_text(json.dumps({"type": "command", "op": "step_once"}))
             step_frames = _next_until(ws, lambda kind, _payload: kind == "binary")
+            assert any(kind == "text" and payload["type"] == "step_progress" for kind, payload in step_frames)
             step_packet = wire.decode_packet(
                 next(payload for kind, payload in step_frames if kind == "binary")
             )
@@ -458,3 +468,70 @@ def test_datasets_empty_and_path_traversal(tmp_path: Path):
         assert client.get("/api/v1/datasets").json() == {"databases": []}
         traversal = client.get("/api/v1/datasets/../../etc/passwd/episodes")
         assert traversal.status_code in {403, 404}
+
+
+def test_mcts_live_session_advances_tree_and_grows_across_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    class GrowingDummyModel(DummyModel):
+        def predict(self, state: np.ndarray):
+            d, h, w = state.shape[1:]
+            p_add = np.linspace(0.2, 1.0, d * h * w, dtype=np.float32).reshape(d, h, w)
+            p_rem = np.full((d, h, w), -10.0, dtype=np.float32)
+            return 0.25, p_add, p_rem
+
+    monkeypatch.setattr("alphabuilder.server.worker.has_fenics", lambda: False)
+    client, _ = make_app(tmp_path, model_factory=lambda path, device: GrowingDummyModel())
+    body = session_body()
+    body["initial_solid_voxels"] = []
+    body["episode_config"]["max_steps"] = 4
+    body["episode_config"]["max_phase1_steps"] = 10
+    body["episode_config"]["use_guided_value"] = True
+    body["phase1_mcts"] = {
+        "num_simulations": 16,
+        "batch_size": 4,
+        "action_batch_size": 8,
+        "c_puct": 1.2,
+        "top_k_expansion": 16,
+        "mixmax_beta": 0.75,
+    }
+    with client:
+        load_dummy(client)
+        created = client.post("/api/v1/sessions", json=body)
+        assert created.status_code == 201, created.text
+        handle = created.json()
+        session_id = handle["session_id"]
+
+        with client.websocket_connect(handle["ws_url"]) as ws:
+            _next_until(
+                ws,
+                lambda kind, payload: kind == "text"
+                and payload.get("type") == "session_ended",
+                limit=80,
+            )
+
+        detail = client.get(f"/api/v1/sessions/{session_id}")
+        assert detail.status_code == 200, detail.text
+        payload = detail.json()
+        history = payload["history"]
+        assert len(history) == 4
+
+        vols = [entry["volume_fraction"] for entry in history]
+        assert vols[0] < vols[1] < vols[2] < vols[3], f"expected monotonic growth, got {vols}"
+        assert round(vols[-1] * 64) > 16, f"stuck in step-0 action cap: final_voxels={vols[-1] * 64}"
+
+        step0_actions = {
+            (a["channel"], a["x"], a["y"], a["z"])
+            for a in history[0]["selected_actions"]
+        }
+        step1_actions = {
+            (a["channel"], a["x"], a["y"], a["z"])
+            for a in history[1]["selected_actions"]
+        }
+        assert step0_actions != step1_actions
+
+        nodes_per_step = [entry["mcts_stats"]["nodes_expanded"] for entry in history]
+        assert max(nodes_per_step) <= 32, f"tree grew without advancing/resetting: {nodes_per_step}"
+
+        assert isinstance(history[0]["reward_v33"]["pbrs_delta"], float)
+        assert history[0]["phase"] == "GROWTH"

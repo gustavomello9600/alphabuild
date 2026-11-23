@@ -528,7 +528,10 @@ class LiveSession:
             if phase2 is not None:
                 self.request.phase2_mcts = phase2
             if use_guided_value is not None:
-                self.request.episode_config.use_guided_value = use_guided_value
+                if use_guided_value != self.request.episode_config.use_guided_value:
+                    self.request.episode_config.use_guided_value = use_guided_value
+                    if self._mcts is not None:
+                        self._mcts.reset()
         self.publish_state()
 
     # ---------------------------------------------------------------- runner
@@ -813,7 +816,11 @@ class LiveSession:
         step: int,
         include_blueprint: bool,
     ) -> _StepOutcome:
-        from alphabuilder.src.logic.mcts.engine import AlphaBuilderMCTS, build_state_tensor
+        from alphabuilder.src.logic.mcts.engine import (
+            AlphaBuilderMCTS,
+            build_state_tensor,
+            select_pv_branches,
+        )
         from alphabuilder.src.logic.mcts.legal_moves import get_legal_moves, masked_softmax
         from alphabuilder.src.logic.selfplay.reward import (
             analyze_structure_islands,
@@ -821,23 +828,72 @@ class LiveSession:
             calculate_connectivity_reward,
             calculate_displacement_penalty,
             calculate_island_penalty,
+            calculate_pbrs_potential,
             calculate_reward,
             calculate_volume_bonus,
+            get_guidance_alpha,
         )
 
+        load_cfg_dict = {**self.load_config.model_dump(), "bc_type": self.bc_type}
+        force_tuple = (forces[0], forces[1], forces[2])
+
         started = time.perf_counter()
-        state_tensor = build_state_tensor(density, bc_masks, forces)
+        state_tensor = build_state_tensor(density, bc_masks, force_tuple)
         value, p_add, p_rem, blueprint = self.manager.models.predict(
             state_tensor, include_blueprint=include_blueprint
         )
         inference_ms = (time.perf_counter() - started) * 1000.0
 
-        predict_fn = lambda arr: (  # noqa: E731
-            self.manager.models.predict(arr, include_blueprint=False)[:3]
+        ep_cfg = self.request.episode_config
+        alpha_guide = (
+            get_guidance_alpha(
+                generation=ep_cfg.generation,
+                decay_generations=ep_cfg.guidance_decay_generations,
+            )
+            if ep_cfg.use_guided_value
+            else 0.0
+        )
+        phi_before, _ = calculate_pbrs_potential(
+            density, bc_masks, force_tuple, load_cfg_dict
         )
 
+        def _shape_value(
+            net_val: float,
+            density_grid: np.ndarray,
+            masks: tuple[np.ndarray, np.ndarray, np.ndarray],
+            force_vecs: tuple[np.ndarray, np.ndarray, np.ndarray],
+        ) -> float:
+            if phase == "REFINEMENT":
+                isl = analyze_structure_islands(density_grid, load_cfg_dict, bc_masks=masks)
+                if not isl["is_connected"]:
+                    return -1.0
+                total_vox = int((density_grid > 0.5).sum())
+                isl_pen = calculate_island_penalty(
+                    isl["n_islands"], isl["loose_voxels"], total_vox
+                )
+                return float(np.clip(float(net_val) - isl_pen, -1.0, 1.0))
+            if alpha_guide > 0.0:
+                phi_leaf, _ = calculate_pbrs_potential(
+                    density_grid, masks, force_vecs, load_cfg_dict
+                )
+                return float(
+                    np.clip(float(net_val) + alpha_guide * (phi_leaf - phi_before), -1.0, 1.0)
+                )
+            return float(np.clip(float(net_val), -1.0, 1.0))
+
+        def predict_fn(arr: np.ndarray):
+            nv, pa, pr, _ = self.manager.models.predict(arr, include_blueprint=False)
+            masks = (arr[1], arr[2], arr[3])
+            fvecs = (arr[4], arr[5], arr[6])
+            return _shape_value(nv, arr[0], masks, fvecs), pa, pr
+
         def predict_batch_fn(states: list[np.ndarray]):
-            return self.manager.models.predict_batch(states)
+            nvs, pas, prs = self.manager.models.predict_batch(states)
+            shaped = [
+                _shape_value(nv, st[0], (st[1], st[2], st[3]), (st[4], st[5], st[6]))
+                for nv, st in zip(nvs, states)
+            ]
+            return shaped, pas, prs
 
         if self._mcts is None:
             self._mcts = AlphaBuilderMCTS(
@@ -847,13 +903,15 @@ class LiveSession:
                 action_batch_size=self.request.phase1_mcts.action_batch_size,
                 c_puct=self.request.phase1_mcts.c_puct,
                 top_k_expansion=self.request.phase1_mcts.top_k_expansion,
-                predict_batch_fn=predict_batch_fn if self.request.phase1_mcts.batch_size > 1 else None,
+                predict_batch_fn=predict_batch_fn,
             )
+        self._mcts.predict_fn = predict_fn
+        self._mcts.predict_batch_fn = predict_batch_fn
         self._mcts.config = self._mcts_config(phase)
-        result = self._mcts.search(density, bc_masks, forces)
+        result = self._mcts.search(density, bc_masks, force_tuple)
 
         valid_add, valid_remove = get_legal_moves(
-            density, 0.5, bc_masks=bc_masks, forces=forces
+            density, 0.5, bc_masks=bc_masks, forces=force_tuple
         )
         prob_add, prob_remove = masked_softmax(
             p_add,
@@ -863,13 +921,24 @@ class LiveSession:
             temperature=1.0,
         )
 
-        actions = list(result.actions)
+        pv_branches = select_pv_branches(
+            result.root,
+            max_actions=self._mcts.config.action_batch_size,
+            max_depth=4,
+        )
+        if pv_branches:
+            actions = [act for branch in pv_branches for act, _, _ in branch]
+        elif result.actions:
+            actions = list(result.actions)
+        else:
+            actions = []
+
         new_density = density.copy()
         for channel, x, y, z in actions:
             new_density[x, y, z] = 1.0 if channel == 0 else 0.0
 
         analysis = analyze_structure_islands(
-            new_density, self.load_config.model_dump(), bc_masks=bc_masks
+            new_density, load_cfg_dict, bc_masks=bc_masks
         )
         vol_frac = float(np.mean(new_density > 0.5))
         total_voxels = int((new_density > 0.5).sum())
@@ -880,8 +949,16 @@ class LiveSession:
         connected_load_fraction = 0.0
         if phase == "GROWTH":
             connectivity_bonus, connected_load_fraction = calculate_connectivity_reward(
-                new_density, bc_masks, forces
+                new_density, bc_masks, force_tuple
             )
+        phi_after, _ = calculate_pbrs_potential(
+            new_density, bc_masks, force_tuple, load_cfg_dict
+        )
+        pbrs_delta = (
+            float(alpha_guide * (phi_after - phi_before))
+            if (phase == "GROWTH" and alpha_guide > 0.0)
+            else None
+        )
 
         new_phase = phase
         reset_tree = False
@@ -954,7 +1031,7 @@ class LiveSession:
                 "displacement_penalty": float(calculate_displacement_penalty(max_disp)),
                 "island_penalty": float(island_penalty),
                 "connectivity_bonus": float(connectivity_bonus),
-                "pbrs_delta": None,
+                "pbrs_delta": pbrs_delta,
                 "total_reward": float(
                     np.clip(fem_reward - island_penalty, -1.0, 1.0)
                 ),
@@ -968,7 +1045,7 @@ class LiveSession:
                 "displacement_penalty": 0.0,
                 "island_penalty": float(island_penalty),
                 "connectivity_bonus": float(connectivity_bonus),
-                "pbrs_delta": None,
+                "pbrs_delta": pbrs_delta,
                 "total_reward": float(step_value),
                 "is_collapsed": False,
             }
@@ -1002,20 +1079,36 @@ class LiveSession:
             stats["refutation"] = bool(tuple(best_visit_action) != tuple(best_policy))
 
         selected = []
-        for branch_index, action in enumerate(actions):
-            channel, x, y, z = action
-            child = root.children.get(action) if root is not None else None
-            selected.append(
-                {
-                    "channel": int(channel),
-                    "x": int(x),
-                    "y": int(y),
-                    "z": int(z),
-                    "visits": int(child.visit_count) if child is not None else int(visits.get(action, 0)),
-                    "q_value": float(child.mean_value) if child is not None else 0.0,
-                    "branch_index": branch_index,
-                }
-            )
+        if pv_branches:
+            for branch_index, branch in enumerate(pv_branches):
+                for action, visit_count, mean_value in branch:
+                    channel, x, y, z = action
+                    selected.append(
+                        {
+                            "channel": int(channel),
+                            "x": int(x),
+                            "y": int(y),
+                            "z": int(z),
+                            "visits": int(visit_count),
+                            "q_value": float(mean_value),
+                            "branch_index": branch_index,
+                        }
+                    )
+        else:
+            for branch_index, action in enumerate(actions):
+                channel, x, y, z = action
+                child = root.children.get(action) if root is not None else None
+                selected.append(
+                    {
+                        "channel": int(channel),
+                        "x": int(x),
+                        "y": int(y),
+                        "z": int(z),
+                        "visits": int(child.visit_count) if child is not None else int(visits.get(action, 0)),
+                        "q_value": float(child.mean_value) if child is not None else 0.0,
+                        "branch_index": branch_index,
+                    }
+                )
 
         step_index = step + 1
         metadata = {
@@ -1120,6 +1213,20 @@ class LiveSession:
 
         if reset_tree:
             self._mcts.reset()
+        elif actions:
+            if len(pv_branches) == 1:
+                for act, _, _ in pv_branches[0]:
+                    self._mcts.step(act)
+                if phase == "GROWTH" and alpha_guide > 0.0 and abs(phi_after - phi_before) > 1e-9:
+                    self._mcts.eval_cache = {}
+            elif not pv_branches and len(actions) == 1:
+                self._mcts.step(actions[0])
+                if phase == "GROWTH" and alpha_guide > 0.0 and abs(phi_after - phi_before) > 1e-9:
+                    self._mcts.eval_cache = {}
+            else:
+                self._mcts.reset()
+        else:
+            self._mcts.clear_tree()
 
         return _StepOutcome(
             density=new_density,
