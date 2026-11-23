@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   Activity,
   ChevronLeft,
@@ -19,6 +19,7 @@ import {
   formatVolume,
 } from "../lib/formatters";
 import { RewardBreakdown } from "./RewardBreakdown";
+import { flatToCoord, readMctsTriples, readPolicyPairs } from "../lib/abmesh";
 
 type Tab = "physics" | "mcts" | "blueprint";
 
@@ -33,6 +34,50 @@ export function RightTelemetryDock() {
   const toggleBlueprint = useInspectorStore((state) => state.toggleBlueprint);
   const blueprintThreshold = useInspectorStore((state) => state.blueprintThreshold);
   const setBlueprintThreshold = useInspectorStore((state) => state.setBlueprintThreshold);
+  const meta = frame?.metadata;
+  const selected = meta?.selected_actions ?? [];
+
+  const refutation = useMemo(() => {
+    if (!frame) return null;
+    const add = readPolicyPairs(frame.policyAddRaw, frame.policyAddCount);
+    const rem = readPolicyPairs(frame.policyRemRaw, frame.policyRemCount);
+    const policyTop = [...add, ...rem].sort((a, b) => b.prob - a.prob)[0];
+    if (!policyTop) return null;
+    const policyChannel = add.some((pair) => pair.flat_idx === policyTop.flat_idx) ? 0 : 1;
+    const selectedTop = selected.reduce(
+      (best, action) => (action.visits > best.visits ? action : best),
+      { channel: 0 as 0 | 1, x: 0, y: 0, z: 0, visits: 0, q_value: 0 },
+    );
+    const mctsTriples = [
+      ...readMctsTriples(frame.mctsAddRaw, frame.mctsAddCount).map((entry) => ({
+        ...entry,
+        channel: 0 as 0 | 1,
+      })),
+      ...readMctsTriples(frame.mctsRemRaw, frame.mctsRemCount).map((entry) => ({
+        ...entry,
+        channel: 1 as 0 | 1,
+      })),
+    ].sort((a, b) => b.visits - a.visits);
+    const mctsTop = mctsTriples[0];
+    const [px, py, pz] = flatToCoord(policyTop.flat_idx, frame.dims);
+    const [mx, my, mz] = mctsTop ? flatToCoord(mctsTop.flat_idx, frame.dims) : [0, 0, 0];
+    return {
+      policy: { channel: policyChannel, x: px, y: py, z: pz, prob: policyTop.prob },
+      mcts:
+        selectedTop.visits > 0
+          ? selectedTop
+          : mctsTop
+            ? {
+                channel: mctsTop.channel,
+                x: mx,
+                y: my,
+                z: mz,
+                visits: mctsTop.visits,
+                q_value: mctsTop.q_value,
+              }
+            : null,
+    };
+  }, [frame, selected]);
 
   if (!metadata) {
     return null;
@@ -53,10 +98,8 @@ export function RightTelemetryDock() {
     );
   }
 
-  const meta = frame?.metadata;
   const phase = meta?.phase ?? metadata.phase_history[step] ?? "GROWTH";
   const reward = meta?.reward_v33 ?? null;
-  const selected = meta?.selected_actions ?? [];
   const stats = meta?.mcts_stats ?? null;
 
   return (
@@ -166,17 +209,23 @@ export function RightTelemetryDock() {
                 connectivityBonus={reward?.connectivity_bonus}
               />
             </div>
-            <div className="panel-section">
-              <div className="panel-heading">
-                <span>Normalização científica</span>
+            {metadata.has_displacement ? (
+              <div className="panel-section">
+                <div className="panel-heading">
+                  <span>Normalização científica</span>
+                </div>
+                <div className="stat-grid">
+                  <Stat label="disp p99" value={formatNumber(frame?.dispP99, 4)} />
+                  <Stat label="strain p99" value={formatNumber(frame?.strainP99, 4)} />
+                  <Stat label="Escala real" value={formatCount(metadata.real_scale_factor)} />
+                  <Stat label="E" value={`${(metadata.stiffness_e / 1e9).toFixed(0)} GPa`} />
+                </div>
               </div>
-              <div className="stat-grid">
-                <Stat label="disp p99" value={formatNumber(frame?.dispP99, 4)} />
-                <Stat label="strain p99" value={formatNumber(frame?.strainP99, 4)} />
-                <Stat label="Escala real" value={formatCount(metadata.real_scale_factor)} />
-                <Stat label="E" value={`${(metadata.stiffness_e / 1e9).toFixed(0)} GPa`} />
-              </div>
-            </div>
+            ) : (
+              <span className="badge" data-tone="warn">
+                Sem campos FEM (deslocamento/tensão) neste banco de treino
+              </span>
+            )}
           </>
         ) : null}
 
@@ -194,13 +243,45 @@ export function RightTelemetryDock() {
               <Stat label="Refutação" value={stats?.refutation ? "SIM" : "não"} />
             </div>
             {stats?.refutation ? (
-              <div className="reward-total" style={{ borderColor: "var(--accent-gold)" }}>
-                <span className="reward-row__name" style={{ color: "var(--accent-gold)" }}>
-                  MCTS corrigiu a Policy Head
-                </span>
-                <span className="badge" data-tone="warn">
-                  REFUTATION
-                </span>
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 6,
+                  padding: 9,
+                  borderRadius: 10,
+                  border: "1px solid color-mix(in srgb, var(--accent-gold) 42%, transparent)",
+                  background: "color-mix(in srgb, var(--accent-gold) 7%, transparent)",
+                }}
+              >
+                <div className="panel-heading" style={{ color: "var(--accent-gold)" }}>
+                  <span>MCTS corrigiu a Policy Head</span>
+                  <span className="badge" data-tone="warn">
+                    REFUTAÇÃO
+                  </span>
+                </div>
+                {refutation ? (
+                  <>
+                    <span className="mono" style={{ fontSize: 9.5, color: "var(--text-secondary)" }}>
+                      Policy #1 · {refutation.policy.channel === 0 ? "ADD" : "REMOVE"} (
+                      {refutation.policy.x}, {refutation.policy.y}, {refutation.policy.z}) · P=
+                      {refutation.policy.prob.toFixed(3)}
+                    </span>
+                    {refutation.mcts ? (
+                      <span className="mono" style={{ fontSize: 9.5, color: "var(--accent-gold)" }}>
+                        MCTS #1 · {refutation.mcts.channel === 0 ? "ADD" : "REMOVE"} (
+                        {refutation.mcts.x}, {refutation.mcts.y}, {refutation.mcts.z}) · N=
+                        {Math.round(refutation.mcts.visits)} · Q=
+                        {formatSigned(refutation.mcts.q_value, 3)}
+                      </span>
+                    ) : null}
+                    <span style={{ fontSize: 10, color: "var(--text-secondary)", lineHeight: 1.5 }}>
+                      A ação mais visitada pela árvore diverge do argmax da Policy. A lente{" "}
+                      <strong>Refutação</strong> mostra os dois lados: wireframe Policy × blocos
+                      sólidos numerados do MCTS.
+                    </span>
+                  </>
+                ) : null}
               </div>
             ) : null}
             <div className="panel-section">

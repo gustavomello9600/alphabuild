@@ -52,7 +52,8 @@ export class BlueprintLayer {
     this.geometry.dispose();
     this.geometry = geometry;
     this.mesh.geometry = geometry;
-    this.mesh.visible = frame.blueprintIndices.length > 0;
+    // Visibility is owned by ViewportEngine.setBlueprintVisible. Frame updates
+    // must never silently re-enable the ghost layer.
   }
 
   clear(): void {

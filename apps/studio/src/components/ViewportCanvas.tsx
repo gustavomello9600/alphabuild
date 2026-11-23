@@ -194,7 +194,7 @@ export function ViewportCanvas() {
           setLoading(false);
           setError(cause instanceof Error ? cause.message : String(cause));
         });
-    }, 40);
+    }, 16);
     return () => window.clearTimeout(timeout);
   }, [
     mode,

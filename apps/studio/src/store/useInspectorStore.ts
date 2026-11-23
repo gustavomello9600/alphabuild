@@ -77,7 +77,8 @@ export const useInspectorStore = create<InspectorStore>((set, get) => ({
       step: 0,
       playing: false,
       lens: "structure",
-      blueprintEnabled: metadata.has_blueprint,
+      // Blueprint always starts disabled; the user opts in explicitly.
+      blueprintEnabled: false,
       useRhoCont: false,
       clipX: metadata.resolution[0],
       clipY: metadata.resolution[1],
@@ -97,8 +98,22 @@ export const useInspectorStore = create<InspectorStore>((set, get) => ({
   setPlaying: (playing) => set({ playing }),
   togglePlaying: () => set((state) => ({ playing: !state.playing })),
   setPlaybackSpeed: (playbackSpeed) => set({ playbackSpeed }),
-  setLens: (lens) => set({ lens }),
-  toggleBlueprint: () => set((state) => ({ blueprintEnabled: !state.blueprintEnabled })),
+  setLens: (lens) =>
+    set((state) => {
+      if (
+        (lens === "deformation" || lens === "strain") &&
+        !state.metadata?.has_displacement
+      ) {
+        return { lens: state.lens };
+      }
+      return { lens };
+    }),
+  toggleBlueprint: () =>
+    set((state) =>
+      state.metadata?.has_blueprint
+        ? { blueprintEnabled: !state.blueprintEnabled }
+        : { blueprintEnabled: false },
+    ),
   setBlueprintThreshold: (blueprintThreshold) =>
     set({ blueprintThreshold: clamp(blueprintThreshold, 0.1, 0.9) }),
   setUseRhoCont: (useRhoCont) => set({ useRhoCont }),
@@ -132,5 +147,6 @@ export const useInspectorStore = create<InspectorStore>((set, get) => ({
       frame: null,
       error: null,
       hoveredVoxelId: null,
+      blueprintEnabled: false,
     }),
 }));

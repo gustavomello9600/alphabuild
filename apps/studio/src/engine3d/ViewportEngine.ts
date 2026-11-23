@@ -160,6 +160,7 @@ export class ViewportEngine {
     this.dims = frame.dims;
     this.voxels.update(frame);
     this.blueprint.update(frame);
+    this.blueprint.setVisible(this.blueprintEnabled);
     this.overlays.update(frame);
     this.rig.setDims(frame.dims);
     if (firstFrame || changedDims) {
@@ -302,12 +303,14 @@ export class ViewportEngine {
     textures: number;
     calls: number;
     triangles: number;
+    blueprint_visible: boolean;
   } {
     return {
       geometries: this.renderer.info.memory.geometries,
       textures: this.renderer.info.memory.textures,
       calls: this.renderer.info.render.calls,
       triangles: this.renderer.info.render.triangles,
+      blueprint_visible: this.blueprint.mesh.visible,
     };
   }
 

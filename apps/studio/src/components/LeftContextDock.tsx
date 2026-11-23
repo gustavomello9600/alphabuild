@@ -74,8 +74,12 @@ export function LeftContextDock() {
                       ["mcts", "MCTS"],
                       ["refutation", "Refutação"],
                       ["decision", "Diff"],
-                      ["deformation", "Deslocamento"],
-                      ["strain", "Tensão"],
+                      ...(metadata.has_displacement
+                        ? ([
+                            ["deformation", "Deslocamento"],
+                            ["strain", "Tensão"],
+                          ] as const)
+                        : []),
                     ] as const
                   ).map(([id, label]) => (
                     <button
@@ -90,6 +94,11 @@ export function LeftContextDock() {
                     </button>
                   ))}
                 </div>
+                {!metadata.has_displacement ? (
+                  <span className="badge" data-tone="warn">
+                    sem mapas de deslocamento/tensão (treino warmup)
+                  </span>
+                ) : null}
               </section>
 
               <section className="panel-section">
@@ -128,41 +137,49 @@ export function LeftContextDock() {
                 />
               </section>
 
-              <section className="panel-section">
-                <div className="panel-heading">
-                  <span>Deslocamento</span>
-                  <SlidersHorizontal size={12} />
-                </div>
-                <div className="slider-label">
-                  <span>Exagero de deformação</span>
-                  <span>{deformScale.toFixed(1)}×</span>
-                </div>
-                <input
-                  type="range"
-                  min={0}
-                  max={20}
-                  step={0.5}
-                  value={deformScale}
-                  onChange={(event) => setDeformScale(Number(event.target.value))}
-                />
-                <label
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 7,
-                    fontSize: 10.5,
-                    color: "var(--text-secondary)",
-                  }}
-                >
+              {metadata.has_displacement ? (
+                <section className="panel-section">
+                  <div className="panel-heading">
+                    <span>Deslocamento</span>
+                    <SlidersHorizontal size={12} />
+                  </div>
+                  <div className="slider-label">
+                    <span>Exagero de deformação</span>
+                    <span>{deformScale.toFixed(1)}×</span>
+                  </div>
                   <input
-                    type="checkbox"
-                    checked={useRhoCont}
-                    disabled={!metadata.has_rho_cont}
-                    onChange={(event) => setUseRhoCont(event.target.checked)}
+                    type="range"
+                    min={0}
+                    max={20}
+                    step={0.5}
+                    value={deformScale}
+                    onChange={(event) => setDeformScale(Number(event.target.value))}
                   />
-                  ρ contínuo (Harvest)
-                </label>
-              </section>
+                </section>
+              ) : null}
+              {metadata.has_rho_cont ? (
+                <section className="panel-section">
+                  <div className="panel-heading">
+                    <span>Densidade contínua</span>
+                  </div>
+                  <label
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 7,
+                      fontSize: 10.5,
+                      color: "var(--text-secondary)",
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={useRhoCont}
+                      onChange={(event) => setUseRhoCont(event.target.checked)}
+                    />
+                    ρ contínuo (Harvest)
+                  </label>
+                </section>
+              ) : null}
 
               <section className="panel-section">
                 <div className="panel-heading">

@@ -66,6 +66,13 @@ A fixture `src/lib/__fixtures__/abmesh_fixture.bin` é gerada por `cargo run -p 
 - `src/lib/` — IPC tipado, parser zero-copy ABMESH01, Turbo, formatters.
 - `src-tauri/` — comandos IPC, cache LRU, sidecar, ws_bridge e contratos snake_case.
 
+## Visualizador v3.3
+
+- **Blueprint** inicia sempre desativado e só aparece quando você liga explicitamente (`B` ou botão ghost). Atualizações de frame não reativam a camada sozinhas.
+- Em bancos de **treino/warmup sem `displacement_blob`**, as lentes **Deslocamento** e **Tensão** e o controle de exagero ficam ocultos. Use um banco Harvest com `displacement_map`/`displacement_blob` ou rode FEM no Estúdio para visualizá-los.
+- Clique ou arraste no filmstrip para saltar imediatamente ao frame correspondente; a reprodução é pausada durante o scrub.
+- A lente **Refutação** compara o argmax da Policy Head com a ação mais visitada pelo MCTS e mostra coordenadas, `N` e `Q` no painel MCTS & PV.
+
 ## Tela cheia
 
 - Botão **Tela cheia** na pill bar superior (ícone maximizar/minimizar).

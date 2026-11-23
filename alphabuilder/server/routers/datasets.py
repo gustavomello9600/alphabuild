@@ -538,6 +538,23 @@ def _episode_metadata(request: Request, db_id: str, episode_id: str) -> dict[str
             (episode_id,),
         ).fetchall()
         supports, forces = _supported_vectors(conn, "episodes", row, resolution)
+        record_columns = _columns(conn, "records")
+        has_rho_cont = (
+            "rho_cont_blob" in record_columns
+            and conn.execute(
+                "SELECT COUNT(*) FROM records WHERE episode_id = ? AND rho_cont_blob IS NOT NULL",
+                (episode_id,),
+            ).fetchone()[0]
+            > 0
+        )
+        has_displacement = (
+            "displacement_blob" in record_columns
+            and conn.execute(
+                "SELECT COUNT(*) FROM records WHERE episode_id = ? AND displacement_blob IS NOT NULL",
+                (episode_id,),
+            ).fetchone()[0]
+            > 0
+        )
         return {
             "entry_id": episode_id,
             "kind": kind,
@@ -558,8 +575,8 @@ def _episode_metadata(request: Request, db_id: str, episode_id: str) -> dict[str
             "stiffness_e": 200e9,
             "load_config": _parse_json(row["load_config"], {}),
             "has_blueprint": _row_get(row, "v_constructed_blob") is not None,
-            "has_rho_cont": any(r[7] is not None for r in rows),
-            "has_displacement": any(r[8] is not None for r in rows),
+            "has_rho_cont": has_rho_cont,
+            "has_displacement": has_displacement,
             "supports": supports,
             "forces": forces,
             "phase_history": [r[1] for r in rows],

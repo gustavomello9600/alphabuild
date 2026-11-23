@@ -13,19 +13,20 @@ import { useAppStore } from "../store/useAppStore";
 import { useInspectorStore } from "../store/useInspectorStore";
 import type { LensMode } from "../types/contracts";
 
-const lenses: Array<{ id: LensMode; key: string; label: string; icon: typeof Box }> = [
+const allLenses: Array<{ id: LensMode; key: string; label: string; icon: typeof Box }> = [
   { id: "structure", key: "1", label: "Estrutura", icon: Box },
-  { id: "policy", key: "2", label: "Policy", icon: Sparkles },
-  { id: "mcts", key: "3", label: "MCTS", icon: Target },
-  { id: "refutation", key: "4", label: "Refutação", icon: GitCompareArrows },
-  { id: "decision", key: "5", label: "Diff", icon: Eye },
-  { id: "deformation", key: "6", label: "Desloc.", icon: Waves },
-  { id: "strain", key: "7", label: "Tensão", icon: Activity },
+  { id: "policy", key: "2", label: "Policy Head", icon: Sparkles },
+  { id: "mcts", key: "3", label: "MCTS · visitas", icon: Target },
+  { id: "refutation", key: "4", label: "Refutação MCTS×Policy", icon: GitCompareArrows },
+  { id: "decision", key: "5", label: "Diff de decisão", icon: Eye },
+  { id: "deformation", key: "6", label: "Deslocamento FEM", icon: Waves },
+  { id: "strain", key: "7", label: "Tensão / strain", icon: Activity },
 ];
 
 export function LensToolbar() {
   const lens = useInspectorStore((state) => state.lens);
   const setLens = useInspectorStore((state) => state.setLens);
+  const metadata = useInspectorStore((state) => state.metadata);
   const blueprint = useInspectorStore((state) => state.blueprintEnabled);
   const toggleBlueprint = useInspectorStore((state) => state.toggleBlueprint);
   const figureMode = useAppStore((state) => state.figureMode);
@@ -34,47 +35,69 @@ export function LensToolbar() {
 
   if (!hasEntry) return null;
 
+  const hasDisplacement = metadata?.has_displacement ?? false;
+  const lenses = allLenses.filter(
+    (entry) =>
+      hasDisplacement || (entry.id !== "deformation" && entry.id !== "strain"),
+  );
+
   return (
-    <div className="lens-bar glass" role="toolbar" aria-label="Lentes">
+    <div className="lens-bar glass" role="toolbar" aria-label="Lentes 3D">
       {lenses.map((entry) => {
         const Icon = entry.icon;
+        const tooltip = `${entry.label} · tecla ${entry.key}`;
         return (
           <button
             key={entry.id}
             type="button"
-            className="lens-button"
+            className="lens-button lens-button--icon"
             data-active={lens === entry.id}
+            data-lens={entry.id}
+            data-tooltip={tooltip}
+            title={tooltip}
+            aria-label={tooltip}
+            aria-pressed={lens === entry.id}
             onClick={() => setLens(entry.id)}
-            title={`${entry.label} (${entry.key})`}
           >
-            <span className="lens-key">{entry.key}</span>
-            <Icon size={11} />
-            <span>{entry.label}</span>
+            <Icon size={15} strokeWidth={1.8} />
           </button>
         );
       })}
-      <span style={{ width: 1, height: 16, background: "var(--hairline)", margin: "0 3px" }} />
+      <span className="lens-divider" />
       <button
         type="button"
-        className="lens-button"
+        className="lens-button lens-button--icon"
         data-active={blueprint}
+        data-lens="blueprint"
+        data-tooltip={
+          metadata?.has_blueprint
+            ? `Blueprint / v_constructed · tecla B`
+            : "Blueprint indisponível neste banco"
+        }
+        title={
+          metadata?.has_blueprint
+            ? "Blueprint / v_constructed (B)"
+            : "Blueprint indisponível neste banco"
+        }
+        aria-label="Alternar Blueprint"
+        aria-pressed={blueprint}
+        disabled={!metadata?.has_blueprint}
         onClick={toggleBlueprint}
-        title="Blueprint / v_constructed (B)"
       >
-        <span className="lens-key">B</span>
-        <Ghost size={11} />
-        <span>Blueprint</span>
+        <Ghost size={15} strokeWidth={1.8} />
       </button>
       <button
         type="button"
-        className="lens-button"
+        className="lens-button lens-button--icon"
         data-active={figureMode}
-        onClick={() => setFigureMode(!figureMode)}
+        data-lens="tcc"
+        data-tooltip="Modo Figura TCC · tecla P"
         title="Modo Figura TCC (P)"
+        aria-label="Modo Figura TCC"
+        aria-pressed={figureMode}
+        onClick={() => setFigureMode(!figureMode)}
       >
-        <span className="lens-key">P</span>
-        <Maximize2 size={11} />
-        <span>TCC</span>
+        <Maximize2 size={15} strokeWidth={1.8} />
       </button>
     </div>
   );

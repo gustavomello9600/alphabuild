@@ -240,7 +240,11 @@ export function CommandPalette() {
         },
       );
     }
-    return list;
+    return list.filter(
+      (command) =>
+        metadata?.has_displacement ||
+        (command.id !== "lens-deformation" && command.id !== "lens-strain"),
+    );
   }, [
     metadata,
     setMode,

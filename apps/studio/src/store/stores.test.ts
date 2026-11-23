@@ -75,6 +75,41 @@ describe("inspector store", () => {
     expect(useInspectorStore.getState().step).toBe(0);
   });
 
+  it("keeps Blueprint off by default and never flips it on frame changes", () => {
+    useInspectorStore.getState().openEntry(source, "episode-1", metadata);
+    expect(useInspectorStore.getState().blueprintEnabled).toBe(false);
+    useInspectorStore.getState().toggleBlueprint();
+    expect(useInspectorStore.getState().blueprintEnabled).toBe(true);
+    useInspectorStore.getState().openEntry(source, "episode-1", metadata);
+    expect(useInspectorStore.getState().blueprintEnabled).toBe(false);
+    useInspectorStore.getState().closeEntry();
+    expect(useInspectorStore.getState().blueprintEnabled).toBe(false);
+  });
+
+  it("hides deformation and strain lenses when the DB has no FEM fields", () => {
+    const trainingData = {
+      ...metadata,
+      has_displacement: false,
+      has_rho_cont: false,
+    };
+    useInspectorStore.getState().openEntry(source, "warmup", trainingData);
+    useInspectorStore.getState().setLens("deformation");
+    expect(useInspectorStore.getState().lens).toBe("structure");
+    useInspectorStore.getState().setLens("strain");
+    expect(useInspectorStore.getState().lens).toBe("structure");
+    useInspectorStore.getState().setLens("policy");
+    expect(useInspectorStore.getState().lens).toBe("policy");
+  });
+
+  it("does not enable Blueprint for datasets without v_constructed", () => {
+    useInspectorStore.getState().openEntry(source, "no-blueprint", {
+      ...metadata,
+      has_blueprint: false,
+    });
+    useInspectorStore.getState().toggleBlueprint();
+    expect(useInspectorStore.getState().blueprintEnabled).toBe(false);
+  });
+
   it("clamps clips and blueprint threshold", () => {
     const store = useInspectorStore.getState();
     store.openEntry(source, "episode-1", metadata);

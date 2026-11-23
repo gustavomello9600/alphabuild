@@ -430,6 +430,70 @@ button {
   align-items: center;
   gap: 5px;
 }
+.lens-button--icon {
+  width: 30px;
+  padding: 0;
+  justify-content: center;
+  position: relative;
+}
+.lens-button--icon[data-tooltip]::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  z-index: 60;
+  bottom: calc(100% + 10px);
+  left: 50%;
+  transform: translate(-50%, 4px);
+  padding: 5px 8px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--bg-surface) 96%, transparent);
+  border: 1px solid var(--border-subtle);
+  box-shadow: var(--shadow-panel);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 120ms var(--ease-out),
+    transform 120ms var(--ease-out);
+}
+.lens-button--icon[data-tooltip]:hover::after,
+.lens-button--icon[data-tooltip]:focus-visible::after {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+.lens-button--icon:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+.lens-button--icon[data-lens="policy"][data-active="true"] {
+  color: var(--accent-emerald);
+  border-color: color-mix(in srgb, var(--accent-emerald) 38%, transparent);
+}
+.lens-button--icon[data-lens="mcts"][data-active="true"] {
+  color: var(--accent-cyan);
+}
+.lens-button--icon[data-lens="refutation"][data-active="true"] {
+  color: var(--accent-gold);
+  border-color: color-mix(in srgb, var(--accent-gold) 40%, transparent);
+}
+.lens-button--icon[data-lens="decision"][data-active="true"] {
+  color: var(--accent-magenta);
+  border-color: color-mix(in srgb, var(--accent-magenta) 36%, transparent);
+}
+.lens-button--icon[data-lens="strain"][data-active="true"] {
+  color: var(--accent-violet);
+  border-color: color-mix(in srgb, var(--accent-violet) 40%, transparent);
+}
+.lens-divider {
+  width: 1px;
+  height: 16px;
+  background: var(--hairline);
+  margin: 0 3px;
+}
 .lens-button:hover {
   color: var(--text-primary);
   background: var(--bg-elevated);
@@ -472,6 +536,7 @@ button {
   height: 54px;
   border-radius: 10px;
   overflow: hidden;
+  touch-action: none;
   background: color-mix(in srgb, var(--bg-void) 55%, transparent);
   border: 1px solid var(--hairline);
 }
@@ -499,6 +564,7 @@ button {
   inset: 0;
   width: 100%;
   opacity: 0;
+  pointer-events: none;
   cursor: ew-resize;
 }
 .timeline-cursor {

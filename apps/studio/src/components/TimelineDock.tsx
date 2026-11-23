@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Pause, Play, SkipBack, SkipForward } from "lucide-react";
 import { useInspectorStore } from "../store/useInspectorStore";
 import { formatPercent, formatReward, formatVolume } from "../lib/formatters";
@@ -28,6 +28,7 @@ export function TimelineDock() {
   const playbackSpeed = useInspectorStore((state) => state.playbackSpeed);
   const setPlaybackSpeed = useInspectorStore((state) => state.setPlaybackSpeed);
   const [hovered, setHovered] = useState<number | null>(null);
+  const scrubbing = useRef(false);
 
   const total = metadata?.total_steps ?? 0;
   const maxStep = Math.max(0, total - 1);
@@ -49,6 +50,14 @@ export function TimelineDock() {
     }, Math.max(40, 160 / Math.max(0.1, playbackSpeed)));
     return () => window.clearInterval(handle);
   }, [playing, metadata, maxStep, playbackSpeed, step, setPlaying]);
+
+  function seekFromPointer(clientX: number, element: HTMLElement) {
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const fraction = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+    setPlaying(false);
+    setStep(Math.round(fraction * maxStep));
+  }
 
   const { valuePath, volumePath, growthPercent } = useMemo(() => {
     const values = metadata?.value_history ?? [];
@@ -159,13 +168,35 @@ export function TimelineDock() {
 
       <div
         className="timeline-track"
-        onMouseMove={(event) => {
-          const rect = event.currentTarget.getBoundingClientRect();
-          if (rect.width <= 0) return;
-          const fraction = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
-          setHovered(Math.round(fraction * maxStep));
+        onPointerDown={(event) => {
+          if (event.button !== 0) return;
+          event.currentTarget.setPointerCapture(event.pointerId);
+          scrubbing.current = true;
+          seekFromPointer(event.clientX, event.currentTarget);
         }}
-        onMouseLeave={() => setHovered(null)}
+        onPointerMove={(event) => {
+          const rect = event.currentTarget.getBoundingClientRect();
+          if (rect.width > 0) {
+            const fraction = Math.min(
+              1,
+              Math.max(0, (event.clientX - rect.left) / rect.width),
+            );
+            setHovered(Math.round(fraction * maxStep));
+          }
+          if (scrubbing.current) seekFromPointer(event.clientX, event.currentTarget);
+        }}
+        onPointerUp={(event) => {
+          scrubbing.current = false;
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+            event.currentTarget.releasePointerCapture(event.pointerId);
+          }
+        }}
+        onPointerCancel={() => {
+          scrubbing.current = false;
+        }}
+        onPointerLeave={() => {
+          if (!scrubbing.current) setHovered(null);
+        }}
         title={`Passo ${hoverIndex} · ${hoverPhase} · R=${formatReward(hoverReward)} · C=${hoverCompliance ?? "—"} · V=${formatPercent(hoverVolume)}`}
       >
         {growthPercent > 0 ? (
