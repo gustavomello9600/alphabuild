@@ -70,6 +70,6 @@ cd apps/studio && npm run typecheck && npm run test && npm run build
 
 ## Release
 
-Tags seguem `studio-vX.Y.Z` e disparam `.github/workflows/studio-release.yml` (Windows `.msi`/`.exe`, Linux `.AppImage`/`.deb`/`.rpm`, macOS `.dmg`, engine `.tar.gz` + `SHA256SUMS.txt`). O workflow exige a mesma versão em `apps/studio/package.json`, `apps/studio/src-tauri/tauri.conf.json`, `apps/studio/src-tauri/Cargo.toml` e `alphabuilder/server/__init__.py`.
+Tags seguem `studio-vX.Y.Z` e disparam `.github/workflows/studio-release.yml` (Windows `.msi`/`.exe`, Linux `.AppImage`/`.deb`/`.rpm`, macOS `.dmg`, engine `.tar.gz` + `SHA256SUMS.txt`). O build Windows publicado é unsigned por padrão; o procedimento de Authenticode (Azure Trusted Signing, token EV/OV ou PFX em CI) está documentado em `apps/studio/README.md`. O workflow exige a mesma versão em `apps/studio/package.json`, `apps/studio/src-tauri/tauri.conf.json`, `apps/studio/src-tauri/Cargo.toml` e `alphabuilder/server/__init__.py`.
 
 A especificação normativa completa está em [`specs/app_v4_spec.md`](specs/app_v4_spec.md).

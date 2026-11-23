@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { useAppStore } from "../store/useAppStore";
 import { useComputeStore } from "../store/useComputeStore";
+import { WindowControls } from "./WindowControls";
 import type { AppMode } from "../types/contracts";
 
 const modes: Array<{ id: AppMode; label: string; icon: typeof ScanSearch }> = [
@@ -41,7 +42,7 @@ export function TopBar() {
         <div className="brand">
           <div className="brand__mark" />
           <span className="brand__name">AlphaBuilder</span>
-          <span className="brand__version">STUDIO v4.0</span>
+          <span className="brand__version">STUDIO v4.0.1</span>
         </div>
         <button
           type="button"
@@ -73,6 +74,7 @@ export function TopBar() {
       </nav>
 
       <div className="top-bar__zone top-bar__zone--right">
+        <WindowControls />
         <button
           type="button"
           className={connected ? "pill-button pill-button--accent" : "pill-button"}
