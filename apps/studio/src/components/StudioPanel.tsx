@@ -16,7 +16,7 @@ import {
 } from "lucide-react";
 import { useComputeStore } from "../store/useComputeStore";
 import { useInspectorStore } from "../store/useInspectorStore";
-import { useStudioStore } from "../store/useStudioStore";
+import { resolveStudioTopology, useStudioStore } from "../store/useStudioStore";
 import type { BcType, LoadConfig, SupportVoxel } from "../types/contracts";
 import { parseAbMesh01 } from "../lib/abmesh";
 import { getActiveEngine } from "../lib/engineBus";
@@ -94,6 +94,14 @@ function outsideSupports(dims: [number, number, number]): SupportVoxel[] {
   return supports;
 }
 
+function setsEqual(a: Set<number>, b: Set<number>): boolean {
+  if (a.size !== b.size) return false;
+  for (const item of a) {
+    if (!b.has(item)) return false;
+  }
+  return true;
+}
+
 export function StudioPanel() {
   const store = useStudioStore();
   const compute = useComputeStore();
@@ -118,7 +126,7 @@ export function StudioPanel() {
       store.setSolidVoxels(next);
       lastSent.current = new Set(next);
     }
-  }, [store.sessionStatus, store.sessionFrame]);
+  }, [store.sessionStatus, store.sessionFrame, store.sessionFollowLive]);
 
   function applyTemplate(kind: "cantilever" | "bridge" | "empty") {
     const dims = RESOLUTIONS[kind] ?? [64, 32, 8];
@@ -146,6 +154,10 @@ export function StudioPanel() {
       overlay: null,
       session: null,
       sessionFrame: null,
+      sessionHistory: [],
+      sessionViewFrame: null,
+      sessionViewStep: null,
+      sessionFollowLive: true,
       sessionStatus: "IDLE",
       inferenceValue: null,
       inferenceError: null,
@@ -374,6 +386,17 @@ export function StudioPanel() {
   const sessionMeta = (store.sessionViewFrame ?? store.sessionFrame)?.metadata;
   const running = store.sessionStatus === "RUNNING";
   const paused = store.sessionStatus === "PAUSED";
+  const hasLocalEdits =
+    paused && store.sessionFollowLive && !setsEqual(store.solidVoxels, lastSent.current);
+  const topology = resolveStudioTopology({
+    session: store.session,
+    sessionFrame: store.sessionFrame,
+    sessionViewFrame: store.sessionViewFrame,
+    sessionStatus: store.sessionStatus,
+    sessionFollowLive: store.sessionFollowLive,
+    report: store.report,
+    hasLocalEdits,
+  });
 
   return (
     <aside className="studio-panel glass">
@@ -515,25 +538,43 @@ export function StudioPanel() {
         <section className="panel-section">
           <div className="panel-heading">
             <span>Topologia Rust</span>
-            <button type="button" className="icon-button" onClick={() => void store.analyze()}>
+            <button
+              type="button"
+              className="icon-button"
+              onClick={() => void store.analyze()}
+              disabled={running}
+              title={running ? "Topologia acompanha a sessão ao vivo" : "Recalcular topologia local"}
+            >
               <RefreshCw size={12} />
             </button>
           </div>
-          {store.report ? (
+          {topology ? (
             <>
               <div className="stat-grid">
-                <Stat label="Ilhas" value={String(store.report.n_islands)} />
-                <Stat label="Soltos" value={String(store.report.loose_voxels)} />
-                <Stat label="Volume" value={formatPercent(store.report.volume_fraction)} />
+                <Stat label="Ilhas" value={String(topology.n_islands)} />
+                <Stat label="Soltos" value={String(topology.loose_voxels)} />
+                <Stat label="Volume" value={formatPercent(topology.volume_fraction)} />
                 <Stat
                   label="Carga conectada"
-                  value={formatPercent(store.report.connected_load_fraction)}
+                  value={formatPercent(topology.connected_load_fraction)}
                 />
-                <Stat label="Legal +" value={String(store.report.legal_add_count)} />
-                <Stat label="Legal −" value={String(store.report.legal_remove_count)} />
+                <Stat
+                  label="Legal +"
+                  value={
+                    topology.legal_add_count !== null ? String(topology.legal_add_count) : "—"
+                  }
+                />
+                <Stat
+                  label="Legal −"
+                  value={
+                    topology.legal_remove_count !== null
+                      ? String(topology.legal_remove_count)
+                      : "—"
+                  }
+                />
               </div>
-              <span className="badge" data-tone={store.report.is_connected ? "growth" : "warn"}>
-                {store.report.is_connected ? "CONECTADO" : "DESCONECTADO"}
+              <span className="badge" data-tone={topology.is_connected ? "growth" : "warn"}>
+                {topology.is_connected ? "CONECTADO" : "DESCONECTADO"}
               </span>
             </>
           ) : (

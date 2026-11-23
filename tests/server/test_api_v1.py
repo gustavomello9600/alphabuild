@@ -535,3 +535,69 @@ def test_mcts_live_session_advances_tree_and_grows_across_steps(
 
         assert isinstance(history[0]["reward_v33"]["pbrs_delta"], float)
         assert history[0]["phase"] == "GROWTH"
+        assert history[0]["legal_add_count"] > 0
+        for entry in history:
+            assert isinstance(entry["legal_add_count"], int) and entry["legal_add_count"] >= 0
+            assert isinstance(entry["legal_remove_count"], int) and entry["legal_remove_count"] >= 0
+
+
+def test_mcts_live_session_reports_connected_load_fraction_in_refinement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    class GrowingDummyModel(DummyModel):
+        def predict(self, state: np.ndarray):
+            d, h, w = state.shape[1:]
+            p_add = np.linspace(0.2, 1.0, d * h * w, dtype=np.float32).reshape(d, h, w)
+            p_rem = np.full((d, h, w), -50.0, dtype=np.float32)
+            return 0.25, p_add, p_rem
+
+    monkeypatch.setattr("alphabuilder.server.worker.has_fenics", lambda: False)
+    client, _ = make_app(tmp_path, model_factory=lambda path, device: GrowingDummyModel())
+    body = session_body()
+    body["initial_solid_voxels"] = [
+        x * 8 + y * 2 + z for x in range(8) for y in range(1, 4) for z in range(2)
+    ]
+    body["episode_config"]["max_steps"] = 2
+    body["episode_config"]["max_phase1_steps"] = 10
+    body["phase1_mcts"] = {
+        "num_simulations": 8,
+        "batch_size": 2,
+        "action_batch_size": 4,
+        "c_puct": 1.2,
+        "top_k_expansion": 16,
+        "mixmax_beta": 0.75,
+    }
+    body["phase2_mcts"] = {
+        "num_simulations": 8,
+        "batch_size": 2,
+        "action_batch_size": 4,
+        "c_puct": 0.8,
+        "top_k_expansion": 16,
+        "mixmax_beta": 1.0,
+    }
+    with client:
+        load_dummy(client)
+        created = client.post("/api/v1/sessions", json=body)
+        assert created.status_code == 201, created.text
+        handle = created.json()
+        session_id = handle["session_id"]
+
+        with client.websocket_connect(handle["ws_url"]) as ws:
+            _next_until(
+                ws,
+                lambda kind, payload: kind == "text"
+                and payload.get("type") == "session_ended",
+                limit=80,
+            )
+
+        detail = client.get(f"/api/v1/sessions/{session_id}")
+        assert detail.status_code == 200, detail.text
+        history = detail.json()["history"]
+        assert len(history) == 2
+
+        for entry in history:
+            assert entry["phase"] == "REFINEMENT"
+            assert entry["is_connected"] is True
+            assert entry["connected_load_fraction"] == pytest.approx(1.0)
+            assert isinstance(entry["legal_add_count"], int)
+            assert isinstance(entry["legal_remove_count"], int)

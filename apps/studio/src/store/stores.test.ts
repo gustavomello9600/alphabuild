@@ -1,8 +1,15 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import type { DataSourceRef, EntryMetadata } from "../types/contracts";
+import type {
+  DataSourceRef,
+  EntryMetadata,
+  LocalTopologyReport,
+  ParsedAbMesh,
+  SessionHandle,
+  StepFrameMetadata,
+} from "../types/contracts";
 import { useAppStore } from "./useAppStore";
 import { useInspectorStore } from "./useInspectorStore";
-import { useStudioStore } from "./useStudioStore";
+import { resolveStudioTopology, useStudioStore } from "./useStudioStore";
 import { useCompareStore } from "./useCompareStore";
 
 const source: DataSourceRef = {
@@ -122,6 +129,64 @@ describe("inspector store", () => {
   });
 });
 
+function makeSessionFrame(overrides: Partial<StepFrameMetadata> = {}): ParsedAbMesh {
+  const emptyView = new DataView(new ArrayBuffer(0));
+  return {
+    flags: 0,
+    stepIndex: overrides.step ?? 1,
+    dims: [64, 32, 8],
+    dispP99: 0,
+    strainP99: 0,
+    positions: new Float32Array(0),
+    normals: new Float32Array(0),
+    aoAndScalars: new Float32Array(0),
+    voxelIds: new Uint32Array(0),
+    indices: new Uint32Array(0),
+    blueprintPositions: new Float32Array(0),
+    blueprintNormals: new Float32Array(0),
+    blueprintIndices: new Uint32Array(0),
+    policyAddRaw: emptyView,
+    policyAddCount: 0,
+    policyRemRaw: emptyView,
+    policyRemCount: 0,
+    mctsAddRaw: emptyView,
+    mctsAddCount: 0,
+    mctsRemRaw: emptyView,
+    mctsRemCount: 0,
+    diffAdded: new Uint32Array(0),
+    diffRemoved: new Uint32Array(0),
+    metadata: {
+      step: 1,
+      phase: "GROWTH",
+      value: 0.2,
+      value_target: null,
+      fem_reward: null,
+      compliance_fem: null,
+      max_displacement: null,
+      volume_fraction: 0.05,
+      is_connected: false,
+      n_islands: 1,
+      loose_voxels: 0,
+      connected_load_fraction: 0.25,
+      island_penalty: 0,
+      reward_v33: {
+        compliance_score: null,
+        volume_bonus: null,
+        fem_score: null,
+        displacement_penalty: 0,
+        island_penalty: 0,
+        connectivity_bonus: 0,
+        pbrs_delta: 0,
+        total_reward: 0.2,
+        is_collapsed: false,
+      },
+      mcts_stats: null,
+      selected_actions: [],
+      ...overrides,
+    },
+  };
+}
+
 describe("studio store", () => {
   it("paints a 3x3x3 brush and validates serialization", () => {
     useStudioStore.setState({ resolution: [4, 4, 4], solidVoxels: new Set() });
@@ -132,6 +197,155 @@ describe("studio store", () => {
     expect(state.resolution).toEqual([4, 4, 4]);
     useStudioStore.getState().setVoxel(2 * 16 + 2 * 4 + 2, false, 1);
     expect(useStudioStore.getState().solidVoxels.size).toBe(26);
+  });
+
+  it("resolves local vs live session vs replay topology accurately", () => {
+    const localReport: LocalTopologyReport = {
+      is_connected: false,
+      n_islands: 0,
+      loose_voxels: 0,
+      volume_fraction: 0,
+      connected_load_fraction: 0,
+      island_penalty: 0,
+      legal_add_count: 512,
+      legal_remove_count: 0,
+    };
+    const session: SessionHandle = {
+      session_id: "sess_1",
+      game_id: "game_1",
+      status: "RUNNING",
+      fem_enabled: true,
+      ws_url: "/api/v1/ws/sessions/sess_1",
+    };
+    const liveFrame = makeSessionFrame({
+      step: 36,
+      phase: "REFINEMENT",
+      is_connected: true,
+      n_islands: 1,
+      loose_voxels: 0,
+      volume_fraction: 0.0703,
+      connected_load_fraction: 1,
+      legal_add_count: 880,
+      legal_remove_count: 112,
+    });
+    const replayFrame = makeSessionFrame({
+      step: 10,
+      phase: "GROWTH",
+      is_connected: false,
+      n_islands: 2,
+      loose_voxels: 4,
+      volume_fraction: 0.02,
+      connected_load_fraction: 0,
+      legal_add_count: 240,
+      legal_remove_count: 320,
+    });
+
+    const expectedLocal = {
+      source: "local" as const,
+      is_connected: false,
+      n_islands: 0,
+      loose_voxels: 0,
+      volume_fraction: 0,
+      connected_load_fraction: 0,
+      legal_add_count: 512,
+      legal_remove_count: 0,
+    };
+
+    expect(
+      resolveStudioTopology({
+        session: null,
+        sessionFrame: null,
+        sessionViewFrame: null,
+        sessionStatus: "IDLE",
+        sessionFollowLive: true,
+        report: localReport,
+        hasLocalEdits: false,
+      }),
+    ).toEqual(expectedLocal);
+
+    expect(
+      resolveStudioTopology({
+        session,
+        sessionFrame: liveFrame,
+        sessionViewFrame: null,
+        sessionStatus: "RUNNING",
+        sessionFollowLive: true,
+        report: localReport,
+        hasLocalEdits: false,
+      }),
+    ).toEqual({
+      source: "session",
+      is_connected: true,
+      n_islands: 1,
+      loose_voxels: 0,
+      volume_fraction: 0.0703,
+      connected_load_fraction: 1,
+      legal_add_count: 880,
+      legal_remove_count: 112,
+    });
+
+    expect(
+      resolveStudioTopology({
+        session,
+        sessionFrame: liveFrame,
+        sessionViewFrame: replayFrame,
+        sessionStatus: "RUNNING",
+        sessionFollowLive: false,
+        report: localReport,
+        hasLocalEdits: false,
+      }),
+    ).toEqual({
+      source: "session",
+      is_connected: false,
+      n_islands: 2,
+      loose_voxels: 4,
+      volume_fraction: 0.02,
+      connected_load_fraction: 0,
+      legal_add_count: 240,
+      legal_remove_count: 320,
+    });
+
+    expect(
+      resolveStudioTopology({
+        session,
+        sessionFrame: liveFrame,
+        sessionViewFrame: liveFrame,
+        sessionStatus: "PAUSED",
+        sessionFollowLive: true,
+        report: localReport,
+        hasLocalEdits: false,
+      })?.source,
+    ).toBe("session");
+
+    expect(
+      resolveStudioTopology({
+        session,
+        sessionFrame: liveFrame,
+        sessionViewFrame: liveFrame,
+        sessionStatus: "PAUSED",
+        sessionFollowLive: true,
+        report: localReport,
+        hasLocalEdits: true,
+      }),
+    ).toEqual(expectedLocal);
+
+    const legacyConnectedFrame = makeSessionFrame({
+      step: 40,
+      phase: "REFINEMENT",
+      is_connected: true,
+      connected_load_fraction: 0,
+    });
+    expect(
+      resolveStudioTopology({
+        session,
+        sessionFrame: legacyConnectedFrame,
+        sessionViewFrame: null,
+        sessionStatus: "RUNNING",
+        sessionFollowLive: true,
+        report: null,
+        hasLocalEdits: false,
+      })?.connected_load_fraction,
+    ).toBe(1);
   });
 });
 

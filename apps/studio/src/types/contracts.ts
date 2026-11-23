@@ -102,6 +102,8 @@ export interface StepFrameMetadata {
   selected_actions: SelectedAction[];
   inference_ms?: number | null;
   step_elapsed_ms?: number | null;
+  legal_add_count?: number | null;
+  legal_remove_count?: number | null;
   reward_components?: Record<string, number | null>;
   fem_enabled?: boolean;
 }

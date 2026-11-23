@@ -21,6 +21,58 @@ export interface SessionHistoryEntry {
   metadata: StepFrameMetadata;
 }
 
+export interface StudioTopologyView {
+  is_connected: boolean;
+  n_islands: number;
+  loose_voxels: number;
+  volume_fraction: number;
+  connected_load_fraction: number;
+  legal_add_count: number | null;
+  legal_remove_count: number | null;
+  source: "session" | "local";
+}
+
+export function resolveStudioTopology(input: {
+  session: SessionHandle | null;
+  sessionFrame: ParsedAbMesh | null;
+  sessionViewFrame: ParsedAbMesh | null;
+  sessionStatus: string;
+  sessionFollowLive: boolean;
+  report: LocalTopologyReport | null;
+  hasLocalEdits: boolean;
+}): StudioTopologyView | null {
+  const displayFrame = input.session ? (input.sessionViewFrame ?? input.sessionFrame) : null;
+  const editingPausedLive =
+    input.sessionStatus === "PAUSED" && input.sessionFollowLive && input.hasLocalEdits;
+  if (displayFrame && !editingPausedLive) {
+    const meta = displayFrame.metadata;
+    return {
+      source: "session",
+      is_connected: meta.is_connected,
+      n_islands: meta.n_islands,
+      loose_voxels: meta.loose_voxels,
+      volume_fraction: meta.volume_fraction,
+      connected_load_fraction:
+        meta.is_connected && meta.connected_load_fraction === 0 ? 1 : meta.connected_load_fraction,
+      legal_add_count: meta.legal_add_count ?? null,
+      legal_remove_count: meta.legal_remove_count ?? null,
+    };
+  }
+  if (input.report) {
+    return {
+      source: "local",
+      is_connected: input.report.is_connected,
+      n_islands: input.report.n_islands,
+      loose_voxels: input.report.loose_voxels,
+      volume_fraction: input.report.volume_fraction,
+      connected_load_fraction: input.report.connected_load_fraction,
+      legal_add_count: input.report.legal_add_count,
+      legal_remove_count: input.report.legal_remove_count,
+    };
+  }
+  return null;
+}
+
 interface StudioStore {
   resolution: [number, number, number];
   bcType: BcType;

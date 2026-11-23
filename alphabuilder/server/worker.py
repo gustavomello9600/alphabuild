@@ -663,6 +663,7 @@ class LiveSession:
         from alphabuilder.src.core.physics_model import PhysicalProperties
         from alphabuilder.src.logic.harvest.config import SIMPConfig
         from alphabuilder.src.logic.harvest.optimization import run_fenitop_optimization
+        from alphabuilder.src.logic.mcts.legal_moves import get_legal_moves
         from alphabuilder.src.logic.selfplay.reward import (
             calculate_compliance_score,
             calculate_displacement_penalty,
@@ -705,6 +706,12 @@ class LiveSession:
             fem_score = float(entry.get("fem_score", 0.0))
             displacement = entry.get("displacement_map")
             reward = calculate_reward(compliance, volume, True, max_disp)
+            valid_add, valid_remove = get_legal_moves(
+                density,
+                0.5,
+                bc_masks=self.bc_masks,
+                forces=(self.forces[0], self.forces[1], self.forces[2]),
+            )
             matrix: dict[str, Any] = {
                 "step": int(entry.get("step", len(outcomes))),
                 "phase": "REFINEMENT",
@@ -719,6 +726,8 @@ class LiveSession:
                 "loose_voxels": 0,
                 "connected_load_fraction": 1.0,
                 "island_penalty": 0.0,
+                "legal_add_count": int(valid_add.sum()),
+                "legal_remove_count": int(valid_remove.sum()),
                 "reward_components": {},
                 "reward_v33": {
                     "compliance_score": float(calculate_compliance_score(compliance)),
@@ -945,12 +954,15 @@ class LiveSession:
         island_penalty = calculate_island_penalty(
             analysis["n_islands"], analysis["loose_voxels"], total_voxels
         )
-        connectivity_bonus = 0.0
-        connected_load_fraction = 0.0
-        if phase == "GROWTH":
-            connectivity_bonus, connected_load_fraction = calculate_connectivity_reward(
-                new_density, bc_masks, force_tuple
-            )
+        conn_bonus, connected_load_fraction = calculate_connectivity_reward(
+            new_density, bc_masks, force_tuple
+        )
+        connectivity_bonus = conn_bonus if phase == "GROWTH" else 0.0
+        next_valid_add, next_valid_remove = get_legal_moves(
+            new_density, 0.5, bc_masks=bc_masks, forces=force_tuple
+        )
+        legal_add_count = int(next_valid_add.sum())
+        legal_remove_count = int(next_valid_remove.sum())
         phi_after, _ = calculate_pbrs_potential(
             new_density, bc_masks, force_tuple, load_cfg_dict
         )
@@ -1135,6 +1147,8 @@ class LiveSession:
             "selected_actions": selected,
             "step_elapsed_ms": round((time.perf_counter() - started) * 1000.0, 2),
             "inference_ms": round(inference_ms, 2),
+            "legal_add_count": legal_add_count,
+            "legal_remove_count": legal_remove_count,
             "fem_enabled": fem_enabled,
             "resolution": list(self.dims),
             "bc_type": self.bc_type,

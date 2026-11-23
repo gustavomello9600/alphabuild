@@ -334,6 +334,8 @@ class StepFrameMetadata(BaseModel):
     selected_actions: list[SelectedAction] = Field(default_factory=list)
     step_elapsed_ms: Optional[float] = None
     inference_ms: Optional[float] = None
+    legal_add_count: Optional[int] = None
+    legal_remove_count: Optional[int] = None
 
 
 class SessionCreateResponse(BaseModel):
