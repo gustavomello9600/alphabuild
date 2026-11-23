@@ -318,9 +318,11 @@ async def list_episodes(
     try:
         kind = _kind(conn)
         if kind == "selfplay":
-            rows = conn.execute("SELECT * FROM games").fetchall()
+            scalar_cols = [c for c in _columns(conn, "games") if not c.endswith("_blob")]
+            rows = conn.execute(f"SELECT {', '.join(scalar_cols)} FROM games").fetchall()
         elif kind in {"harvest_v33", "harvest_v2"}:
-            rows = conn.execute("SELECT * FROM episodes").fetchall()
+            scalar_cols = [c for c in _columns(conn, "episodes") if not c.endswith("_blob")]
+            rows = conn.execute(f"SELECT {', '.join(scalar_cols)} FROM episodes").fetchall()
         else:
             rows = conn.execute(
                 "SELECT DISTINCT episode_id FROM training_data"
@@ -329,20 +331,12 @@ async def list_episodes(
         for row in rows:
             if kind == "selfplay":
                 entry_id = row["game_id"]
-                total = conn.execute(
-                    "SELECT COUNT(*) FROM game_steps WHERE game_id = ?", (entry_id,)
-                ).fetchone()[0]
-                p1 = conn.execute(
-                    "SELECT COUNT(*) FROM game_steps WHERE game_id = ? AND phase='GROWTH'",
-                    (entry_id,),
-                ).fetchone()[0]
-                p2 = total - p1
                 item = {
                     "entry_id": entry_id,
                     "kind": kind,
-                    "total_steps": int(total),
-                    "steps_phase1": int(p1),
-                    "steps_phase2": int(p2),
+                    "total_steps": int(_row_get(row, "total_steps") or 0),
+                    "steps_phase1": 0,
+                    "steps_phase2": 0,
                     "final_reward": _row_get(row, "final_score"),
                     "final_compliance": _row_get(row, "final_compliance"),
                     "final_volume": _row_get(row, "final_volume"),
@@ -362,43 +356,34 @@ async def list_episodes(
                     continue
             elif kind in {"harvest_v33", "harvest_v2"}:
                 entry_id = row["episode_id"]
-                total = conn.execute(
-                    "SELECT COUNT(*) FROM records WHERE episode_id = ?", (entry_id,)
-                ).fetchone()[0]
-                p1 = conn.execute(
-                    "SELECT COUNT(*) FROM records WHERE episode_id = ? AND phase='GROWTH'",
-                    (entry_id,),
-                ).fetchone()[0]
-                p2 = total - p1
-                final_reward = None
-                last = conn.execute(
-                    "SELECT fitness_score, compliance, vol_frac, max_displacement, is_connected, reward_components_json "
-                    "FROM records WHERE episode_id = ? ORDER BY step DESC LIMIT 1",
-                    (entry_id,),
-                ).fetchone()
-                if last:
-                    components = _parse_json(last[5], {})
-                    if isinstance(components, dict) and components.get("total") is not None:
-                        final_reward = components.get("total")
-                    else:
-                        final_reward = last[0]
+                fc = _row_get(row, "final_compliance")
+                fv = _row_get(row, "final_volume")
+                fdisp = _row_get(row, "final_max_displacement")
+                fconn_raw = _row_get(row, "final_is_connected")
+                is_conn = bool(fconn_raw) if fconn_raw is not None else None
+                est_reward = None
+                if fc is not None and fv is not None:
+                    est_reward = _reward_from_values(
+                        float(fc),
+                        float(fv),
+                        float(fdisp) if fdisp is not None else None,
+                        True if is_conn is None else is_conn,
+                    ).get("total_reward")
                 item = {
                     "entry_id": entry_id,
                     "kind": kind,
-                    "total_steps": int(total),
-                    "steps_phase1": int(p1),
-                    "steps_phase2": int(p2),
-                    "final_reward": final_reward,
-                    "final_compliance": _row_get(row, "final_compliance"),
-                    "final_volume": _row_get(row, "final_volume"),
+                    "total_steps": 0,
+                    "steps_phase1": 0,
+                    "steps_phase2": 0,
+                    "final_reward": est_reward,
+                    "final_compliance": fc,
+                    "final_volume": fv,
                     "bc_type": _row_get(row, "bc_type"),
                     "strategy": _row_get(row, "strategy"),
                     "neural_engine": None,
                     "checkpoint_version": _row_get(row, "code_version"),
                     "seed": _row_get(row, "seed"),
-                    "is_connected": bool(_row_get(row, "final_is_connected"))
-                    if _row_get(row, "final_is_connected") is not None
-                    else None,
+                    "is_connected": is_conn,
                     "created_at": str(_row_get(row, "created_at", "")),
                 }
                 if strategy and item["strategy"] != strategy:
@@ -411,13 +396,10 @@ async def list_episodes(
                     continue
             else:
                 entry_id = row["episode_id"]
-                total = conn.execute(
-                    "SELECT COUNT(*) FROM training_data WHERE episode_id = ?", (entry_id,)
-                ).fetchone()[0]
                 item = {
                     "entry_id": entry_id,
                     "kind": kind,
-                    "total_steps": int(total),
+                    "total_steps": 0,
                     "steps_phase1": 0,
                     "steps_phase2": 0,
                     "final_reward": None,
@@ -441,7 +423,48 @@ async def list_episodes(
         else:
             items.sort(key=lambda i: i.get("created_at", ""), reverse=True)
         total_count = len(items)
-        return {"total_count": total_count, "items": items[offset : offset + limit]}
+        page_items = items[offset : offset + limit]
+        for item in page_items:
+            entry_id = item["entry_id"]
+            if kind == "selfplay":
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM game_steps WHERE game_id = ?", (entry_id,)
+                ).fetchone()[0]
+                p1 = conn.execute(
+                    "SELECT COUNT(*) FROM game_steps WHERE game_id = ? AND phase='GROWTH'",
+                    (entry_id,),
+                ).fetchone()[0]
+                item["total_steps"] = int(total)
+                item["steps_phase1"] = int(p1)
+                item["steps_phase2"] = int(total - p1)
+            elif kind in {"harvest_v33", "harvest_v2"}:
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM records WHERE episode_id = ?", (entry_id,)
+                ).fetchone()[0]
+                p1 = conn.execute(
+                    "SELECT COUNT(*) FROM records WHERE episode_id = ? AND phase='GROWTH'",
+                    (entry_id,),
+                ).fetchone()[0]
+                last = conn.execute(
+                    "SELECT fitness_score, reward_components_json "
+                    "FROM records WHERE episode_id = ? ORDER BY step DESC LIMIT 1",
+                    (entry_id,),
+                ).fetchone()
+                if last:
+                    components = _parse_json(last[1], {})
+                    if isinstance(components, dict) and components.get("total") is not None:
+                        item["final_reward"] = components.get("total")
+                    elif last[0] is not None:
+                        item["final_reward"] = last[0]
+                item["total_steps"] = int(total)
+                item["steps_phase1"] = int(p1)
+                item["steps_phase2"] = int(total - p1)
+            else:
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM training_data WHERE episode_id = ?", (entry_id,)
+                ).fetchone()[0]
+                item["total_steps"] = int(total)
+        return {"total_count": total_count, "items": page_items}
     finally:
         conn.close()
 

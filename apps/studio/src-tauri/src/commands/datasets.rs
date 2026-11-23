@@ -699,11 +699,39 @@ async fn build_frame(
     Ok(bytes)
 }
 
-fn summarize_harvest(
-    reader: &SqliteReader,
-    row: &HashMap<String, SqlValue>,
-) -> Option<EntrySummary> {
+fn summarize_harvest_light(row: &HashMap<String, SqlValue>, kind: DbKind) -> Option<EntrySummary> {
     let entry_id = value_text(row.get("episode_id"))?;
+    let fc = value_f64(row.get("final_compliance"));
+    let fv = value_f64(row.get("final_volume"));
+    let fdisp = value_f64(row.get("final_max_displacement"));
+    let is_conn = value_bool(row.get("final_is_connected"));
+    let est_reward = match (fc, fv) {
+        (Some(c), Some(v)) => Some(
+            calculate_reward_breakdown(c, v, is_conn.unwrap_or(true), fdisp, 0.0).total_reward,
+        ),
+        _ => None,
+    };
+    Some(EntrySummary {
+        entry_id,
+        kind,
+        total_steps: 0,
+        steps_phase1: 0,
+        steps_phase2: 0,
+        final_reward: est_reward,
+        final_compliance: fc,
+        final_volume: fv,
+        bc_type: value_text(row.get("bc_type")),
+        strategy: value_text(row.get("strategy")),
+        neural_engine: None,
+        checkpoint_version: value_text(row.get("code_version")),
+        seed: value_i64(row.get("seed")),
+        is_connected: is_conn,
+        created_at: value_text(row.get("created_at")),
+    })
+}
+
+fn hydrate_harvest_summary(reader: &SqliteReader, item: &mut EntrySummary) {
+    let entry_id = item.entry_id.clone();
     let total = reader
         .query_row(
             "SELECT COUNT(*) AS c FROM records WHERE episode_id = ?1",
@@ -724,35 +752,25 @@ fn summarize_harvest(
         .unwrap_or(0);
     let last = reader
         .query_row(
-            "SELECT fitness_score, compliance, vol_frac, max_displacement, is_connected, reward_components_json FROM records WHERE episode_id = ?1 ORDER BY step DESC LIMIT 1",
-            &[SqlValue::Text(entry_id.clone())],
+            "SELECT fitness_score, reward_components_json FROM records WHERE episode_id = ?1 ORDER BY step DESC LIMIT 1",
+            &[SqlValue::Text(entry_id)],
         )
         .ok()
         .flatten();
-    let final_reward = last.as_ref().and_then(|r| {
-        r.get("reward_components_json")
+    if let Some(r) = last.as_ref() {
+        if let Some(rew) = r
+            .get("reward_components_json")
             .and_then(SqlValue::as_str)
             .and_then(|text| serde_json::from_str::<Value>(text).ok())
             .and_then(|v| v.get("total").and_then(Value::as_f64))
             .or_else(|| value_f64(r.get("fitness_score")))
-    });
-    Some(EntrySummary {
-        entry_id,
-        kind: DbKind::HarvestV33,
-        total_steps: total,
-        steps_phase1: p1,
-        steps_phase2: total - p1,
-        final_reward,
-        final_compliance: value_f64(row.get("final_compliance")),
-        final_volume: value_f64(row.get("final_volume")),
-        bc_type: value_text(row.get("bc_type")),
-        strategy: value_text(row.get("strategy")),
-        neural_engine: None,
-        checkpoint_version: value_text(row.get("code_version")),
-        seed: value_i64(row.get("seed")),
-        is_connected: value_bool(row.get("final_is_connected")),
-        created_at: value_text(row.get("created_at")),
-    })
+        {
+            item.final_reward = Some(rew);
+        }
+    }
+    item.total_steps = total;
+    item.steps_phase1 = p1;
+    item.steps_phase2 = total - p1;
 }
 
 fn summarize_game(reader: &SqliteReader, row: &HashMap<String, SqlValue>) -> Option<EntrySummary> {
@@ -834,22 +852,59 @@ fn list_local_entries(
     let reader = open_reader(source)?;
     let kind = reader.detect_kind().map_err(|e| e.to_string())?;
     let rows = match kind {
-        CoreDbKind::SelfPlay => reader
-            .query_rows("SELECT * FROM games", &[])
-            .map_err(|e| e.to_string())?,
-        CoreDbKind::HarvestV33 | CoreDbKind::HarvestV2 => reader
-            .query_rows("SELECT * FROM episodes", &[])
-            .map_err(|e| e.to_string())?,
+        CoreDbKind::SelfPlay => {
+            let select = reader
+                .select_with_nulls(
+                    "games",
+                    &[
+                        "game_id",
+                        "final_score",
+                        "final_compliance",
+                        "final_volume",
+                        "bc_type",
+                        "neural_engine",
+                        "checkpoint_version",
+                        "created_at",
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            reader
+                .query_rows(&format!("SELECT {select} FROM games"), &[])
+                .map_err(|e| e.to_string())?
+        }
+        CoreDbKind::HarvestV33 | CoreDbKind::HarvestV2 => {
+            let select = reader
+                .select_with_nulls(
+                    "episodes",
+                    &[
+                        "episode_id",
+                        "final_compliance",
+                        "final_volume",
+                        "final_max_displacement",
+                        "final_is_connected",
+                        "bc_type",
+                        "strategy",
+                        "code_version",
+                        "seed",
+                        "created_at",
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            reader
+                .query_rows(&format!("SELECT {select} FROM episodes"), &[])
+                .map_err(|e| e.to_string())?
+        }
         CoreDbKind::LegacyV1 => reader
             .query_rows("SELECT DISTINCT episode_id FROM training_data", &[])
             .map_err(|e| e.to_string())?,
     };
+    let contract_db_kind = contract_kind(kind);
     let mut items: Vec<EntrySummary> = rows
         .iter()
         .filter_map(|row| match kind {
             CoreDbKind::SelfPlay => summarize_game(&reader, row),
             CoreDbKind::LegacyV1 => summarize_legacy(&reader, row),
-            _ => summarize_harvest(&reader, row),
+            _ => summarize_harvest_light(row, contract_db_kind.clone()),
         })
         .collect();
     if let Some(search) = &query.search {
@@ -892,7 +947,12 @@ fn list_local_entries(
         query.limit as usize
     };
     let offset = query.offset as usize;
-    let page = items.into_iter().skip(offset).take(limit).collect();
+    let mut page: Vec<EntrySummary> = items.into_iter().skip(offset).take(limit).collect();
+    if matches!(kind, CoreDbKind::HarvestV33 | CoreDbKind::HarvestV2) {
+        for item in &mut page {
+            hydrate_harvest_summary(&reader, item);
+        }
+    }
     Ok(EntryListPage {
         total_count,
         items: page,

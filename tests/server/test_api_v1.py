@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -263,6 +264,8 @@ def test_infer_rejects_oversized_resolution(tmp_path: Path):
 
 
 def test_infer_abwire01_is_parsed_by_rust(tmp_path: Path):
+    if shutil.which("cargo") is None:
+        pytest.skip("cargo is not installed on this host")
     client, _ = make_app(tmp_path)
     with client:
         load_dummy(client)
@@ -313,7 +316,8 @@ def _next_until(ws, predicate, limit: int = 80):
     raise AssertionError(f"condition not reached; last frames: {frames[-5:]}")
 
 
-def test_websocket_full_session_flow(tmp_path: Path):
+def test_websocket_full_session_flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("alphabuilder.server.worker.has_fenics", lambda: False)
     client, _ = make_app(tmp_path)
     with client:
         load_dummy(client)

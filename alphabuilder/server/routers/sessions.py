@@ -120,6 +120,9 @@ async def session_ws(websocket: WebSocket, session_id: str) -> None:
     queue = session.subscribe()
     try:
         await websocket.send_json(session.state_payload())
+        if session.frames:
+            latest_step = max(session.frames.keys())
+            await websocket.send_bytes(session.frames[latest_step])
         if session.status in {"COMPLETED", "FAILED", "CANCELLED"}:
             await websocket.send_json(
                 {
