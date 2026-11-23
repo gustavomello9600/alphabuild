@@ -56,6 +56,13 @@ cd apps/studio && npm run typecheck && npm run test && npm run build
 - Local SQLite is always opened read-only (`SQLITE_OPEN_READ_ONLY` + `PRAGMA table_info`).
 - FastAPI never performs inference/FEM/MCTS inline; all work runs on the single `ComputeWorker` thread.
 
+## Brand assets
+
+- Fonte: `apps/studio/src/assets/brand/` (SVG) + `p6_wordmark_dark.png`.
+- Use `apps/studio/src/components/BrandMark.tsx` para alternar dark/light automaticamente.
+- Ícones nativos/favicon: `p2_prism_brand_mark.svg` → `src-tauri/icons/` e `public/favicon.svg`.
+- Guia de contexto e tamanhos mínimos: `apps/studio/src/assets/brand/README.md`.
+
 ## Key Files
 
 - `specs/app_v4_spec.md`: normative Studio v4.0 specification.

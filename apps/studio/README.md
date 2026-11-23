@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="src/assets/brand/p6_wordmark_dark.png" width="420" alt="AlphaBuilder Studio — 3D Structural Optimization" />
+</p>
+
 # AlphaBuilder Studio v4.0
 
 Desktop cross-platform para inspecionar e editar estruturas AlphaBuilder v3.3.

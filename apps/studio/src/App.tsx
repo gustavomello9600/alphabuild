@@ -1,6 +1,7 @@
 import { useEffect } from "react";
-import { Database, FolderOpen } from "lucide-react";
+import { FolderOpen } from "lucide-react";
 import { TopBar } from "./components/TopBar";
+import { BrandMark } from "./components/BrandMark";
 import { ViewportCanvas } from "./components/ViewportCanvas";
 import { LibraryDrawer } from "./components/LibraryDrawer";
 import { LensToolbar } from "./components/LensToolbar";
@@ -223,8 +224,8 @@ export default function App() {
       {mode === "inspector" && !hasEntry ? (
         <div className="center-empty">
           <div className="center-empty__card glass">
-            <div className="center-empty__icon">
-              <Database size={24} />
+            <div className="center-empty__logo">
+              <BrandMark variant="studio" size={68} alt="AlphaBuilder Studio" />
             </div>
             <div className="center-empty__title">Abra um banco v3.3</div>
             <div className="center-empty__text">

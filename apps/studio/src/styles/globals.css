@@ -116,24 +116,12 @@ button {
   padding-right: 4px;
   min-width: 0;
 }
-.brand__mark {
-  width: 24px;
-  height: 24px;
+.brand-mark {
+  display: block;
+  flex: 0 0 auto;
   border-radius: 8px;
-  background:
-    linear-gradient(135deg, rgba(0, 240, 255, 0.95), rgba(139, 92, 246, 0.95)) padding-box,
-    linear-gradient(135deg, #00f0ff, #8b5cf6) border-box;
-  border: 1px solid transparent;
-  box-shadow: 0 0 18px rgba(0, 240, 255, 0.28);
-  position: relative;
-}
-.brand__mark::after {
-  content: "";
-  position: absolute;
-  inset: 6px;
-  border-radius: 3px;
-  border: 1px solid rgba(5, 6, 8, 0.55);
-  transform: rotate(45deg);
+  object-fit: contain;
+  filter: drop-shadow(0 0 10px rgba(0, 240, 255, 0.12));
 }
 .brand__name {
   font-family: var(--font-display);
@@ -141,6 +129,20 @@ button {
   letter-spacing: 0.01em;
   font-size: 14px;
   white-space: nowrap;
+}
+.brand__name-accent {
+  background: linear-gradient(100deg, var(--accent-cyan), var(--accent-violet));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.brand__tagline {
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  white-space: nowrap;
+  padding-left: 1px;
 }
 .brand__version {
   font-family: var(--font-mono);
@@ -906,18 +908,14 @@ input[type="checkbox"] {
   text-align: center;
   pointer-events: auto;
 }
-.center-empty__icon {
-  width: 54px;
-  height: 54px;
+.center-empty__logo {
+  width: 68px;
+  height: 68px;
   margin: 0 auto 12px;
-  border-radius: 16px;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--accent-cyan);
-  background: color-mix(in srgb, var(--accent-cyan) 8%, transparent);
-  border: 1px solid var(--border-active);
-  box-shadow: 0 0 34px rgba(0, 240, 255, 0.16);
+  filter: drop-shadow(0 0 28px rgba(0, 240, 255, 0.2));
 }
 .center-empty__title {
   font-family: var(--font-display);
@@ -1021,6 +1019,11 @@ input[type="checkbox"] {
   }
 }
 
+@media (max-width: 1450px) {
+  .brand__tagline {
+    display: none;
+  }
+}
 @media (max-width: 1180px) {
   .bottom-dock {
     left: 84px;
@@ -1129,7 +1132,7 @@ input[type="checkbox"] {
   align-items: center;
   justify-content: center;
   gap: 8px;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: 11px;
   text-align: center;
   padding: 30px;

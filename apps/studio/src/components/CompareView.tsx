@@ -11,6 +11,7 @@ import {
 import { formatNumber, formatPercent, formatReward, formatSigned } from "../lib/formatters";
 import { useAppStore } from "../store/useAppStore";
 import { useCompareStore } from "../store/useCompareStore";
+import { BrandMark } from "./BrandMark";
 import { ViewportEngine } from "../engine3d/ViewportEngine";
 import type { ParsedAbMesh } from "../types/contracts";
 
@@ -416,7 +417,7 @@ function ComparePane(props: {
       </header>
       {!slot ? (
         <div className="compare-pane__empty">
-          <Columns2 size={26} />
+          <BrandMark variant="cad" size={58} alt="" />
           <div>Selecione o Slot {props.slot.toUpperCase()} e carregue um episódio.</div>
         </div>
       ) : null}

@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   Box,
-  BrainCircuit,
   Copy,
   FlaskConical,
   Grid3X3,
@@ -28,6 +27,7 @@ import {
   sessionStart,
 } from "../lib/ipc";
 import { formatMilliseconds, formatPercent, formatReward, formatSigned } from "../lib/formatters";
+import { BrandMark } from "./BrandMark";
 
 const RESOLUTIONS: Record<string, [number, number, number]> = {
   cantilever: [64, 32, 8],
@@ -366,7 +366,7 @@ export function StudioPanel() {
     <aside className="studio-panel glass">
       <div className="dock-header">
         <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
-          <BrainCircuit size={13} className="accent-cyan" />
+          <BrandMark variant="layered" size={19} alt="" />
           <span className="dock-title">Estúdio generativo</span>
         </div>
         <span className="badge" data-tone={store.sessionStatus === "IDLE" ? undefined : "accent"}>

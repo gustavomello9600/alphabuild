@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 260" width="960" height="260">
+  <defs>
+    <linearGradient id="p6-grad" x1="68" y1="68" x2="192" y2="192" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#00f0ff"/>
+      <stop offset="100%" stop-color="#8b5cf6"/>
+    </linearGradient>
+    <linearGradient id="p6-tile" x1="36" y1="36" x2="224" y2="224" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#00f0ff" stop-opacity="0.45"/>
+      <stop offset="50%" stop-color="#ffffff" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#8b5cf6" stop-opacity="0.45"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="960" height="260" rx="28" fill="#050608"/>
+  <rect x="44" y="44" width="172" height="172" rx="40" fill="#0e1015" stroke="url(#p6-tile)" stroke-width="2"/>
+
+  <line x1="88" y1="88" x2="88" y2="172" stroke="#00f0ff" stroke-width="11" stroke-linecap="round"/>
+  <line x1="88" y1="88" x2="172" y2="172" stroke="url(#p6-grad)" stroke-width="11" stroke-linecap="round"/>
+  <line x1="120" y1="140" x2="140" y2="120" stroke="#0e1015" stroke-width="19"/>
+  <line x1="88" y1="172" x2="172" y2="88" stroke="url(#p6-grad)" stroke-width="11" stroke-linecap="round"/>
+
+  <circle cx="88" cy="88" r="13" fill="#050608" stroke="#00f0ff" stroke-width="5"/>
+  <circle cx="88" cy="172" r="13" fill="#050608" stroke="#00f0ff" stroke-width="5"/>
+  <circle cx="172" cy="88" r="13" fill="#050608" stroke="#8b5cf6" stroke-width="5"/>
+  <circle cx="172" cy="172" r="13" fill="#050608" stroke="#8b5cf6" stroke-width="5"/>
+
+  <text x="252" y="138" font-family="'Space Grotesk', 'Inter Display', 'Inter', sans-serif" font-weight="700" font-size="74" letter-spacing="-2" fill="#eef2f8">Alpha<tspan fill="url(#p6-grad)">Builder</tspan></text>
+  <rect x="255" y="158" width="114" height="32" rx="8" fill="#0e1015" stroke="#00f0ff" stroke-opacity="0.38" stroke-width="1.5"/>
+  <text x="312" y="179" text-anchor="middle" font-family="'JetBrains Mono', 'DejaVu Sans Mono', monospace" font-weight="600" font-size="16" letter-spacing="3.5" fill="#00f0ff">STUDIO</text>
+  <text x="386" y="179" font-family="'Inter', sans-serif" font-weight="400" font-size="18" letter-spacing="0.4" fill="#8f9bb0">3D Structural Optimization</text>
+</svg>

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="apps/studio/src/assets/brand/p6_wordmark_dark.png" width="440" alt="AlphaBuilder Studio — 3D Structural Optimization" />
+</p>
+
 # AlphaBuilder Studio v4.0
 
 Aplicativo desktop cross-platform para inspeção de datasets **v3.3**, design estrutural generativo, MCTS ao vivo e comparação A/B — construído com **Tauri v2 (Rust)**, **Three.js imperative** e um **Compute & Inference Server** Python local/remoto.

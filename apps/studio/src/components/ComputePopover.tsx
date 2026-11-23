@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import {
   Activity,
   Check,
-  Cpu,
   Play,
   RefreshCw,
   Server,
@@ -12,6 +11,7 @@ import {
 import { useAppStore } from "../store/useAppStore";
 import { useComputeStore } from "../store/useComputeStore";
 import { formatMilliseconds } from "../lib/formatters";
+import { BrandMark } from "./BrandMark";
 import type { ComputeProfile } from "../types/contracts";
 
 export function ComputePopover() {
@@ -53,7 +53,7 @@ export function ComputePopover() {
     <aside className="compute-popover glass">
       <div className="dock-header">
         <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
-          <Cpu size={13} className="accent-cyan" />
+          <BrandMark variant="prism" size={19} alt="" />
           <span className="dock-title">Compute & Inference</span>
         </div>
         <button type="button" className="icon-button" onClick={() => setOpen(false)}>

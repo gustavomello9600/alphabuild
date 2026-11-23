@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="p5-bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#121620"/>
+      <stop offset="100%" stop-color="#050608"/>
+    </linearGradient>
+    <linearGradient id="p5-bar-left" x1="142" y1="142" x2="142" y2="370" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#eef2f8"/>
+      <stop offset="100%" stop-color="#8f9bb0"/>
+    </linearGradient>
+    <linearGradient id="p5-bar-d1" x1="142" y1="142" x2="370" y2="370" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#00f0ff"/>
+      <stop offset="100%" stop-color="#0284c7"/>
+    </linearGradient>
+    <linearGradient id="p5-bar-d2" x1="142" y1="370" x2="370" y2="142" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="55%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#a78bfa"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="116" fill="url(#p5-bg)"/>
+  <rect x="8" y="8" width="496" height="496" rx="108" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="2"/>
+  <polygon points="144,144 144,368 256,256" fill="#00f0ff" fill-opacity="0.06"/>
+
+  <line x1="144" y1="144" x2="144" y2="368" stroke="url(#p5-bar-left)" stroke-width="30" stroke-linecap="round"/>
+  <line x1="144" y1="144" x2="368" y2="368" stroke="url(#p5-bar-d1)" stroke-width="30" stroke-linecap="round"/>
+  <line x1="224" y1="288" x2="288" y2="224" stroke="#090b10" stroke-width="50" stroke-linecap="butt"/>
+  <line x1="144" y1="368" x2="368" y2="144" stroke="url(#p5-bar-d2)" stroke-width="30" stroke-linecap="round"/>
+
+  <g>
+    <circle cx="144" cy="144" r="38" fill="#090b10"/>
+    <circle cx="144" cy="144" r="28" fill="#eef2f8"/>
+    <circle cx="144" cy="144" r="10" fill="#00f0ff"/>
+
+    <circle cx="144" cy="368" r="38" fill="#090b10"/>
+    <circle cx="144" cy="368" r="28" fill="#eef2f8"/>
+    <circle cx="144" cy="368" r="10" fill="#38bdf8"/>
+
+    <circle cx="368" cy="144" r="38" fill="#090b10"/>
+    <circle cx="368" cy="144" r="28" fill="#8b5cf6"/>
+    <circle cx="368" cy="144" r="10" fill="#eef2f8"/>
+
+    <circle cx="368" cy="368" r="38" fill="#090b10"/>
+    <circle cx="368" cy="368" r="28" fill="#00f0ff"/>
+    <circle cx="368" cy="368" r="10" fill="#050608"/>
+  </g>
+</svg>

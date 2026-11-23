@@ -11,6 +11,7 @@ import {
 import { useAppStore } from "../store/useAppStore";
 import { useInspectorStore } from "../store/useInspectorStore";
 import { useCompareStore } from "../store/useCompareStore";
+import { BrandMark } from "./BrandMark";
 import {
   getEntryMetadata,
   isTauriRuntime,
@@ -164,7 +165,7 @@ export function LibraryDrawer() {
     <aside className="library-drawer glass">
       <div className="dock-header">
         <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
-          <LibraryGlyph />
+          <BrandMark variant="minimal" size={18} alt="" />
           <span className="dock-title">Biblioteca de Dados</span>
           {mode === "compare" ? (
             <span className="badge" data-tone="accent">
@@ -350,25 +351,5 @@ export function LibraryDrawer() {
         ) : null}
       </div>
     </aside>
-  );
-}
-
-function LibraryGlyph() {
-  return (
-    <span
-      style={{
-        width: 18,
-        height: 18,
-        borderRadius: 6,
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        background: "color-mix(in srgb, var(--accent-cyan) 10%, transparent)",
-        border: "1px solid var(--border-active)",
-        color: "var(--accent-cyan)",
-      }}
-    >
-      <Database size={10} />
-    </span>
   );
 }

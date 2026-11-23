@@ -39,6 +39,7 @@ export class ViewportEngine {
   private cameraPreset: CameraPreset = "iso";
   private blueprintEnabled = false;
   private figureEnabled = false;
+  private themeLight = false;
   private unbindSync: (() => void) | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
@@ -223,9 +224,12 @@ export class ViewportEngine {
     this.voxels.setClip(min, max);
   }
 
-  setFigureMode(enabled: boolean, light = false): void {
+  setFigureMode(enabled: boolean, light = this.themeLight): void {
     this.figureEnabled = enabled;
-    this.background = new THREE.Color(enabled ? (light ? "#ffffff" : "#f4f6f9") : "#050608");
+    this.themeLight = light;
+    this.background = new THREE.Color(
+      enabled ? (light ? "#ffffff" : "#f4f6f9") : light ? "#ffffff" : "#050608",
+    );
     this.renderer.setClearColor(this.background, 1);
     this.grid.visible = !enabled;
     this.boundaries.setVisible(!enabled);
@@ -234,11 +238,12 @@ export class ViewportEngine {
   }
 
   setTheme(light: boolean): void {
+    this.themeLight = light;
     if (this.figureEnabled) return;
     this.background = new THREE.Color(light ? "#ffffff" : "#050608");
     this.renderer.setClearColor(this.background, 1);
     const gridMaterial = this.grid.material as THREE.Material;
-    gridMaterial.opacity = light ? 0.25 : 0.42;
+    gridMaterial.opacity = light ? 0.09 : 0.42;
   }
 
   clearFrame(): void {

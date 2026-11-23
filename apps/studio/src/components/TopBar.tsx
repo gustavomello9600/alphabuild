@@ -12,6 +12,7 @@ import {
 import { useAppStore } from "../store/useAppStore";
 import { useComputeStore } from "../store/useComputeStore";
 import { WindowControls } from "./WindowControls";
+import { BrandMark } from "./BrandMark";
 import type { AppMode } from "../types/contracts";
 
 const modes: Array<{ id: AppMode; label: string; icon: typeof ScanSearch }> = [
@@ -40,9 +41,12 @@ export function TopBar() {
     <header className="top-bar glass">
       <div className="top-bar__zone">
         <div className="brand">
-          <div className="brand__mark" />
-          <span className="brand__name">AlphaBuilder</span>
-          <span className="brand__version">STUDIO v4.0.1</span>
+          <BrandMark variant="studio" size={26} alt="AlphaBuilder Studio" />
+          <span className="brand__name">
+            Alpha<span className="brand__name-accent">Builder</span>
+          </span>
+          <span className="brand__tagline">3D Structural Optimization</span>
+          <span className="brand__version">STUDIO v4.0.2</span>
         </div>
         <button
           type="button"

@@ -170,6 +170,8 @@ jobs:
           prerelease: ${{ needs.verify-version-and-tests.outputs.prerelease == 'true' }}
           args: ${{ matrix.args }}
           releaseBody: |
+            ![AlphaBuilder Studio](https://raw.githubusercontent.com/gustavomello9600/alphabuild/main/apps/studio/src/assets/brand/p6_wordmark_dark.png)
+
             ## AlphaBuilder Studio v${{ needs.verify-version-and-tests.outputs.version }}
 
             ### Downloads por Sistema Operacional

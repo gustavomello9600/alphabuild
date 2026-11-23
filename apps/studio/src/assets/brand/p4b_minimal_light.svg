@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="p4l-grad" x1="144" y1="144" x2="368" y2="368" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0284c7"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="116" fill="#ffffff" stroke="#e2e8f0" stroke-width="3"/>
+  <line x1="144" y1="144" x2="144" y2="368" stroke="#0f172a" stroke-width="26" stroke-linecap="round"/>
+  <line x1="144" y1="144" x2="368" y2="368" stroke="url(#p4l-grad)" stroke-width="26" stroke-linecap="round"/>
+  <line x1="144" y1="368" x2="368" y2="144" stroke="url(#p4l-grad)" stroke-width="26" stroke-linecap="round"/>
+  <circle cx="144" cy="144" r="30" fill="#0f172a"/>
+  <circle cx="144" cy="144" r="12" fill="#ffffff"/>
+  <circle cx="144" cy="368" r="30" fill="#0f172a"/>
+  <circle cx="144" cy="368" r="12" fill="#ffffff"/>
+  <circle cx="368" cy="144" r="30" fill="#0284c7"/>
+  <circle cx="368" cy="144" r="12" fill="#ffffff"/>
+  <circle cx="368" cy="368" r="30" fill="#7c3aed"/>
+  <circle cx="368" cy="368" r="12" fill="#ffffff"/>
+</svg>
