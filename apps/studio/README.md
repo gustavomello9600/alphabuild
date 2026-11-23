@@ -70,6 +70,7 @@ A fixture `src/lib/__fixtures__/abmesh_fixture.bin` é gerada por `cargo run -p 
 
 - **Blueprint** inicia sempre desativado e só aparece quando você liga explicitamente (`B` ou botão ghost). Atualizações de frame não reativam a camada sozinhas.
 - Em bancos de **treino/warmup sem `displacement_blob`**, as lentes **Deslocamento** e **Tensão** e o controle de exagero ficam ocultos. Use um banco Harvest com `displacement_map`/`displacement_blob` ou rode FEM no Estúdio para visualizá-los.
+- No Estúdio, **arrastar com o botão esquerdo orbita a câmera e nunca cria voxels**; um clique curto (sem arrastar) aplica a ferramenta de pintura/remoção/suporte.
 - Clique ou arraste no filmstrip para saltar imediatamente ao frame correspondente; a reprodução é pausada durante o scrub.
 - A lente **Refutação** compara o argmax da Policy Head com a ação mais visitada pelo MCTS e mostra coordenadas, `N` e `Q` no painel MCTS & PV.
 

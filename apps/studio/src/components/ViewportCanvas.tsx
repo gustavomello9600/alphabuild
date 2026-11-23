@@ -314,7 +314,8 @@ export function ViewportCanvas() {
     if (mode !== "studio") return;
     const canvas = canvasRef.current;
     if (!canvas) return;
-    let dragging = false;
+    let editStart: { x: number; y: number; moved: boolean } | null = null;
+    let loadDragging = false;
 
     const applyAt = (event: PointerEvent) => {
       const engine = engineRef.current;
@@ -362,27 +363,50 @@ export function ViewportCanvas() {
 
     const handleDown = (event: PointerEvent) => {
       if (event.button !== 0) return;
-      event.preventDefault();
-      dragging = true;
-      applyAt(event);
+      const store = useStudioStore.getState();
+      if (store.tool === "load") {
+        // Load handles are intentionally draggable; they never create material.
+        loadDragging = true;
+        applyAt(event);
+        return;
+      }
+      // Paint/erase/support are click-to-edit. A left drag belongs to
+      // OrbitControls, so it must never mutate the voxel grid.
+      editStart = { x: event.clientX, y: event.clientY, moved: false };
     };
     const handleMove = (event: PointerEvent) => {
-      if (!dragging) return;
-      const store = useStudioStore.getState();
-      if (store.tool === "load" || store.tool === "paint" || store.tool === "erase") {
+      if (loadDragging) {
         applyAt(event);
+        return;
       }
+      if (!editStart) return;
+      const dx = event.clientX - editStart.x;
+      const dy = event.clientY - editStart.y;
+      if (dx * dx + dy * dy > 16) editStart.moved = true;
     };
-    const handleUp = () => {
-      dragging = false;
+    const handleUp = (event: PointerEvent) => {
+      if (loadDragging) {
+        loadDragging = false;
+        return;
+      }
+      const start = editStart;
+      editStart = null;
+      if (!start || start.moved) return;
+      applyAt(event);
+    };
+    const handleCancel = () => {
+      editStart = null;
+      loadDragging = false;
     };
     canvas.addEventListener("pointerdown", handleDown);
     window.addEventListener("pointermove", handleMove);
     window.addEventListener("pointerup", handleUp);
+    window.addEventListener("pointercancel", handleCancel);
     return () => {
       canvas.removeEventListener("pointerdown", handleDown);
       window.removeEventListener("pointermove", handleMove);
       window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleCancel);
     };
   }, [mode]);
 

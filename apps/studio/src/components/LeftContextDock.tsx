@@ -303,6 +303,9 @@ function StudioTools() {
         <div className="panel-heading">
           <span>Pincel</span>
         </div>
+        <div className="mono muted" style={{ fontSize: 9, lineHeight: 1.45 }}>
+          Clique para editar. Arraste para orbitar a câmera.
+        </div>
         <div style={{ display: "flex", gap: 5 }}>
           {[1, 3].map((size) => (
             <button
