@@ -66,6 +66,18 @@ A fixture `src/lib/__fixtures__/abmesh_fixture.bin` é gerada por `cargo run -p 
 - `src/lib/` — IPC tipado, parser zero-copy ABMESH01, Turbo, formatters.
 - `src-tauri/` — comandos IPC, cache LRU, sidecar, ws_bridge e contratos snake_case.
 
+## Filmstrip ao vivo no Estúdio
+
+Durante uma sessão MCTS, o mesmo dock inferior do Inspetor aparece no Estúdio:
+
+- sparkline de `Value` e `Volume` sendo construída a cada passo;
+- fases `GROWTH`/`REFINEMENT` e marcadores de refutação;
+- clique/arraste para revisar qualquer frame já recebido;
+- badge **AO VIVO**/ **REPLAY** e botão **Voltar ao vivo**;
+- as mesmas lentes, Blueprint e Modo TCC do Inspetor.
+
+Ao revisar um frame antigo, o Estúdio fica em modo leitura; volte ao vivo para editar/pintar novamente.
+
 ## Visualizador v3.3
 
 - **Blueprint** inicia sempre desativado e só aparece quando você liga explicitamente (`B` ou botão ghost). Atualizações de frame não reativam a camada sozinhas.

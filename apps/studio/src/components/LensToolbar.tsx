@@ -23,7 +23,12 @@ const allLenses: Array<{ id: LensMode; key: string; label: string; icon: typeof 
   { id: "strain", key: "7", label: "Tensão / strain", icon: Activity },
 ];
 
-export function LensToolbar() {
+interface LensToolbarProps {
+  forceVisible?: boolean;
+  available?: { has_displacement: boolean; has_blueprint: boolean };
+}
+
+export function LensToolbar({ forceVisible, available }: LensToolbarProps = {}) {
   const lens = useInspectorStore((state) => state.lens);
   const setLens = useInspectorStore((state) => state.setLens);
   const metadata = useInspectorStore((state) => state.metadata);
@@ -31,11 +36,13 @@ export function LensToolbar() {
   const toggleBlueprint = useInspectorStore((state) => state.toggleBlueprint);
   const figureMode = useAppStore((state) => state.figureMode);
   const setFigureMode = useAppStore((state) => state.setFigureMode);
-  const hasEntry = useInspectorStore((state) => state.entryId !== null);
+  const entryId = useInspectorStore((state) => state.entryId);
+  const hasEntry = forceVisible ?? entryId !== null;
 
   if (!hasEntry) return null;
 
-  const hasDisplacement = metadata?.has_displacement ?? false;
+  const hasDisplacement = available?.has_displacement ?? metadata?.has_displacement ?? false;
+  const hasBlueprint = available?.has_blueprint ?? metadata?.has_blueprint ?? false;
   const lenses = allLenses.filter(
     (entry) =>
       hasDisplacement || (entry.id !== "deformation" && entry.id !== "strain"),
@@ -70,18 +77,18 @@ export function LensToolbar() {
         data-active={blueprint}
         data-lens="blueprint"
         data-tooltip={
-          metadata?.has_blueprint
+          hasBlueprint
             ? `Blueprint / v_constructed · tecla B`
             : "Blueprint indisponível neste banco"
         }
         title={
-          metadata?.has_blueprint
+          hasBlueprint
             ? "Blueprint / v_constructed (B)"
             : "Blueprint indisponível neste banco"
         }
         aria-label="Alternar Blueprint"
         aria-pressed={blueprint}
-        disabled={!metadata?.has_blueprint}
+        disabled={!hasBlueprint}
         onClick={toggleBlueprint}
       >
         <Ghost size={15} strokeWidth={1.8} />

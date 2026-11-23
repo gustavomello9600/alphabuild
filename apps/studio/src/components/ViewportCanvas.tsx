@@ -102,6 +102,7 @@ export function ViewportCanvas() {
   const studioSupports = useStudioStore((state) => state.customSupports);
   const studioForces = useStudioStore((state) => state.customForces);
   const studioOverlay = useStudioStore((state) => state.overlay);
+  const sessionViewFrame = useStudioStore((state) => state.sessionViewFrame);
   const liveXray = useStudioStore((state) => state.liveXray);
   const sessionStatus = useStudioStore((state) => state.sessionStatus);
   const connected = useComputeStore((state) => state.connection?.connected ?? false);
@@ -254,6 +255,11 @@ export function ViewportCanvas() {
   }, [mode, studioResolution, studioBc, studioLoad, studioSupports, studioForces]);
 
   useEffect(() => {
+    if (mode !== "studio" || !sessionViewFrame) return;
+    engineRef.current?.applyFrame(sessionViewFrame);
+  }, [mode, sessionViewFrame]);
+
+  useEffect(() => {
     if (mode !== "studio") return;
     const timer = window.setTimeout(() => {
       void useStudioStore.getState().analyze();
@@ -322,6 +328,8 @@ export function ViewportCanvas() {
       if (!engine) return;
       const store = useStudioStore.getState();
       if (store.sessionStatus === "RUNNING") return;
+      // Replay of an older live frame is read-only; return to the live edge to edit.
+      if (store.session && !store.sessionFollowLive) return;
       if (store.tool === "load") {
         const pick = engine.pickVoxel(event);
         if (pick) {

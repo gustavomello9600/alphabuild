@@ -8,12 +8,18 @@ import type {
   LocalTopologyReport,
   ParsedAbMesh,
   SessionHandle,
+  StepFrameMetadata,
   StudioVoxelState,
   SupportVoxel,
 } from "../types/contracts";
 import { studioAnalyzeLocal } from "../lib/ipc";
 
 export type StudioTool = "paint" | "erase" | "load" | "support";
+
+export interface SessionHistoryEntry {
+  step: number;
+  metadata: StepFrameMetadata;
+}
 
 interface StudioStore {
   resolution: [number, number, number];
@@ -33,6 +39,10 @@ interface StudioStore {
   liveXray: boolean;
   session: SessionHandle | null;
   sessionFrame: ParsedAbMesh | null;
+  sessionHistory: SessionHistoryEntry[];
+  sessionViewFrame: ParsedAbMesh | null;
+  sessionViewStep: number | null;
+  sessionFollowLive: boolean;
   sessionStatus: string;
   sessionStep: number;
   sessionProgress: number;
@@ -55,6 +65,10 @@ interface StudioStore {
   analyze: () => Promise<void>;
   setSession: (session: SessionHandle | null) => void;
   setSessionFrame: (frame: ParsedAbMesh | null) => void;
+  appendSessionStep: (step: number, metadata: StepFrameMetadata) => void;
+  setSessionViewFrame: (frame: ParsedAbMesh | null, step: number | null) => void;
+  setSessionFollowLive: (value: boolean) => void;
+  clearSessionHistory: () => void;
   setSessionStatus: (status: string, step?: number) => void;
   setSessionProgress: (value: number) => void;
   setSessionError: (error: string | null) => void;
@@ -87,6 +101,10 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
   liveXray: false,
   session: null,
   sessionFrame: null,
+  sessionHistory: [],
+  sessionViewFrame: null,
+  sessionViewStep: null,
+  sessionFollowLive: true,
   sessionStatus: "IDLE",
   sessionStep: 0,
   sessionProgress: 0,
@@ -175,8 +193,40 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       set({ sessionError: error instanceof Error ? error.message : String(error) });
     }
   },
-  setSession: (session) => set({ session, sessionStatus: session?.status ?? "IDLE" }),
+  setSession: (session) =>
+    set((state) => {
+      if (session?.session_id === state.session?.session_id) {
+        return { session, sessionStatus: session?.status ?? "IDLE" };
+      }
+      return {
+        session,
+        sessionStatus: session?.status ?? "IDLE",
+        sessionFrame: null,
+        sessionHistory: [],
+        sessionViewFrame: null,
+        sessionViewStep: null,
+        sessionFollowLive: true,
+      };
+    }),
   setSessionFrame: (sessionFrame) => set({ sessionFrame }),
+  appendSessionStep: (step, metadata) =>
+    set((state) => {
+      const next = state.sessionHistory.filter((entry) => entry.step !== step);
+      next.push({ step, metadata });
+      next.sort((a, b) => a.step - b.step);
+      return { sessionHistory: next };
+    }),
+  setSessionViewFrame: (sessionViewFrame, sessionViewStep) =>
+    set({ sessionViewFrame, sessionViewStep }),
+  setSessionFollowLive: (sessionFollowLive) => set({ sessionFollowLive }),
+  clearSessionHistory: () =>
+    set({
+      sessionFrame: null,
+      sessionHistory: [],
+      sessionViewFrame: null,
+      sessionViewStep: null,
+      sessionFollowLive: true,
+    }),
   setSessionStatus: (sessionStatus, step) =>
     set((state) => ({ sessionStatus, sessionStep: step ?? state.sessionStep })),
   setSessionProgress: (sessionProgress) => set({ sessionProgress }),

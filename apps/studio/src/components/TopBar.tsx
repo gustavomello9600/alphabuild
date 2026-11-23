@@ -46,7 +46,7 @@ export function TopBar() {
             Alpha<span className="brand__name-accent">Builder</span>
           </span>
           <span className="brand__tagline">3D Structural Optimization</span>
-          <span className="brand__version">STUDIO v4.0.4</span>
+          <span className="brand__version">STUDIO v4.0.5</span>
         </div>
         <button
           type="button"

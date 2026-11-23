@@ -6,6 +6,7 @@ import { ViewportCanvas } from "./components/ViewportCanvas";
 import { LibraryDrawer } from "./components/LibraryDrawer";
 import { LensToolbar } from "./components/LensToolbar";
 import { TimelineDock } from "./components/TimelineDock";
+import { StudioTimelineDock } from "./components/StudioTimelineDock";
 import { LeftContextDock } from "./components/LeftContextDock";
 import { RightTelemetryDock } from "./components/RightTelemetryDock";
 import { VoxelTooltip } from "./components/VoxelTooltip";
@@ -19,7 +20,7 @@ import { useInspectorStore } from "./store/useInspectorStore";
 import { useComputeStore } from "./store/useComputeStore";
 import { useCompareStore } from "./store/useCompareStore";
 import { useStudioStore } from "./store/useStudioStore";
-import { parseAbMesh01 } from "./lib/abmesh";
+import { ABMESH_FLAGS, parseAbMesh01 } from "./lib/abmesh";
 import { getActiveEngine } from "./lib/engineBus";
 import {
   isTauriRuntime,
@@ -54,7 +55,16 @@ export default function App() {
   const loadProfiles = useComputeStore((state) => state.loadProfiles);
   const setSessionStatus = useStudioStore((state) => state.setSessionStatus);
   const setSessionProgress = useStudioStore((state) => state.setSessionProgress);
-  const setSessionFrame = useStudioStore((state) => state.setSessionFrame);
+  const session = useStudioStore((state) => state.session);
+  const sessionFrame = useStudioStore((state) => state.sessionFrame);
+  const sessionViewFrame = useStudioStore((state) => state.sessionViewFrame);
+  const studioDisplayFrame = sessionViewFrame ?? sessionFrame;
+  const studioHasDisplacement = Boolean(
+    studioDisplayFrame && studioDisplayFrame.flags & ABMESH_FLAGS.DISPLACEMENT,
+  );
+  const studioHasBlueprint = Boolean(
+    studioDisplayFrame && studioDisplayFrame.flags & ABMESH_FLAGS.BLUEPRINT,
+  );
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -77,9 +87,14 @@ export default function App() {
         void sessionGetStepMesh(event.session_id, event.step)
           .then((buffer) => {
             const parsed = parseAbMesh01(buffer);
-            setSessionFrame(parsed);
-            if (useAppStore.getState().mode === "studio") {
-              getActiveEngine()?.applyFrame(parsed);
+            const studio = useStudioStore.getState();
+            studio.appendSessionStep(event.step, parsed.metadata);
+            studio.setSessionFrame(parsed);
+            if (studio.sessionFollowLive) {
+              studio.setSessionViewFrame(parsed, event.step);
+              if (useAppStore.getState().mode === "studio") {
+                getActiveEngine()?.applyFrame(parsed);
+              }
             }
           })
           .catch(() => {
@@ -94,7 +109,6 @@ export default function App() {
     loadProfiles,
     setComputeConnection,
     setSessionProgress,
-    setSessionFrame,
     setSessionStatus,
   ]);
 
@@ -219,6 +233,18 @@ export default function App() {
         <div className="bottom-dock">
           <LensToolbar />
           <TimelineDock />
+        </div>
+      ) : null}
+      {mode === "studio" && session ? (
+        <div className="bottom-dock">
+          <LensToolbar
+            forceVisible
+            available={{
+              has_displacement: studioHasDisplacement,
+              has_blueprint: studioHasBlueprint,
+            }}
+          />
+          <StudioTimelineDock />
         </div>
       ) : null}
       {mode === "inspector" && !hasEntry ? (

@@ -106,7 +106,13 @@ export function StudioPanel() {
   const [localError, setLocalError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (store.sessionStatus !== "PAUSED" || !store.sessionFrame) return;
+    if (
+      store.sessionStatus !== "PAUSED" ||
+      !store.sessionFrame ||
+      !store.sessionFollowLive
+    ) {
+      return;
+    }
     const next = new Set(store.sessionFrame.voxelIds);
     if (next.size > 0) {
       store.setSolidVoxels(next);
@@ -286,6 +292,9 @@ export function StudioPanel() {
         },
       });
       lastSent.current = new Set(state.solid_voxels);
+      store.clearSessionHistory();
+      useInspectorStore.getState().setLens("structure");
+      useInspectorStore.getState().setBlueprintEnabled(false);
       store.setSession(handle);
       store.setSessionStatus(handle.status, 0);
       store.setSessionProgress(0);
@@ -318,6 +327,10 @@ export function StudioPanel() {
         r_min: 1.5,
         seed: 42,
       });
+      lastSent.current = new Set(state.solid_voxels);
+      store.clearSessionHistory();
+      useInspectorStore.getState().setLens("structure");
+      useInspectorStore.getState().setBlueprintEnabled(false);
       store.setSession(handle);
       store.setSessionStatus(handle.status, 0);
       store.setSessionProgress(0);
@@ -358,7 +371,7 @@ export function StudioPanel() {
   }
 
   const session = store.session;
-  const sessionMeta = store.sessionFrame?.metadata;
+  const sessionMeta = (store.sessionViewFrame ?? store.sessionFrame)?.metadata;
   const running = store.sessionStatus === "RUNNING";
   const paused = store.sessionStatus === "PAUSED";
 

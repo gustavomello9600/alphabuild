@@ -37,6 +37,7 @@ interface InspectorStore {
   setPlaybackSpeed: (speed: number) => void;
   setLens: (lens: LensMode) => void;
   toggleBlueprint: () => void;
+  setBlueprintEnabled: (value: boolean) => void;
   setBlueprintThreshold: (value: number) => void;
   setUseRhoCont: (value: boolean) => void;
   setClip: (axis: "x" | "y" | "z", value: number) => void;
@@ -114,6 +115,7 @@ export const useInspectorStore = create<InspectorStore>((set, get) => ({
         ? { blueprintEnabled: !state.blueprintEnabled }
         : { blueprintEnabled: false },
     ),
+  setBlueprintEnabled: (value) => set({ blueprintEnabled: value }),
   setBlueprintThreshold: (blueprintThreshold) =>
     set({ blueprintThreshold: clamp(blueprintThreshold, 0.1, 0.9) }),
   setUseRhoCont: (useRhoCont) => set({ useRhoCont }),
