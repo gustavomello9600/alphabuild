@@ -292,6 +292,20 @@ export class ViewportEngine {
     return this.frame;
   }
 
+  stats(): {
+    geometries: number;
+    textures: number;
+    calls: number;
+    triangles: number;
+  } {
+    return {
+      geometries: this.renderer.info.memory.geometries,
+      textures: this.renderer.info.memory.textures,
+      calls: this.renderer.info.render.calls,
+      triangles: this.renderer.info.render.triangles,
+    };
+  }
+
   dispose(): void {
     this.disposed = true;
     cancelAnimationFrame(this.animationFrame);

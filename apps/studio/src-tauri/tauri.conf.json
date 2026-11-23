@@ -31,6 +31,14 @@
     "targets": "all",
     "category": "DeveloperTool",
     "shortDescription": "Generative structural design studio",
-    "longDescription": "AlphaBuilder Studio — Tauri v2 desktop inspector and generative structural design studio for v3.3 datasets."
+    "longDescription": "AlphaBuilder Studio \u2014 Tauri v2 desktop inspector and generative structural design studio for v3.3 datasets.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/64x64.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
   }
 }

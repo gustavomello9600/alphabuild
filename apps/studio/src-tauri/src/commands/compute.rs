@@ -593,7 +593,11 @@ pub async fn session_start(
 ) -> Result<SessionHandle, String> {
     let connection = state.active_connection()?;
     let is_simp = req.kind == "SIMP";
-    let path = if is_simp { "/api/v1/simp/start" } else { "/api/v1/sessions" };
+    let path = if is_simp {
+        "/api/v1/simp/start"
+    } else {
+        "/api/v1/sessions"
+    };
     let body = if is_simp {
         json!({
             "resolution": req.resolution,

@@ -1,0 +1,187 @@
+name: Release AlphaBuilder Studio
+
+on:
+  push:
+    tags:
+      - 'studio-v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag de release (ex: studio-v4.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  verify-version-and-tests:
+    name: Verify Version Sync & Core Tests
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract and verify synced version across 4 files
+        id: meta
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag_name || github.ref_name }}"
+          VERSION="${TAG#studio-v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" == *"-"* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+          python3 - "$VERSION" <<'PY'
+          import json, re, sys, pathlib
+          expected = sys.argv[1]
+          pkg = json.loads(pathlib.Path("apps/studio/package.json").read_text())["version"]
+          tauri = json.loads(pathlib.Path("apps/studio/src-tauri/tauri.conf.json").read_text())["version"]
+          cargo = re.search(r'^version\s*=\s*"([^"]+)"', pathlib.Path("apps/studio/src-tauri/Cargo.toml").read_text(), re.M).group(1)
+          srv = re.search(r'^__version__\s*=\s*"([^"]+)"', pathlib.Path("alphabuilder/server/__init__.py").read_text(), re.M).group(1)
+          versions = {"package.json": pkg, "tauri.conf.json": tauri, "Cargo.toml": cargo, "server/__init__.py": srv}
+          mismatches = {k: v for k, v in versions.items() if v != expected}
+          if mismatches:
+              raise SystemExit(f"Version mismatch for tag {expected}: {mismatches}")
+          print("All 4 versions verified:", expected)
+          PY
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p ab-core
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: |
+          pip install pytest pytest-timeout numpy scipy
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r alphabuilder/server/requirements.txt
+          pip install -e .
+          pytest tests/server/ -v --timeout=60
+
+      - name: Create Draft Release Once (Prevents Parallel Matrix Race Condition)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VER: ${{ steps.meta.outputs.version }}
+          PRE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            PRE_FLAG=""
+            if [ "$PRE" = "true" ]; then PRE_FLAG="--prerelease"; fi
+            gh release create "$TAG" --draft $PRE_FLAG \
+              --title "AlphaBuilder Studio v${VER}" \
+              --notes "Draft release em compilação para Windows, Linux e macOS."
+          fi
+
+  build-desktop:
+    name: Build Desktop (${{ matrix.label }})
+    needs: verify-version-and-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: '--target x86_64-pc-windows-msvc'
+          - label: linux-x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            args: '--target x86_64-unknown-linux-gnu'
+          - label: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            args: '--target aarch64-apple-darwin'
+          - label: macos-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            args: '--target x86_64-apple-darwin'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: apps/studio/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux Tauri v2 System Dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libsqlite3-dev
+
+      - name: Install Frontend Dependencies & Test
+        working-directory: apps/studio
+        run: |
+          npm ci
+          npm run typecheck
+          npm run test
+
+      - name: Build & Upload Tauri Bundles to Draft Release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: apps/studio
+          tagName: ${{ needs.verify-version-and-tests.outputs.tag }}
+          releaseName: 'AlphaBuilder Studio v${{ needs.verify-version-and-tests.outputs.version }}'
+          releaseDraft: true
+          prerelease: ${{ needs.verify-version-and-tests.outputs.prerelease == 'true' }}
+          args: ${{ matrix.args }}
+          releaseBody: |
+            ## AlphaBuilder Studio v${{ needs.verify-version-and-tests.outputs.version }}
+
+            ### Downloads por Sistema Operacional
+            - **Windows (x64):** `*.msi` ou `*-setup.exe` *(SmartScreen em builds não assinados: "Mais informações" → "Executar assim mesmo")*
+            - **Linux (x64, glibc >= 2.35):** `*.AppImage`, `*.deb` ou `*.rpm`
+            - **macOS (Apple Silicon M1–M4):** `*_aarch64.dmg` *(se Gatekeeper bloquear build ad-hoc: `xattr -cr "/Applications/AlphaBuilder Studio.app"`)*
+            - **macOS (Intel x64):** `*_x64.dmg`
+            - **Compute Engine (Local ou Remoto):** `alphabuilder-engine-${{ needs.verify-version-and-tests.outputs.version }}.tar.gz`
+
+            ### Verificação de Integridade
+            Confira os hashes SHA-256 em `SHA256SUMS.txt`.
+
+  package-engine-and-checksums:
+    name: Package Engine & Publish SHA256SUMS
+    needs: [verify-version-and-tests, build-desktop]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Engine Source Archive & Generate SHA256SUMS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.verify-version-and-tests.outputs.tag }}
+          VER: ${{ needs.verify-version-and-tests.outputs.version }}
+        run: |
+          mkdir -p release_assets
+          tar -czf "release_assets/alphabuilder-engine-${VER}.tar.gz" \
+            pyproject.toml \
+            alphabuilder/__init__.py \
+            alphabuilder/src \
+            alphabuilder/server
+          gh release upload "$TAG" "release_assets/alphabuilder-engine-${VER}.tar.gz" --clobber
+          mkdir -p downloaded_assets
+          gh release download "$TAG" --dir downloaded_assets
+          (cd downloaded_assets && sha256sum * > ../SHA256SUMS.txt)
+          gh release upload "$TAG" SHA256SUMS.txt --clobber

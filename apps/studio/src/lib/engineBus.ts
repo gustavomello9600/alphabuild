@@ -3,8 +3,17 @@ import type { ViewportEngine } from "../engine3d/ViewportEngine";
 let active: ViewportEngine | null = null;
 const engines = new Map<string, ViewportEngine>();
 
+declare global {
+  interface Window {
+    __abEngine?: ViewportEngine | null;
+  }
+}
+
 export function setActiveEngine(engine: ViewportEngine | null): void {
   active = engine;
+  if (import.meta.env.DEV && typeof window !== "undefined") {
+    window.__abEngine = engine;
+  }
 }
 
 export function getActiveEngine(): ViewportEngine | null {
