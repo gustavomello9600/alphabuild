@@ -382,12 +382,36 @@ pub async fn compute_load_model(
     )
     .await?;
     let info: LoadedModelInfo = response.json().await.map_err(|e| e.to_string())?;
-    let _ = app.emit("ab://compute-status", json!({"active_model": info}));
+    let active_value = serde_json::to_value(&info).map_err(|e| e.to_string())?;
+    let payload = {
+        let mut active = state.active.lock().map_err(|e| e.to_string())?;
+        if let Some(conn) = active.as_mut() {
+            if let Some(map) = conn.capabilities.as_object_mut() {
+                map.insert("active_model".to_string(), active_value.clone());
+            }
+            Some(ComputeConnectionState {
+                profile_id: conn.profile.id.clone(),
+                connected: true,
+                rtt_ms: conn.rtt_ms,
+                capabilities: Some(conn.capabilities.clone()),
+                active_model: Some(active_value),
+                error: None,
+            })
+        } else {
+            None
+        }
+    };
+    if let Some(payload) = payload {
+        let _ = app.emit("ab://compute-status", &payload);
+    }
     Ok(info)
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub async fn compute_unload_model(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn compute_unload_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let connection = state.active_connection()?;
     ensure_success(
         connection
@@ -397,6 +421,27 @@ pub async fn compute_unload_model(state: State<'_, AppState>) -> Result<(), Stri
             .map_err(|e| e.to_string())?,
     )
     .await?;
+    let payload = {
+        let mut active = state.active.lock().map_err(|e| e.to_string())?;
+        if let Some(conn) = active.as_mut() {
+            if let Some(map) = conn.capabilities.as_object_mut() {
+                map.insert("active_model".to_string(), Value::Null);
+            }
+            Some(ComputeConnectionState {
+                profile_id: conn.profile.id.clone(),
+                connected: true,
+                rtt_ms: conn.rtt_ms,
+                capabilities: Some(conn.capabilities.clone()),
+                active_model: None,
+                error: None,
+            })
+        } else {
+            None
+        }
+    };
+    if let Some(payload) = payload {
+        let _ = app.emit("ab://compute-status", &payload);
+    }
     Ok(())
 }
 

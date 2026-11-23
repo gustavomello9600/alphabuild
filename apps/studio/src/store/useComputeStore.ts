@@ -138,12 +138,36 @@ export const useComputeStore = create<ComputeStore>((set, get) => ({
     set({ harvest });
   },
   setConnection: (connection) =>
-    set({
-      connection,
-      capabilities: connection.capabilities,
-      activeModel: connection.active_model,
-      activeProfileId: connection.profile_id,
-      error: connection.error,
+    set((state) => {
+      const partial = connection as Partial<ComputeConnectionState>;
+      const prevConn = state.connection;
+      const nextCapabilities =
+        partial.capabilities !== undefined ? partial.capabilities : state.capabilities;
+      const nextActiveModel =
+        partial.active_model !== undefined ? partial.active_model : state.activeModel;
+      const nextProfileId = partial.profile_id ?? state.activeProfileId;
+      const nextConnected =
+        partial.connected !== undefined ? partial.connected : prevConn?.connected ?? true;
+      const nextRtt = partial.rtt_ms ?? prevConn?.rtt_ms ?? 0;
+      const nextError = partial.error !== undefined ? partial.error : prevConn?.error ?? null;
+      const nextConnection: ComputeConnectionState | null =
+        prevConn || partial.profile_id !== undefined
+          ? {
+              profile_id: nextProfileId ?? prevConn?.profile_id ?? "",
+              connected: nextConnected,
+              rtt_ms: nextRtt,
+              capabilities: nextCapabilities ?? null,
+              active_model: nextActiveModel ?? null,
+              error: nextError,
+            }
+          : null;
+      return {
+        connection: nextConnection,
+        capabilities: nextCapabilities ?? null,
+        activeModel: nextActiveModel ?? null,
+        activeProfileId: nextProfileId,
+        error: nextError,
+      };
     }),
   setActiveModel: (activeModel) => set({ activeModel }),
 }));
