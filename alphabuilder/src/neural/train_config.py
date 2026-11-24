@@ -64,6 +64,7 @@ class TrainConfig:
 
     # Mixed precision
     use_amp: bool = True
+    max_wall_hours: Optional[float] = None
 
     def __post_init__(self):
         if self.use_swin and self.architecture == "simple":
@@ -163,7 +164,7 @@ CONFIGS = {
         embed_dim=192,
         transformer_depth=5,
         num_heads=6,
-        batch_size=32,
+        batch_size=64,
         epochs=30,
         learning_rate=3e-4,
         weight_decay=1e-2,
@@ -182,7 +183,7 @@ CONFIGS = {
         embed_dim=192,
         transformer_depth=5,
         num_heads=6,
-        batch_size=32,  # Per GPU (64 global under 2-rank DDP)
+        batch_size=64,  # Per GPU (128 global under 2-rank DDP)
         epochs=30,
         learning_rate=3e-4,
         weight_decay=1e-2,

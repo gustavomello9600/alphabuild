@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import random
+import shutil
 import sqlite3
 import sys
 import time
@@ -737,7 +738,9 @@ def main(
     architecture: Optional[str] = None,
     num_workers: Optional[int] = None,
     resume: Optional[str] = None,
+    max_wall_hours: Optional[float] = None,
 ) -> None:
+    run_start = time.time()
     is_distributed, rank, local_rank, world_size = _setup_distributed()
     is_main_process = rank == 0
 
@@ -770,6 +773,8 @@ def main(
             config.architecture = "swin" if use_swin else "simple"
         if num_workers is not None:
             config.num_workers = num_workers
+        if max_wall_hours is not None:
+            config.max_wall_hours = max_wall_hours
 
         Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
         Path(config.log_dir).mkdir(parents=True, exist_ok=True)
@@ -841,6 +846,10 @@ def main(
                     history = [h for h in loaded_hist if int(h.get("epoch", 0)) <= start_epoch]
                 except Exception:
                     history = []
+            best_candidate = resume_path.parent / "best_model.pt"
+            if is_main_process and best_candidate.exists() and not (ckpt_dir / "best_model.pt").exists():
+                shutil.copy2(best_candidate, ckpt_dir / "best_model.pt")
+                print(f"Carried over prior best_model.pt ({best_val_loss:.4f}) -> {ckpt_dir / 'best_model.pt'}", flush=True)
 
         for epoch in range(start_epoch, config.epochs):
             epoch_start = time.time()
@@ -971,8 +980,24 @@ def main(
                 )
 
                 if patience_counter >= config.patience:
-                    print(f"\nEarly stopping triggered (patience={config.patience})")
+                    print(f"\nEarly stopping triggered (patience={config.patience})", flush=True)
                     stop_signal = True
+
+                if (
+                    not stop_signal
+                    and config.max_wall_hours is not None
+                    and (epoch + 1) < config.epochs
+                ):
+                    elapsed_h = (time.time() - run_start) / 3600.0
+                    projected_next_h = ((time.time() - run_start) + epoch_time * 1.15) / 3600.0
+                    if projected_next_h >= config.max_wall_hours:
+                        print(
+                            f"\nReached max_wall_hours guard after epoch {epoch + 1}/{config.epochs} "
+                            f"(elapsed={elapsed_h:.2f}h, projected_next={projected_next_h:.2f}h >= {config.max_wall_hours:.2f}h). "
+                            "Stopping cleanly for seamless --resume!",
+                            flush=True,
+                        )
+                        stop_signal = True
 
             if is_distributed:
                 stop_tensor = torch.tensor([1 if stop_signal else 0], dtype=torch.int32, device=device)
@@ -1008,6 +1033,7 @@ if __name__ == "__main__":
     parser.add_argument("--use-swin", dest="use_swin", action="store_true", default=None)
     parser.add_argument("--no-swin", dest="use_swin", action="store_false")
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--max-wall-hours", type=float, default=None)
     args = parser.parse_args()
 
     main(
@@ -1024,4 +1050,5 @@ if __name__ == "__main__":
         architecture=args.arch,
         num_workers=args.num_workers,
         resume=args.resume,
+        max_wall_hours=args.max_wall_hours,
     )
