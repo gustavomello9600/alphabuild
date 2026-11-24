@@ -4,6 +4,7 @@ import type {
   DataSourceRef,
   EntryMetadata,
   FrameRef,
+  LensMode,
 } from "../types/contracts";
 import { computeAbComparison } from "../lib/ipc";
 
@@ -23,6 +24,7 @@ interface CompareStore {
   linkMode: "index" | "normalized";
   fraction: number;
   activeSlot: "a" | "b";
+  lens: LensMode;
   metrics: ComparisonMetrics | null;
   loading: boolean;
   error: string | null;
@@ -33,6 +35,7 @@ interface CompareStore {
   setNormalized: (value: boolean) => void;
   setSyncCamera: (value: boolean) => void;
   setActiveSlot: (slot: "a" | "b") => void;
+  setLens: (lens: LensMode) => void;
   compare: () => Promise<void>;
 }
 
@@ -46,13 +49,27 @@ export const useCompareStore = create<CompareStore>((set, get) => ({
   linkMode: "index",
   fraction: 0,
   activeSlot: "a",
+  lens: "structure",
   metrics: null,
   loading: false,
   error: null,
   setSlot: (slot, value) => {
+    const state = get();
     const max = value ? Math.max(0, value.metadata.total_steps - 1) : 0;
-    if (slot === "a") set({ slotA: value, stepA: Math.min(get().stepA, max), metrics: null });
-    else set({ slotB: value, stepB: Math.min(get().stepB, max), metrics: null });
+    const nextA = slot === "a" ? value : state.slotA;
+    const nextB = slot === "b" ? value : state.slotB;
+    const hasDisplacement =
+      (!nextA || nextA.metadata.has_displacement) &&
+      (!nextB || nextB.metadata.has_displacement);
+    const lens =
+      !hasDisplacement && (state.lens === "deformation" || state.lens === "strain")
+        ? "structure"
+        : state.lens;
+    if (slot === "a") {
+      set({ slotA: value, stepA: Math.min(state.stepA, max), metrics: null, lens });
+    } else {
+      set({ slotB: value, stepB: Math.min(state.stepB, max), metrics: null, lens });
+    }
   },
   setStep: (slot, step) => {
     const current = slot === "a" ? get().slotA : get().slotB;
@@ -88,6 +105,14 @@ export const useCompareStore = create<CompareStore>((set, get) => ({
     set({ normalized, linkMode: normalized ? "normalized" : "index" }),
   setSyncCamera: (syncCamera) => set({ syncCamera }),
   setActiveSlot: (activeSlot) => set({ activeSlot }),
+  setLens: (lens) => {
+    const state = get();
+    const missingDisplacement = [state.slotA, state.slotB].some(
+      (slot) => slot && !slot.metadata.has_displacement,
+    );
+    if (missingDisplacement && (lens === "deformation" || lens === "strain")) return;
+    set({ lens });
+  },
   compare: async () => {
     const state = get();
     if (!state.slotA || !state.slotB) {

@@ -26,11 +26,26 @@ const allLenses: Array<{ id: LensMode; key: string; label: string; icon: typeof 
 interface LensToolbarProps {
   forceVisible?: boolean;
   available?: { has_displacement: boolean; has_blueprint: boolean };
+  lens?: LensMode;
+  onLensChange?: (lens: LensMode) => void;
+  showActions?: boolean;
+  showKeys?: boolean;
+  ariaLabel?: string;
 }
 
-export function LensToolbar({ forceVisible, available }: LensToolbarProps = {}) {
-  const lens = useInspectorStore((state) => state.lens);
-  const setLens = useInspectorStore((state) => state.setLens);
+export function LensToolbar({
+  forceVisible,
+  available,
+  lens: controlledLens,
+  onLensChange,
+  showActions = true,
+  showKeys = false,
+  ariaLabel = "Lentes 3D",
+}: LensToolbarProps = {}) {
+  const storeLens = useInspectorStore((state) => state.lens);
+  const storeSetLens = useInspectorStore((state) => state.setLens);
+  const lens = controlledLens ?? storeLens;
+  const setLens = onLensChange ?? storeSetLens;
   const metadata = useInspectorStore((state) => state.metadata);
   const blueprint = useInspectorStore((state) => state.blueprintEnabled);
   const toggleBlueprint = useInspectorStore((state) => state.toggleBlueprint);
@@ -49,7 +64,7 @@ export function LensToolbar({ forceVisible, available }: LensToolbarProps = {}) 
   );
 
   return (
-    <div className="lens-bar glass" role="toolbar" aria-label="Lentes 3D">
+    <div className="lens-bar glass" role="toolbar" aria-label={ariaLabel}>
       {lenses.map((entry) => {
         const Icon = entry.icon;
         const tooltip = `${entry.label} · tecla ${entry.key}`;
@@ -57,7 +72,9 @@ export function LensToolbar({ forceVisible, available }: LensToolbarProps = {}) 
           <button
             key={entry.id}
             type="button"
-            className="lens-button lens-button--icon"
+            className={
+              showKeys ? "lens-button lens-button--keyed" : "lens-button lens-button--icon"
+            }
             data-active={lens === entry.id}
             data-lens={entry.id}
             data-tooltip={tooltip}
@@ -67,45 +84,50 @@ export function LensToolbar({ forceVisible, available }: LensToolbarProps = {}) 
             onClick={() => setLens(entry.id)}
           >
             <Icon size={15} strokeWidth={1.8} />
+            {showKeys ? <span className="lens-key">{entry.key}</span> : null}
           </button>
         );
       })}
-      <span className="lens-divider" />
-      <button
-        type="button"
-        className="lens-button lens-button--icon"
-        data-active={blueprint}
-        data-lens="blueprint"
-        data-tooltip={
-          hasBlueprint
-            ? `Blueprint / v_constructed · tecla B`
-            : "Blueprint indisponível neste banco"
-        }
-        title={
-          hasBlueprint
-            ? "Blueprint / v_constructed (B)"
-            : "Blueprint indisponível neste banco"
-        }
-        aria-label="Alternar Blueprint"
-        aria-pressed={blueprint}
-        disabled={!hasBlueprint}
-        onClick={toggleBlueprint}
-      >
-        <Ghost size={15} strokeWidth={1.8} />
-      </button>
-      <button
-        type="button"
-        className="lens-button lens-button--icon"
-        data-active={figureMode}
-        data-lens="tcc"
-        data-tooltip="Modo Figura TCC · tecla P"
-        title="Modo Figura TCC (P)"
-        aria-label="Modo Figura TCC"
-        aria-pressed={figureMode}
-        onClick={() => setFigureMode(!figureMode)}
-      >
-        <Maximize2 size={15} strokeWidth={1.8} />
-      </button>
+      {showActions ? <span className="lens-divider" /> : null}
+      {showActions ? (
+        <button
+          type="button"
+          className="lens-button lens-button--icon"
+          data-active={blueprint}
+          data-lens="blueprint"
+          data-tooltip={
+            hasBlueprint
+              ? `Blueprint / v_constructed · tecla B`
+              : "Blueprint indisponível neste banco"
+          }
+          title={
+            hasBlueprint
+              ? "Blueprint / v_constructed (B)"
+              : "Blueprint indisponível neste banco"
+          }
+          aria-label="Alternar Blueprint"
+          aria-pressed={blueprint}
+          disabled={!hasBlueprint}
+          onClick={toggleBlueprint}
+        >
+          <Ghost size={15} strokeWidth={1.8} />
+        </button>
+      ) : null}
+      {showActions ? (
+        <button
+          type="button"
+          className="lens-button lens-button--icon"
+          data-active={figureMode}
+          data-lens="tcc"
+          data-tooltip="Modo Figura TCC · tecla P"
+          title="Modo Figura TCC (P)"
+          aria-label="Modo Figura TCC"
+          aria-pressed={figureMode}
+          onClick={() => setFigureMode(!figureMode)}
+        >
+          <Maximize2 size={15} strokeWidth={1.8} />
+        </button>
+      ) : null}
     </div>
   );
 }

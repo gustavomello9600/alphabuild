@@ -132,6 +132,13 @@ export default function App() {
       }
       if (modifier) return;
       const inspector = useInspectorStore.getState();
+      const setActiveLens = (lens: LensMode) => {
+        if (useAppStore.getState().mode === "compare") {
+          useCompareStore.getState().setLens(lens);
+        } else {
+          useInspectorStore.getState().setLens(lens);
+        }
+      };
       switch (event.key) {
         case "Escape":
           setPaletteOpen(false);
@@ -149,11 +156,11 @@ export default function App() {
           break;
         case "d":
         case "D":
-          inspector.setLens("deformation");
+          setActiveLens("deformation");
           break;
         case "s":
         case "S":
-          inspector.setLens("strain");
+          setActiveLens("strain");
           break;
         case "p":
         case "P":
@@ -204,9 +211,8 @@ export default function App() {
           getActiveEngine()?.cycleView();
           break;
         default: {
-          const lens = lensByKey[event.key];
-          if (lens) inspector.setLens(lens);
-          if (event.key === "7") inspector.setLens("strain");
+          const lens = event.key === "7" ? "strain" : lensByKey[event.key];
+          if (lens) setActiveLens(lens);
         }
       }
     };

@@ -58,6 +58,7 @@ beforeEach(() => {
     slotB: null,
     stepA: 0,
     stepB: 0,
+    lens: "structure",
     metrics: null,
   });
 });
@@ -357,5 +358,23 @@ describe("compare store", () => {
     expect(useCompareStore.getState().stepA).toBe(11);
     useCompareStore.getState().setStep("b", 3);
     expect(useCompareStore.getState().stepB).toBe(3);
+  });
+
+  it("shares the view lens and blocks FEM lenses without displacement", () => {
+    useCompareStore.getState().setSlot("a", { source, entryId: "episode-1", metadata });
+    useCompareStore.getState().setSlot("b", { source, entryId: "episode-1", metadata });
+    useCompareStore.getState().setLens("strain");
+    expect(useCompareStore.getState().lens).toBe("strain");
+
+    useCompareStore.getState().setSlot("b", {
+      source,
+      entryId: "warmup",
+      metadata: { ...metadata, has_displacement: false },
+    });
+    expect(useCompareStore.getState().lens).toBe("structure");
+    useCompareStore.getState().setLens("deformation");
+    expect(useCompareStore.getState().lens).toBe("structure");
+    useCompareStore.getState().setLens("policy");
+    expect(useCompareStore.getState().lens).toBe("policy");
   });
 });

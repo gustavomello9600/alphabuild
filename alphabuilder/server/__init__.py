@@ -1,3 +1,3 @@
 """AlphaBuilder Compute & Inference Server (v1 API)."""
 
-__version__ = "4.0.7"
+__version__ = "4.0.8"

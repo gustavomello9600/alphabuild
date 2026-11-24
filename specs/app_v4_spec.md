@@ -431,6 +431,7 @@ NUNCA use offsets fixos como `left-[340px]`. Use uma grade de sobreposição fle
   - Episódio de Harvest (`FEniTop SIMP`),
   - Partida Self-Play (`SimpleBackbone` vs `Swin-UNETR`, ou `Warmup` vs `SP-Gen 5`),
   - Resultado atual do `Estúdio`.
+- **Barra de lentes compartilhada** (`1`..`7`) logo acima do painel delta: o modo escolhido é aplicado simultaneamente aos dois viewports; lentes FEM ficam ocultas se algum slot carregado não tiver `displacement`.
 - **Painel Delta A vs. B** no rodapé: exibe lado a lado e a diferença percentual ($\Delta\%$) para `Compliance Final`, `Volume %`, `Max Displacement`, `Reward v3.3`, `Passos Fase 1 / Fase 2`, `Taxa de Refutação MCTS`, além do **IoU Volumétrico 3D** ($\frac{|A \cap B|}{|A \cup B|}$) calculado em Rust!
 - Exportação conjunta **PNG A/B Side-by-Side 4K** pronta para figuras comparativas do TCC!
 

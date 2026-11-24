@@ -69,7 +69,7 @@ cd apps/studio && npm run typecheck && npm run test && npm run build
 
 - **Inspetor:** replay de Harvest v3.3 e Self-Play MCTS, malha surface-culled com AO, 7 lentes, Blueprint Ghost Fresnel, planos de corte X/Y/Z, deformação/exagero com colormap Turbo, filmstrip com fases/sparklines/refutações, exportação STL/OBJ/VTI/PNG 4K.
 - **Estúdio:** templates, escultura 3D, suporte/carga com snap inteiro, Raio-X Neural (debounce 120 ms), FEM real, SIMP e MCTS ao vivo com Pausar → Editar → Continuar.
-- **Comparador:** dois viewports sincronizados (câmera e timeline por índice ou fração normalizada), IoU 3D e deltas calculados em Rust, PNG A/B 4K.
+- **Comparador:** dois viewports sincronizados (câmera e timeline por índice ou fração normalizada), barra de lentes 1–7 compartilhada que muda a vista dos dois lados, IoU 3D e deltas calculados em Rust, PNG A/B 4K.
 - **Offline-first:** abrir `.db` locais sem Python; o Compute Engine é opcional.
 
 ## Release

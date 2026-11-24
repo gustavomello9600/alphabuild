@@ -66,6 +66,13 @@ A fixture `src/lib/__fixtures__/abmesh_fixture.bin` é gerada por `cargo run -p 
 - `src/lib/` — IPC tipado, parser zero-copy ABMESH01, Turbo, formatters.
 - `src-tauri/` — comandos IPC, cache LRU, sidecar, ws_bridge e contratos snake_case.
 
+## Comparador A/B
+
+- Barra de lentes numerada (1–7) acima da faixa de comparações/deltas; o modo escolhido vale para os dois viewports.
+- As teclas `1`–`7`, `D` e `S` trocam a lente do comparador sem afetar o Inspetor.
+- Lentes FEM ficam ocultas quando algum slot carregado não possui `displacement`.
+- Os controles globais do comparador ficam abaixo dos cabeçalhos dos slots, sem sobreposição.
+
 ## Filmstrip ao vivo no Estúdio
 
 Durante uma sessão MCTS, o mesmo dock inferior do Inspetor aparece no Estúdio:

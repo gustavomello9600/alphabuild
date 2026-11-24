@@ -12,6 +12,7 @@ import { formatNumber, formatPercent, formatReward, formatSigned } from "../lib/
 import { useAppStore } from "../store/useAppStore";
 import { useCompareStore } from "../store/useCompareStore";
 import { BrandMark } from "./BrandMark";
+import { LensToolbar } from "./LensToolbar";
 import { ViewportEngine } from "../engine3d/ViewportEngine";
 import type { ParsedAbMesh } from "../types/contracts";
 
@@ -42,6 +43,11 @@ export function CompareView() {
     engineRefs.current[slot] = engine;
     setEngineTick((value) => value + 1);
   }, []);
+
+  useEffect(() => {
+    engineRefs.current.a?.setLens(store.lens);
+    engineRefs.current.b?.setLens(store.lens);
+  }, [store.lens, engineTick]);
 
   useEffect(() => {
     const a = engineRefs.current.a;
@@ -93,6 +99,9 @@ export function CompareView() {
     };
   }, []);
 
+  const compareHasDisplacement =
+    (!store.slotA || store.slotA.metadata.has_displacement) &&
+    (!store.slotB || store.slotB.metadata.has_displacement);
   const maxA = store.slotA ? Math.max(0, store.slotA.metadata.total_steps - 1) : 0;
   const maxB = store.slotB ? Math.max(0, store.slotB.metadata.total_steps - 1) : 0;
   const masterMax = store.linkMode === "normalized" ? 1000 : Math.max(maxA, maxB);
@@ -237,68 +246,79 @@ export function CompareView() {
         </button>
       </div>
 
-      <div className="compare-delta glass">
-        <div className="compare-delta__head">
-          <div className="timeline-meta">
-            <span className="badge" data-tone="accent">
-              A/B SYNC
+      <div className="compare-bottom">
+        <LensToolbar
+          forceVisible
+          showActions={false}
+          showKeys
+          lens={store.lens}
+          onLensChange={store.setLens}
+          available={{ has_displacement: compareHasDisplacement, has_blueprint: false }}
+          ariaLabel="Modo de visualização A/B"
+        />
+        <div className="compare-delta glass">
+          <div className="compare-delta__head">
+            <div className="timeline-meta">
+              <span className="badge" data-tone="accent">
+                A/B SYNC
+              </span>
+              <span>Passo A {store.stepA}</span>
+              <span>Passo B {store.stepB}</span>
+              <span>{store.linkMode === "normalized" ? formatPercent(store.fraction) : "índice"}</span>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, maxWidth: 520 }}>
+              <input
+                type="range"
+                min={0}
+                max={Math.max(1, masterMax)}
+                step={1}
+                value={masterValue}
+                onChange={(event) => {
+                  const value = Number(event.target.value);
+                  if (store.linkMode === "normalized") store.setFraction(value / 1000);
+                  else store.setLinkedStep(value);
+                }}
+                aria-label="Timeline sincronizada A/B"
+              />
+            </div>
+          </div>
+          {store.metrics ? (
+            <div className="compare-metrics">
+              <Metric label="IoU 3D" value={store.metrics.iou_3d.toFixed(4)} tone="accent" />
+              <Metric
+                label="Δ compliance"
+                value={formatNumber(store.metrics.delta_compliance, 2)}
+              />
+              <Metric
+                label="Δ compliance %"
+                value={
+                  store.metrics.delta_compliance_pct === null
+                    ? "—"
+                    : `${formatSigned(store.metrics.delta_compliance_pct, 2)}%`
+                }
+              />
+              <Metric label="Δ volume" value={formatPercent(store.metrics.delta_volume)} />
+              <Metric label="Δ reward" value={formatSigned(store.metrics.delta_reward, 4)} />
+              <Metric
+                label="Δ desloc. máx"
+                value={formatNumber(store.metrics.delta_max_displacement, 2)}
+              />
+              <Metric label="Δ passos" value={String(store.metrics.delta_steps)} />
+            </div>
+          ) : (
+            <div className="timeline-meta" style={{ paddingTop: 6 }}>
+              <span>
+                Carregue dois episódios para calcular IoU 3D (|A∩B| / |A∪B|) e deltas exatos em Rust.
+              </span>
+            </div>
+          )}
+          {store.error ? <span className="badge" data-tone="danger">{store.error}</span> : null}
+          {exportMessage ? (
+            <span className="badge" data-tone="success" style={{ height: "auto", padding: "5px 7px" }}>
+              {exportMessage}
             </span>
-            <span>Passo A {store.stepA}</span>
-            <span>Passo B {store.stepB}</span>
-            <span>{store.linkMode === "normalized" ? formatPercent(store.fraction) : "índice"}</span>
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, maxWidth: 520 }}>
-            <input
-              type="range"
-              min={0}
-              max={Math.max(1, masterMax)}
-              step={1}
-              value={masterValue}
-              onChange={(event) => {
-                const value = Number(event.target.value);
-                if (store.linkMode === "normalized") store.setFraction(value / 1000);
-                else store.setLinkedStep(value);
-              }}
-              aria-label="Timeline sincronizada A/B"
-            />
-          </div>
+          ) : null}
         </div>
-        {store.metrics ? (
-          <div className="compare-metrics">
-            <Metric label="IoU 3D" value={store.metrics.iou_3d.toFixed(4)} tone="accent" />
-            <Metric
-              label="Δ compliance"
-              value={formatNumber(store.metrics.delta_compliance, 2)}
-            />
-            <Metric
-              label="Δ compliance %"
-              value={
-                store.metrics.delta_compliance_pct === null
-                  ? "—"
-                  : `${formatSigned(store.metrics.delta_compliance_pct, 2)}%`
-              }
-            />
-            <Metric label="Δ volume" value={formatPercent(store.metrics.delta_volume)} />
-            <Metric label="Δ reward" value={formatSigned(store.metrics.delta_reward, 4)} />
-            <Metric
-              label="Δ desloc. máx"
-              value={formatNumber(store.metrics.delta_max_displacement, 2)}
-            />
-            <Metric label="Δ passos" value={String(store.metrics.delta_steps)} />
-          </div>
-        ) : (
-          <div className="timeline-meta" style={{ paddingTop: 6 }}>
-            <span>
-              Carregue dois episódios para calcular IoU 3D (|A∩B| / |A∪B|) e deltas exatos em Rust.
-            </span>
-          </div>
-        )}
-        {store.error ? <span className="badge" data-tone="danger">{store.error}</span> : null}
-        {exportMessage ? (
-          <span className="badge" data-tone="success" style={{ height: "auto", padding: "5px 7px" }}>
-            {exportMessage}
-          </span>
-        ) : null}
       </div>
     </section>
   );
@@ -367,7 +387,6 @@ function ComparePane(props: {
           if (engine) {
             engine.applyFrame(parsed);
             engine.setBoundaries(slot.metadata.supports, slot.metadata.forces, slot.metadata.bc_type);
-            engine.setLens("structure");
             engine.setBlueprintVisible(false);
           }
         })

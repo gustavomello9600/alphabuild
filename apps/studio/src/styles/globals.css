@@ -436,7 +436,18 @@ button {
   justify-content: center;
   position: relative;
 }
-.lens-button--icon[data-tooltip]::after {
+.lens-button--keyed {
+  width: auto;
+  padding: 0 7px;
+  gap: 4px;
+  justify-content: center;
+  position: relative;
+}
+.lens-button--keyed .lens-key {
+  color: var(--text-muted);
+  font-size: 9px;
+}
+.lens-button[data-tooltip]::after {
   content: attr(data-tooltip);
   position: absolute;
   z-index: 60;
@@ -460,8 +471,8 @@ button {
     opacity 120ms var(--ease-out),
     transform 120ms var(--ease-out);
 }
-.lens-button--icon[data-tooltip]:hover::after,
-.lens-button--icon[data-tooltip]:focus-visible::after {
+.lens-button[data-tooltip]:hover::after,
+.lens-button[data-tooltip]:focus-visible::after {
   opacity: 1;
   transform: translate(-50%, 0);
 }
@@ -1232,7 +1243,7 @@ input[type="checkbox"] {
 .compare-toolbar {
   position: absolute;
   z-index: 16;
-  top: 64px;
+  top: 116px;
   left: 50%;
   transform: translateX(-50%);
   border-radius: 999px;
@@ -1244,19 +1255,32 @@ input[type="checkbox"] {
   overflow-x: auto;
   pointer-events: auto;
 }
-.compare-delta {
+.compare-bottom {
   position: absolute;
   z-index: 16;
   bottom: 14px;
   left: 50%;
   transform: translateX(-50%);
   width: min(1100px, calc(100% - 32px));
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  pointer-events: none;
+}
+.compare-bottom > * {
+  pointer-events: auto;
+}
+.compare-bottom .lens-bar {
+  align-self: center;
+}
+.compare-delta {
+  width: 100%;
   border-radius: var(--radius-lg);
   padding: 9px 12px 10px;
   display: flex;
   flex-direction: column;
   gap: 6px;
-  pointer-events: auto;
 }
 .compare-delta__head {
   display: flex;
