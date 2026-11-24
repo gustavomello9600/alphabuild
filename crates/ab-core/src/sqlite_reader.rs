@@ -26,6 +26,7 @@ pub const MAX_BLOB_BYTES: usize = 256 * 1024 * 1024;
 pub enum DbKind {
     HarvestV33,
     HarvestV2,
+    #[serde(rename = "selfplay")]
     SelfPlay,
     LegacyV1,
 }
@@ -521,9 +522,6 @@ mod tests {
     use super::*;
     use crate::codecs::npy::encode_npy;
     use crate::codecs::zlib_compress;
-    use std::sync::Mutex;
-
-    static FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
     fn write_pickle_blob() -> Vec<u8> {
         let pickle = b"\x80\x02}q\x00.".to_vec();
@@ -531,10 +529,6 @@ mod tests {
     }
 
     fn build_legacy_selfplay_db(path: &Path) {
-        let _guard = FIXTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        if path.exists() {
-            return;
-        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -592,15 +586,20 @@ mod tests {
         drop(conn);
     }
 
-    fn repo_selfplay_db() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../data/selfplay_games.db")
-            .to_path_buf()
+    fn temp_selfplay_fixture(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "abcore-{tag}-{}-{}-selfplay_games.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 
     #[test]
     fn reads_real_or_fixture_selfplay_db_without_missing_columns() {
-        let path = repo_selfplay_db();
+        let path = temp_selfplay_fixture("legacy-cols");
         build_legacy_selfplay_db(&path);
         let reader = SqliteReader::open(&path).unwrap();
         assert_eq!(reader.detect_kind().unwrap(), DbKind::SelfPlay);
@@ -641,11 +640,35 @@ mod tests {
             reader.game_ids(10, 0).unwrap(),
             vec!["legacy-game".to_string()]
         );
+        drop(reader);
+        let _ = std::fs::remove_file(&path);
+
+        // If a real data/selfplay_games.db is present, verify read-only introspection works too.
+        let repo_db = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/selfplay_games.db");
+        if repo_db.exists() {
+            let real_reader = SqliteReader::open(&repo_db).unwrap();
+            assert_eq!(real_reader.detect_kind().unwrap(), DbKind::SelfPlay);
+            let real_select = real_reader
+                .select_with_nulls(
+                    "games",
+                    &[
+                        "game_id",
+                        "fem_reward",
+                        "displacement_map_blob",
+                        "initial_cantilever_problem_real_scale_factor",
+                        "stiffness_E",
+                    ],
+                )
+                .unwrap();
+            let real_sql = format!("SELECT {real_select} FROM games LIMIT 1");
+            let mut stmt = real_reader.connection().prepare(&real_sql).unwrap();
+            let _ = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+        }
     }
 
     #[test]
     fn legacy_pickle_blob_is_reported_without_panic() {
-        let path = repo_selfplay_db();
+        let path = temp_selfplay_fixture("legacy-pickle");
         build_legacy_selfplay_db(&path);
         let reader = SqliteReader::open(&path).unwrap();
         assert!(reader.detect_legacy_pickle(DbKind::SelfPlay).unwrap());
@@ -663,6 +686,8 @@ mod tests {
             }
             other => panic!("expected LegacyPickleBlob, got {other:?}"),
         }
+        drop(reader);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -737,5 +762,20 @@ mod tests {
     fn open_missing_database_is_clean_error() {
         let err = SqliteReader::open("/tmp/abcore-does-not-exist.db");
         assert!(matches!(err, Err(CoreError::NotFound { .. })));
+    }
+
+    #[test]
+    fn db_kind_serde_matches_as_str() {
+        for kind in [
+            DbKind::HarvestV33,
+            DbKind::HarvestV2,
+            DbKind::SelfPlay,
+            DbKind::LegacyV1,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, format!("\"{}\"", kind.as_str()));
+            let roundtrip: DbKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(roundtrip, kind);
+        }
     }
 }
