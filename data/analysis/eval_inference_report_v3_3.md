@@ -33,6 +33,10 @@ Treino executado com [`alphabuilder-v3-3-stage3-simple`](file:///c:/Users/admin/
 | **20** | `9,27e-5` | `1.265,2s` (`339,3 s/s`) | `0,3038` (`0,2532 / 0,0016 / 0,0948`) | `0,3671` (`0,3134 / 0,0013 / 0,1024`) | `0,0149` | **`16,65%`** *(pico)* | `89,74%` |
 | **30** *(Best)* | `3,00e-6` | `1.259,3s` (`340,9 s/s`) | **`0,2732`** (`0,2252 / 0,0012 / 0,0912`) | **`0,3415`** (`0,2895 / 0,0011 / 0,0997`) | **`0,0134`** *(mín Ep 28/30)* | `15,16%` | **`90,05%`** *(pico 90,06% Ep 29)* |
 
+![Evolução das Métricas de Validação no Stage 3](figures/stage3_validation_metrics.png)
+
+*Para a análise completa das curvas de treino, agenda de LR, razão de gradientes e vazão DDP nas 30 épocas, veja [`stage3_training_report.md`](file:///c:/Users/admin/Projetos/alphabuild/data/analysis/stage3_training_report.md).*
+
 ---
 
 ## 3. Benchmark Quantitativo por Cenário (`ep2` × `ep30` × `FEniTop SIMP`)
@@ -59,6 +63,10 @@ Parâmetros idênticos em todos os cenários: malha `64 × 32 × 8` (`16.384` vo
 
 *\*Em `ep30__S2`, `n_islands = 2` (`374` voxels soltos num banzo paralelo não conectado ao carregamento); veja decomposição na Seção 4.1.*
 
+![Comparativo de Compliance Final e Score v3.3](figures/eval_compliance_score_comparison.png)
+
+*Figura: Comparação logarítmica da compliance final (`ep2 × ep30 × SIMP`) e salto do Score v3.3 nos 6 cenários.*
+
 > [!IMPORTANT]
 > **Observação metodológica sobre o SIMP em `max_iter = 60` (`beta = 4,0`):** como `optimization.py` usa `beta_interval = 30`, em 60 iterações as diagonais finas do SIMP ainda contêm densidades cinzentas intermediárias, fazendo com que a binarização ingênua em `rho > 0,5` perca conexão em `S1–S5` (`C_bin = 21k–254k`). No entanto, em **`S6`** (vão curto `x = 36`), onde o SIMP já está **100% conectado em voxels discretos (`V = 14,41%`, `C_bin = 6.800,8`, `Score_bin = +0,048`)**, o **`ep30` superou o SIMP binarizado em `15,7%` de compliance (`5.732,3`) e em `+0,205` de `Score v3.3` (`+0,253`) usando metade do volume (`7,28%`)**. Contra o campo contínuo (`beta = 4,0`) do SIMP, o `ep30` ainda está `20,0×` (`S4`) a `56,2×` (`S6`) acima em compliance.
 
@@ -72,6 +80,10 @@ Parâmetros idênticos em todos os cenários: malha `64 × 32 × 8` (`16.384` vo
 | **S4** (`x=58, y=16, z=[3,5]`) | `7/7/7` → **`9/8/8`** vs `32/32/24` | `0,012 → 0,015` vs `0,494` | `0,01 → 0,00` vs `0,57` | `6,8% →` **`5,3%`** vs `0,0%` | `3,46 → 4,28` vs `5,71` |
 | **S5** (`x=52, y=11, z=[1,3]`) | `7/6/11` → **`9/9/7`** vs `32/32/24` | `0,042 → 0,026` vs `0,431` | `0,16 → 0,00` vs `0,40` | `12,3% →` **`7,5%`** vs `0,0%` | `3,05 → 2,99` vs **`0,99`** |
 | **S6** (`x=36, y=16, z=[3,5]`) | `5/5/7` → **`11/7/9`** vs `32/26/16` | `0,016 → 0,031` vs `0,341` | `0,00 → 0,01` vs `0,42` | `16,4% →` **`5,2%`** vs `0,0%` | `2,90 → 4,27` vs `4,25` |
+
+![Padrões Geométricos Estruturais](figures/eval_geometry_patterns.png)
+
+*Figura: Evolução da inércia à flexão ($I_y$), correção do afilamento raiz → ponta em 6/6 cenários e redução do overshoot em X.*
 
 ---
 
@@ -98,6 +110,10 @@ Parâmetros idênticos em todos os cenários: malha `64 × 32 × 8` (`16.384` vo
 | **S5** | `73,2%` / `96,7%` | `70,6%` / `81,1%` | `18,8 → 13,6` | `240/0 → 240/0` | `0,597 →` **`0,333`** | `+0,597 → +0,333` | `+0,621 → -0,280` |
 | **S6** | `83,9%` / `80,0%` | `57,7%` / `68,5%` | `19,5 → 18,8` | `240/0 → 200/0` | `0,535 → 0,441` | `+0,531 → +0,441` | `-0,101 →` **`+0,884`** |
 | **Total / Méd.** | — | — | `18,5 → 15,1` | **`1439/1 → 1335/1`** | `0,596 →` **`0,401`** | `+0,595 →` **`+0,401`** | — |
+
+![Shift Covariável da Value Head na Fase 2](figures/eval_value_calibration_shift.png)
+
+*Figura: Trajetória real passo a passo em S6 (`V_net` vs `R_FEM`) e salto de ~30× no MAE entre validação supervisionada e rollout OOD.*
 
 O contraste entre **`Val MAE = 0,0134`** no dataset supervisionado e **`MAE = 0,401`** nos episódios reais revela o mecanismo exato que limita a Fase 2 após 30 épocas supervisionadas:
 
@@ -164,6 +180,10 @@ Aplicando um fator conservador-realista de **`4,5×` a `6,5×`** por amostra (en
 
 Hardware medido (`katastopoulos` via WSL2 `archlinux`): **`Intel(R) Graphics [0x7dd1]`** (`xpu`, PyTorch `2.5.1+xpu` + IPEX) e CPU do host (NPU `Intel(R) AI Boost` existe no Windows mas não está exposta ao WSL2 e `openvino` ainda não está instalado nos ambientes Python atuais).
 
+![Custo de Pré-Treino e Viabilidade Local](figures/hardware_cost_latency_viability.png)
+
+*Figura: Custo estimado/medido de 30 épocas (`GPU-h`) e latências reais de inferência (`BS=1` Raio-X e `MCTS` por passo) no hardware local.*
+
 ### 6.1 Latências Medidas (`BS=1` Raio-X e `BS=8` MCTS Batch)
 
 | Arquitetura | `xpu` `BS=1` (FP32 / BF16) | `xpu` `BS=8` (FP32 / BF16) | `cpu` `BS=1` (FP32) | Raio-X Neural Interativo (`120 ms` debounce) | MCTS `160 sims` (`20 × BS=8`) só Rede | MCTS `160 sims` Passo Completo (F1 / F2+FEM) |
@@ -195,3 +215,49 @@ Todos os **18 episódios** já estão persistidos em [`data/eval_inference_v3_3.
 - **No app:** abra a gaveta **Biblioteca** (`L`), selecione o banco `eval_inference_v3_3.db` e use:
   - **Inspetor:** para percorrer passo a passo Fase 1 → transição → Fase 2 com as lentes *Estrutura*, *Policy*, *Visitas MCTS*, *Refutação* e *Deformação / Tensão* (inclusive visualizando a bifurcação em duas ilhas no passo `49` de `ep30__S2_cantilever_tip_bottom` e a viga limpa de `ep30__S6_short_deep_clamp`).
   - **Comparação:** para colocar lado a lado **`ep2__S*`**, **`ep30__S*`** e **`simp__S*`** no mesmo cenário.
+
+---
+
+## 8. Inspeção Direta dos Pesos (`ep30`): O que a Rede Aprendeu a Enxergar, Entender e Agir
+
+Esta auditoria examina diretamente os `88` tensores de pesos (`4.433.132` parâmetros) do checkpoint [`simple_v3_3_stage3_best.pt`](file:///c:/Users/admin/Projetos/alphabuild/checkpoints/simple_v3_3_stage3_best.pt) em comparação com [`simple_v3_3_smoke_ep2.pt`](file:///c:/Users/admin/Projetos/alphabuild/checkpoints/simple_v3_3_smoke_ep2.pt) e sonda suas ativações internas nos estados reais de Fase 2 e nos alvos SIMP gravados em [`eval_inference_v3_3.db`](file:///c:/Users/admin/Projetos/alphabuild/data/eval_inference_v3_3.db).
+
+![Inspeção Direta de Pesos e Ativações do ep30](figures/ep30_weight_inspection.png)
+
+### 8.1 Saúde Estrutural e Espectro dos Pesos
+
+- **Ausência total de colapso numérico:** `0` valores `NaN`/`Inf` em todo o checkpoint e **`0/672` canais `GroupNorm` mortos** (`|gamma| < 0,05`), indicando fluxo de gradientes íntegro do *stem* até as três cabeças após 30 épocas em `BF16`/FP16 AMP.
+- **Posto efetivo por módulo (*effective rank* espectral):**
+  - O *backbone* espacial e as duas cabeças densas operam em posto alto e saudável: `encoder.stage1.conv1` (**`74,1%`**, `17,8/24`), `policy_head.0` (**`75,2%`**, `18,1/24`) e `blueprint_head.0` (**`74,7%`**, `17,9/24`).
+  - Já a primeira camada da `Value Head` (`value_head.0`, `(256, 448)`) concentrou-se num subespaço muito mais estreito (**`16,7%`**, posto efetivo `42,6/256`, número de condição `s_max/s_min = 56,7`). Isso combina diretamente com a capacidade de encaixar com precisão `MAE = 0,0134` dentro do *manifold* supervisionado do SIMP, ao custo de extrapolar mal fora dele.
+
+### 8.2 O que a Rede Aprendeu a Enxergar (Sensibilidade de Entrada e Filtros 3D)
+
+- **Foco quase exclusivo na geometria e carga ativa no plano XY:** na camada de entrada `encoder.stage1.conv1`, apenas 3 dos 11 canais concentram **`78,7%` de toda a energia $L_2^2$**: **`fx` (`26,75%`)**, **`fy` (`26,37%`)** e **`density` (`25,61%`)** (saltando de `||w||₂ ≈ 1,39–1,46` no `ep2` para `2,95–3,01` no `ep30`).
+- **Simetria `D4 × Z2` efetivamente internalizada nos pesos:** `fx` e `fy` têm energia quase idêntica (`26,75%` vs `26,37%`), assim como `mask_x` e `mask_y` (`3,31%` vs `3,23%`) — prova direta de que as rotações de `90°` no plano XY durante o treino forçaram invariância rotacional real na convolução inicial.
+- **Como os filtros 3×3×3 enxergam o espaço (`X, Y, Z`):**
+  - Os filtros de `stem[density]` são **isotrópicos em 3D** (`dX/dZ = 1,07×`, `dY/dZ = 1,05×`), atuando como detectores verdadeiros de borda sólido-vazio nas três dimensões.
+  - Em contraste, os filtros de `stem[fy]` tornaram-se **anisotrópicos e quasi-2D em `Z`**: `flatness Z = 0,821` (`82,1%` da variação dos kernels é uniforme ao longo do eixo `Z`), `dX/dZ = 2,25×` e energia de diferenças ortogonais (`0,0885`) **`4,7×` maior** que a diagonal (`0,0190`). Ou seja, a rede enxerga o campo de força como **placas alinhadas em `Z` com variação principalmente em `X–Y`**, explicando em nível microscópico sua baixa especialização na espessura `Z` em `S5`.
+- **Anomalia do canal `fz` não treinado:** como todas as simulações de warmup têm `fz = 0`, na entrada convolucional `fz` estagnou em `2,11%` de energia (`ep2 L2 = 0,880 → ep30 0,847`), mas no atalho direto para o *decoder* (`raw_phys_proj`, `1×1` sem normalização) a rede zerou/reduziu ativamente `fx` (`3,65%`) e `fy` (`1,83%`) enquanto **deixou `fz` com `27,31%` da energia residual** (`L2 = 0,929 → 1,200`) apenas por falta de gradiente corretivo.
+
+### 8.3 O que a Rede Aprendeu a Entender (Física Global e `Value Head`)
+
+- **Descritores físicos no *bottleneck* (`phys_film`) e na `Value Head` (`phys_value_proj`):** entre as 9 estatísticas globais invariantes ([`model.py#L156`](file:///c:/Users/admin/Projetos/alphabuild/alphabuilder/src/neural/model.py#L156)), o modulador FiLM deu maior peso a **`vol_mean` (`24,9%`)** e **`bc_z` (`20,1%`)**; na projeção direta da `Value Head`, **`bc_z` concentra sozinho `50,4%` da energia**, mostrando que a rede aprendeu a usar `bc_z` como interruptor exato entre o regime de engaste completo (`FULL_CLAMP`) e deslizamento livre (`RAIL_XY`).
+- **`max_pool` atua como censor de defeitos; `avg_pool` é conservador:** na camada `value_head.0`, `avg_pool` tem maior energia estrutural nos pesos (`61,0%`), mas nas **ativações reais quem manda na decisão é `max_pool`** (`h0 L2`: `max = 38,8` vs `avg = 18,2` no `ep30__S1`; `max = 55,0` vs `avg = 7,9` no `simp__S1`). Quando o estado `simp__S1` binarizado está desconectado (`V = -0,611`), zerar `max_pool` inverte o veredito para `+0,121` (enquanto zerar `phys_emb` ou `avg_pool` pouco altera: `-0,690` e `-0,544`). A rede aprendeu a identificar falhas locais de conectividade via `max_pool`, embora no `ep30__S1..S6` conectados o bias pré-tanh positivo (**`value_head.5.bias = +0,1059`** vs `+0,0003` no `ep2`) e a superestimação OOD sustentem `V_pred = +0,32..+0,66` (pré-tanh médio `+0,535`).
+
+### 8.4 Como a Rede Decide Agir (`Policy Head` vs `Blueprint Head`)
+
+- **Separação funcional espontânea no *decoder* (`r = -0,5317`):** os `24` canais finais de `dec_feat` alimentam simultaneamente `policy_head` e `blueprint_head`, porém a correlação entre a importância por canal usada pelas duas cabeças é **`-0,5317`** — o *decoder* dividiu seus canais entre **forma global futura (*Blueprint*)** e **fronteira imediata de edição (*Policy*)**.
+- **Por que `REMOVE` é quase invisível na Fase 2 (`+8,9` a `+9,2` logits de diferença):**
+  - Os pesos da cabeça de remoção **não estão mortos**: `||w_REM|| = 2,178` vs `||w_ADD|| = 2,318`, com similaridade cosseno **`-0,200`** (a rede aprendeu direções ligeiramente opostas em vez de simetria trivial).
+  - Contudo, nas ativações reais sobre estados de Fase 2, o maior logit válido de `ADD` em voxels vazios atinge **`+8,86` na média de 18 estados `ep30`** (`+9,02` nos 6 finais, até `+10,05` em `S1`), enquanto o maior logit válido de `REMOVE` em voxels sólidos fica em **`-0,01` na média** (`-0,19` nos 6 finais; faixa `-1,44` a `+0,42`). Mesmo nos estados finais quase ótimos do SIMP, `max(ADD) = +5,21` supera `max(REM) = +0,76` em **`6/6` cenários**.
+  - Assim, a paralisia de `REMOVE` (`1` ação em `1.336` na Fase 2) tem dupla causa nos pesos: (1) a `Policy Head` coloca **`~+9` logits de vantagem pró-`ADD`** na expansão `top_k` da árvore MCTS, e (2) a `Value Head` dá **`+0,40` de viés otimista** para adições OOD.
+
+### 8.5 Nota Final — Você Faria Alguma Alteração Direta nos Pesos do `ep30`?
+
+**NÃO** para editar calibração da `Value Head` ou da `Policy Head`, e **SIM (apenas opcionalmente como higiene defensiva de produção)** para **zerar os pesos não-treinados do canal `fz`** caso o Studio permita forças `fz ≠ 0` antes do próximo retreino completo.
+
+1. **Por que NÃO mexer no `value_head.5.bias` (`+0,1059`):** uma simulação direta em memória revelou que deslocar esse bias em `-0,35` reduz o `MAE` nos finais `ep30` (`0,406 → 0,112`), mas **destrói a calibração em boas estruturas SIMP (`MAE 0,249 → 0,539`, piorando `2,2×`)** além de manter a mesma ordenação relativa dentro do MCTS. A correção legítima exige **Etapa 6 (Self-Play)** para ensinar a `Value Head` a distinguir vigas espessas de treliças ótimas.
+2. **Por que NÃO deslocar o bias de `REMOVE` (`policy_head.3.bias[1]`):** subir artificialmente todos os voxels sólidos em `+6` logits contaminaria a Fase 1 (`GROWTH`) com remoções sem critério geométrico. Se quiser incentivar remoções antes do Self-Play, isso deve ser feito **no seletor de ações de Fase 2 do MCTS** (ex.: reservando slots do `top_k` para candidatos `REMOVE`), nunca adulterando os pesos salvos no checkpoint.
+3. **Única cirurgia matematicamente segura — zerar pesos mortos de `fz` (`raw_phys_proj[:, 6]`, `stage1.conv1[:, 6]`, `stage1.skip[:, 6]`, `phys_film.0[:, 8]`, `phys_value_proj.0[:, 8]`):** produz **alteração exatamente nula (`0,0000`)** em todos os cenários com `fz = 0` e neutraliza o canal OOD residual (`27,3%` de energia em `raw_phys_proj`), que num teste sintético com `fz ≠ 0` provocou perturbação de `ΔPol = 0,27–0,71` e até **`ΔVal = +0,865`** em `simp__S1`. *(Obs.: nesta entrega, o arquivo [`simple_v3_3_stage3_best.pt`](file:///c:/Users/admin/Projetos/alphabuild/checkpoints/simple_v3_3_stage3_best.pt) em disco foi mantido intacto e fiel ao treino do Kaggle.)*
+
