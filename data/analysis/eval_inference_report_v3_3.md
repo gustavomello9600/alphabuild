@@ -1,103 +1,134 @@
-# Avaliação Real de Inferência + MCTS (v3.3), Análise de Padrões Estruturais e Estimativa de Custo/Viabilidade (`Swin-UNETR`)
+# Avaliação Real de Inferência + MCTS (v3.3): Evolução `ep2 → ep30` vs `SIMP` e Viabilidade (`Swin-UNETR`)
 
 **Data:** 2026-11-24  
-**Checkpoint avaliado neste ciclo:** [`checkpoints/simple_v3_3_smoke_ep2.pt`](file:///c:/Users/admin/Projetos/alphabuild/checkpoints/simple_v3_3_smoke_ep2.pt) (`SimpleBackbone`, `4.433.132` parâmetros, smoke test de **2 épocas**, `val_loss = 0.5953`, dispositivo `xpu` = `Intel(R) Graphics [0x7dd1]`)  
-**Banco SQLite inspecionável (Studio v4):** [`data/eval_inference_v3_3.db`](file:///c:/Users/admin/Projetos/alphabuild/data/eval_inference_v3_3.db) (`105,57 MB`, `12` episódios = `6 ep2__*` + `6 simp__*`, `762` passos, `PRAGMA integrity_check = ok`, zero blobs pickle)  
+**Checkpoints avaliados neste estudo:**
+- **Baseline Smoke (`ep2`):** [`checkpoints/simple_v3_3_smoke_ep2.pt`](file:///c:/Users/admin/Projetos/alphabuild/checkpoints/simple_v3_3_smoke_ep2.pt) (`SimpleBackbone`, `4.433.132` parâmetros, **2 épocas**; no treino Stage 3 completo, a época 2 fechou em `val_loss = 0,6378`)
+- **Stage 3 Completo (`ep30`, melhor modelo):** [`checkpoints/simple_v3_3_stage3_best.pt`](file:///c:/Users/admin/Projetos/alphabuild/checkpoints/simple_v3_3_stage3_best.pt) (`SimpleBackbone`, **Epoch 30/30** [índice `29`], `val_loss = 0,3415`, `Top-1 = 15,16%`, `Blueprint Dice = 90,05%`, `Value MAE = 0,0134`), executado em `xpu` (`Intel(R) Graphics [0x7dd1]`)
+
+**Banco SQLite inspecionável (Studio v4):** [`data/eval_inference_v3_3.db`](file:///c:/Users/admin/Projetos/alphabuild/data/eval_inference_v3_3.db) (`175,45 MB`, `18` episódios = `6 ep2__*` + `6 ep30__*` + `6 simp__*`, `1.186` passos no total, `PRAGMA integrity_check = ok`, `has_legacy_pickle = False`)  
 **Script reprodutível:** [`scripts/evaluate_inference_scenarios.py`](file:///c:/Users/admin/Projetos/alphabuild/scripts/evaluate_inference_scenarios.py)  
-**Dados brutos:** [`data/analysis/eval_ep2_results.json`](file:///c:/Users/admin/Projetos/alphabuild/data/analysis/eval_ep2_results.json)
-
-> [!NOTE]
-> O treino completo Stage 3 (`SimpleBackbone`, 30 épocas no Kaggle `2 × Tesla T4`) ainda está em execução no momento deste relatório (~04:33 BRT, término previsto ~05:13 BRT). Ao finalizar, o modelo de 30 épocas será avaliado com `--skip-simp` no **mesmo** banco [`data/eval_inference_v3_3.db`](file:///c:/Users/admin/Projetos/alphabuild/data/eval_inference_v3_3.db) com prefixo `ep30__*` para comparação direta lado a lado (`ep2` × `ep30` × `simp`).
+**Dados brutos:** [`data/analysis/eval_ep2_results.json`](file:///c:/Users/admin/Projetos/alphabuild/data/analysis/eval_ep2_results.json) · [`data/analysis/eval_ep30_results.json`](file:///c:/Users/admin/Projetos/alphabuild/data/analysis/eval_ep30_results.json) · [`data/analysis/stage3_simple_metrics_history.json`](file:///c:/Users/admin/Projetos/alphabuild/data/analysis/stage3_simple_metrics_history.json)
 
 ---
 
-## 1. Resumo Executivo
+## 1. Resumo Executivo (`ep2` → `ep30` vs `SIMP`)
 
-1. **Conectividade robusta na Fase 1 (`6/6 = 100%`):** usando o loop canônico (`AlphaBuilderMCTS` com `160` simulações, `select_pv_branches` profundidade até 4, PBRS na Fase 1 e FEniCSx real na Fase 2), a rede de apenas **2 épocas** conectou apoio (`x = 0`) à região de carga em **todos os 6 cenários** (`18` a `60` passos), terminando com **`1` ilha principal e `0` voxels soltos** em 100% dos casos e reduzindo a compliance em **`9,7%` a `34,8%`** durante os 30 passos de Fase 2.
-2. **Padrão geométrico atual — viga compacta e baixa utilização de altura ($I_z$):** ao contrário do FEniTop SIMP, que empurra banzos para as bordas superior/inferior (`inertia_y_norm = 0,341–0,518`) e escava diagonais vazadas (`hollow_ratio_xy = 0,40–0,63`), a política atual com 2 épocas converge para uma **barra sólida quase maciça** perto da linha neutra (`inertia_y_norm = 0,012–0,052`, **10× a 42× menor** que o SIMP; `hollow_ratio_xy = 0,00–0,16`) e exibe **alargamento invertido na ponta** (`y_span_tip > y_span_root`) e **overshoot em X** (`12,3%–16,4%`) quando a carga não está no extremo `x = 63`.
-3. **Por que a Fase 2 apenas engrossa a barra (`99,93% ADD`) em vez de esculpir treliça:** em `1.440` ações executadas na Fase 2 (`6 × 240`), houve **`1.439` adições (`ADD`)** e apenas **`1` remoção (`REMOVE`)**. A causa medida está na **calibração otimista da Value Head** de 2 épocas: ela prevê `+0,38` a `+0,61` enquanto o `fem_reward` real FEniCSx é negativo/baixo (`MAE = 0,42–0,70`, viés médio de **`+0,595`**), levando o MCTS a evitar remoções.
-4. **Blueprint Head vs Trajetória MCTS:** no passo 0 (domínio vazio), a Blueprint Head já prevê envoltória significativamente mais alta (`inertia_y_norm = 0,057–0,110`) do que a estrutura realmente construída pelo MCTS (`0,012–0,052`), demonstrando que a cabeça auxiliar já capta parte da altura estrutural antes mesmo de a política explorá-la.
-5. **Arquitetura completa (`Swin-UNETR`, 6,83M parâmetros):** medimos no hardware local que ela é **`3,66×` mais lenta no passo de treino (`BS=8`)** que o `SimpleBackbone` (e **`~6,4×`** considerando `BS=16`). Um pré-treino completo de 30 épocas no `warmup_v3_3_kaggle.db` requer **`~96–136 GPU-horas` de Tesla T4** (~`48–68h` em `2 × T4`, inviável num único commit de 12h no Kaggle sem fatiamento em múltiplos resumes). Na `Intel(R) Graphics [0x7dd1]` local, ela é **viável para Raio-X Neural** (`169 ms`), mas **pesada para MCTS ao vivo de 160 sims** (`~17–20 s/passo`, exigindo reduzir para `40–64` sims ou otimizar via OpenVINO).
+1. **Salto massivo de rigidez estrutural e `Score v3.3` (`ep2 → ep30`):** com o treino completo de 30 épocas no Kaggle (`~10,52 h` wall-clock em `2 × Tesla T4`), a compliance final média nos 6 cenários caiu de **`50.480` (`ep2`) → `15.179` (`ep30`)** (**`-69,9%`**, ou **`3,33×` mais rígido** na média). Em **`5/6` cenários (`S1, S3, S4, S5, S6`)**, o ganho de rigidez foi de **`2,67×` a `6,28×`** (`-62,5%` a `-84,1%` de compliance), elevando o **`Score v3.3` médio de `-0,092` → `+0,057`** (`4/6` cenários positivos no `ep30` contra `1/6` no `ep2`) e a convergência natural na Fase 2 (`CONVERGENCE`) de **`1/6` → `4/6` cenários**.
+2. **Marco em `S6` e comparação com FEniTop `SIMP` (`60 iter`, `beta = 4,0`):** em `S6_short_deep_clamp` (único cenário onde o SIMP curto já fecha conexão binarizada em `rho > 0,5`), o `ep30` atingiu **`C_final = 5.732,3`** e **`Score = +0,253`** com **`7,28%` de volume** — superando inclusive o SIMP binarizado (`C_bin = 6.800,8`, `Score_bin = +0,048`, `V = 14,41%`) em **rigidez (`-15,7%`) usando metade da massa** (no campo contínuo `beta = 4,0`, o SIMP ainda é `56,2×` mais rígido em `C_cont = 102,0`). Nos demais cenários conectados (`S1, S3, S4, S5`), o `ep30` ficou em `0,062×–0,414×` de `C_bin` em `S3–S5` e `1,107×` em `S1`, mas ainda `20×–42×` atrás do `C_cont` contínuo do SIMP por baixa utilização da altura total ($I_y$).
+3. **Avanços geométricos reais e problema isolado em `S2`:** o `ep30` corrigiu o alargamento invertido na ponta (`y_span_root >= y_span_tip` agora ocorre em **`6/6` cenários** vs `1/6` no `ep2`) e cortou o *overshoot* pós-carga em `X` em `40%–68%` nos cenários internos (`6,8%–16,4%` → `5,2%–8,6%`). Em contrapartida, no `S2` (`y = 6`), a rede nucleou um banzo inferior desconectado junto ao ramo principal (`n_islands = 2`, **`374` voxels soltos** = `20,7%` da massa), penalizando o `Score` (`-0,087` vs `fem_reward = -0,046`) e piorando a compliance frente ao `ep2` (`22.039` vs `17.347`).
+4. **Por que a Fase 2 ainda não esculpe treliças vazadas (`99,93% ADD`):** apesar de a `Value MAE` na validação supervisionada ter caído para **`0,0134`**, nos rollouts reais de Fase 2 persiste um **deslocamento de distribuição (*covariate shift*)**: o viés `V_net - R_FEM` caiu `32,6%` (`+0,595 → +0,401`) e a correlação intra-episódio ficou fortemente positiva em `S1 (+0,610)`, `S4 (+0,838)` e `S6 (+0,884)`, porém a Value Head ainda avalia estados esparsos fora-da-distribuição do warmup de forma otimista demais (`+0,32` a `+0,45`). Como consequência, em `1.336` ações de Fase 2 houve **`1.335` adições (`ADD`) e apenas `1` remoção (`REMOVE`)**, mantendo `hollow_ratio_xy ≈ 0,00–0,13` na ilha conectada. Isso confirma empiricamente que a escavação ativa (`REMOVE`) depende da **Etapa 6 (Self-Play MCTS com recompensas FEM reais)**.
+5. **Custo & viabilidade da arquitetura completa (`Swin-UNETR`, `6,83M` parâmetros):** medida em `3,66×` mais lenta por batch (`BS = 8`) e `~6,4×` na comparação de preset sobre o `SimpleBackbone`, requerendo **`~96–136 GPU-h` de T4** (~`48–68h` em `2 × T4`, exigindo múltiplos *resumes* no Kaggle ou ~US\$5–8 na nuvem). Localmente na `Intel(R) Graphics [0x7dd1]`, é viável para Raio-X (`169 ms`), mas requer reduzir para `40–64` simulações no MCTS ao vivo (`~4,5–7,5 s/passo`, contra `~17–20 s` com `160` sims).
 
 ---
 
-## 2. Benchmark Quantitativo por Cenário (`ep2` MCTS vs `FEniTop SIMP`)
+## 2. Progressão do Treino Stage 3 (`SimpleBackbone`, 30 épocas no Kaggle `2 × Tesla T4`)
+
+Treino executado com [`alphabuilder-v3-3-stage3-simple`](file:///c:/Users/admin/Projetos/alphabuild/data/analysis/stage3_simple_metrics_history.json) em `429.345` amostras de treino e `47.705` de validação (`~339–343 samples/s`, soma dos `30` intervalos por época = **`37.877,8 s` / `10,52 h`** wall-clock, `~21,0 GPU-h`). Nenhuma regressão de validação ocorreu até o final: **`Epoch 30/30` foi o melhor checkpoint global (`best_model.pt`)**.
+
+| Época | `LR` | Tempo / Vazão | Train `Loss` (`Pol / Val / BP`) | Val `Loss` (`Pol / Val / BP`) | Val `Value MAE` | Val `Policy Top-1` | Val `Blueprint Dice` |
+|---|---|---|---|---|---|---|---|
+| **1** | `1,20e-4` | `1.260,3s` (`340,7 s/s`) | `1,4671` (`1,0159 / 0,1236 / 0,4081`) | `0,9302` (`0,7288 / 0,0233 / 0,3095`) | `0,0654` | `2,44%` | `71,34%` |
+| **2** | `2,10e-4` | `1.253,1s` (`342,6 s/s`) | `0,7636` (`0,5967 / 0,0292 / 0,2169`) | `0,6378` (`0,5447 / 0,0059 / 0,1626`) | `0,0315` | `7,00%` | `83,51%` |
+| **10** | `2,53e-4` | `1.264,0s` (`339,7 s/s`) | `0,3762` (`0,3167 / 0,0031 / 0,1068`) | `0,4334` (`0,3717 / 0,0032 / 0,1106`) | `0,0201` | `12,80%` | `88,87%` |
+| **20** | `9,27e-5` | `1.265,2s` (`339,3 s/s`) | `0,3038` (`0,2532 / 0,0016 / 0,0948`) | `0,3671` (`0,3134 / 0,0013 / 0,1024`) | `0,0149` | **`16,65%`** *(pico)* | `89,74%` |
+| **30** *(Best)* | `3,00e-6` | `1.259,3s` (`340,9 s/s`) | **`0,2732`** (`0,2252 / 0,0012 / 0,0912`) | **`0,3415`** (`0,2895 / 0,0011 / 0,0997`) | **`0,0134`** *(mín Ep 28/30)* | `15,16%` | **`90,05%`** *(pico 90,06% Ep 29)* |
+
+---
+
+## 3. Benchmark Quantitativo por Cenário (`ep2` × `ep30` × `FEniTop SIMP`)
 
 Parâmetros idênticos em todos os cenários: malha `64 × 32 × 8` (`16.384` voxels), `E = 100,0`, `nu = 0,25`, `P1 = 160 sims / action_batch = 32`, `P2 = 160 sims / action_batch = 8`, teto de `60` passos Fase 1 e `30` passos Fase 2; SIMP executado com `vol_frac = 0,15`, `max_iter = 60`, `r_min = 1,5`, `FULL_DOMAIN`.
 
-### 2.1 Comparação de Performance Física (`Compliance`, `Volume` e `Reward v3.3`)
+### 3.1 Comparação de Performance Física (`Compliance`, `Volume` e `Score v3.3`)
 
-| Cenário (`BC`, carga) | EP2 Passos (`P1+P2`) | EP2 Motivo Fim | EP2 `Vol` | EP2 `C_P2_ini → C_final` (Δ%) | EP2 `Score v3.3` | SIMP Contínuo `C_cont` (`V`, `Reward`) | SIMP Binarizado `rho>0,5` `C_bin` (`conn?`) |
-|---|---|---|---|---|---|---|---|
-| **S1** (`FULL_CLAMP`, `x=63, y=16`) | `41 + 30` | `CONVERGENCE` | `9,46%` | `75.281 → 62.228` (**-17,3%**) | `-0,164` | `596,4` (`12,83%`, `+0,458`) | `21.083` (`False`) |
-| **S2** (`FULL_CLAMP`, `x=63, y=6`) | `60 + 30` | `MAX_PHASE2_STEPS` | `13,18%` | `26.606 → 17.347` (**-34,8%**) | `-0,063` | `600,4` (`13,04%`, `+0,452`) | `48.847` (`False`) |
-| **S3** (`FULL_CLAMP`, `x=44, y=24`) | `30 + 30` | `MAX_PHASE2_STEPS` | `7,32%` | `61.312 → 55.015` (**-10,3%**) | `-0,092` | `249,6` (`13,84%`, `+0,565`) | `25.127` (`False`) |
-| **S4** (`RAIL_XY`, `x=58, y=16`) | `34 + 30` | `MAX_PHASE2_STEPS` | `8,11%` | `95.658 → 85.583` (**-10,5%**) | `-0,179` | `789,1` (`13,14%`, `+0,408`) | `254.506` (`False`) |
-| **S5** (`RAIL_XY`, `x=52, y=11, z=[1,3]`) | `33 + 30` | `MAX_PHASE2_STEPS` | `7,91%` | `51.728 → 46.687` (**-9,7%**) | `-0,082` | `420,5` (`13,70%`, `+0,489`) | `70.139` (`False`) |
-| **S6** (`FULL_CLAMP`, `x=36, y=16`) | `18 + 30` | `MAX_PHASE2_STEPS` | `4,98%` | `42.207 → 36.020` (**-14,7%**) | **`+0,031`** | `102,0` (`14,52%`, `+0,684`) | **`6.801` (`True`)** |
+| Cenário (`BC`, carga) | Modelo (`ep2` vs `ep30`) | Passos (`P1+P2`) | Motivo Fim | `Vol` Final | `C_P2_ini → C_final` (Δ% vs `ep2`) | `Score v3.3` | SIMP Contínuo `C_cont` (`V`, `Reward`) | SIMP Binarizado `rho>0,5` `C_bin` (`conn?`) |
+|---|---|---|---|---|---|---|---|---|
+| **S1** (`FULL_CLAMP`, `x=63, y=16`) | `ep2` | `41 + 30` | `CONVERGENCE` | `9,46%` | `75.281 → 62.228` | `-0,164` | `596,4` (`12,83%`, `+0,458`) | `21.083` (`False`) |
+| | **`ep30`** | `48 + 27` | `CONVERGENCE` | `10,69%` | `25.228 →` **`23.348`** (**`-62,5%` / `2,67×`**) | **`-0,046`** | | *(ratio vs `C_bin` = `1,107×`)* |
+| **S2** (`FULL_CLAMP`, `x=63, y=6`) | `ep2` | `60 + 30` | `MAX_PHASE2` | `13,18%` | `26.606 →` **`17.347`** | **`-0,063`** | `600,4` (`13,04%`, `+0,452`) | `48.847` (`False`) |
+| | **`ep30`** | `49 + 30` | `MAX_PHASE2` | `11,04%` | `27.811 → 22.039` (`+27,0%` / `0,79×`)* | `-0,087` *(fem `-0,046`)* | | *(ratio vs `C_bin` = `0,451×`)* |
+| **S3** (`FULL_CLAMP`, `x=44, y=24`) | `ep2` | `30 + 30` | `MAX_PHASE2` | `7,32%` | `61.312 → 55.015` | `-0,092` | `249,6` (`13,84%`, `+0,565`) | `25.127` (`False`) |
+| | **`ep30`** | `34 + 27` | `CONVERGENCE` | `7,96%` | `11.150 →` **`10.402`** (**`-81,1%` / `5,29×`**) | **`+0,145`** | | *(ratio vs `C_bin` = `0,414×`)* |
+| **S4** (`RAIL_XY`, `x=58, y=16`) | `ep2` | `34 + 30` | `MAX_PHASE2` | `8,11%` | `95.658 → 85.583` | `-0,179` | `789,1` (`13,14%`, `+0,408`) | `254.506` (`False`) |
+| | **`ep30`** | `48 + 28` | `CONVERGENCE` | `10,73%` | `18.293 →` **`15.806`** (**`-81,5%` / `5,41×`**) | **`+0,012`** | | *(ratio vs `C_bin` = `0,062×`)* |
+| **S5** (`RAIL_XY`, `x=52, y=11, z=[1,3]`) | `ep2` | `33 + 30` | `MAX_PHASE2` | `7,91%` | `51.728 → 46.687` | `-0,082` | `420,5` (`13,70%`, `+0,489`) | `70.139` (`False`) |
+| | **`ep30`** | `41 + 30` | `MAX_PHASE2` | `9,47%` | `16.008 →` **`13.747`** (**`-70,6%` / `3,40×`**) | **`+0,065`** | | *(ratio vs `C_bin` = `0,196×`)* |
+| **S6** (`FULL_CLAMP`, `x=36, y=16`) | `ep2` | `18 + 30` | `MAX_PHASE2` | `4,98%` | `42.207 → 36.020` | `+0,031` | `102,0` (`14,52%`, `+0,684`) | **`6.801` (`True`)** |
+| | **`ep30`** | `31 + 25` | `CONVERGENCE` | `7,28%` | `6.263 →` **`5.732`** (**`-84,1%` / `6,28×`**) | **`+0,253`** | | *(`0,843×` vs `C_bin` — supera SIMP!)* |
+| **Média dos 6 Cenários** | **`ep2 → ep30`** | `36+30 → 41,8+27,8` | `1/6 → 4/6 CONV.` | `8,49% → 9,53%` | `C_fin: 50.480 →` **`15.179`** (**`-69,9%`**) | **`-0,092 → +0,057`** | `C_cont` méd.: `459,7` | `C_bin` méd.: `71.084` |
+
+*\*Em `ep30__S2`, `n_islands = 2` (`374` voxels soltos num banzo paralelo não conectado ao carregamento); veja decomposição na Seção 4.1.*
 
 > [!IMPORTANT]
-> **Observação metodológica sobre o SIMP binarizado em `max_iter = 60`:** o `optimization.py` utiliza `beta_interval = 30`. Com 60 iterações, o fator de projeção Heaviside termina em **`beta = 4,0`** (quantil `p85 ≈ 0,35–0,47`), com barras inclinadas finas ainda em densidade cinzenta intermediária. Por isso, ao binarizar ingenuamente com `rho > 0,5`, o SIMP perde parte da ilha na patch de carga em S1–S5 (`C_bin = 21k–254k`, perdendo para `ep2` em S2, S4 e S5), enquanto no campo contínuo (`beta = 4,0`, usado no harvest longo até `beta = 128`) o SIMP é **`28,9×` (S2) a `353,0×` (S6) mais rígido** que o `ep2`. No cenário S6 (vão curto `x=36`), o SIMP já fecha conexão binarizada completa e supera o `ep2` em `5,30×` até nos voxels discretos.
+> **Observação metodológica sobre o SIMP em `max_iter = 60` (`beta = 4,0`):** como `optimization.py` usa `beta_interval = 30`, em 60 iterações as diagonais finas do SIMP ainda contêm densidades cinzentas intermediárias, fazendo com que a binarização ingênua em `rho > 0,5` perca conexão em `S1–S5` (`C_bin = 21k–254k`). No entanto, em **`S6`** (vão curto `x = 36`), onde o SIMP já está **100% conectado em voxels discretos (`V = 14,41%`, `C_bin = 6.800,8`, `Score_bin = +0,048`)**, o **`ep30` superou o SIMP binarizado em `15,7%` de compliance (`5.732,3`) e em `+0,205` de `Score v3.3` (`+0,253`) usando metade do volume (`7,28%`)**. Contra o campo contínuo (`beta = 4,0`) do SIMP, o `ep30` ainda está `20,0×` (`S4`) a `56,2×` (`S6`) acima em compliance.
 
-### 2.2 Métricas Geométricas (`Forma Aprendida` vs `SIMP`)
+### 3.2 Métricas Geométricas (`ep2` vs `ep30` vs `SIMP`)
 
-| Cenário | `y_span` (`raiz / meio / ponta`) EP2 vs SIMP | `inertia_y_norm` EP2 vs SIMP | `hollow_ratio_xy` EP2 vs SIMP | `overshoot_frac` (`x > lx+2`) EP2 vs SIMP | `z_centroid` EP2 vs SIMP |
+| Cenário | `y_span` (`raiz / meio / ponta`) `ep2 → ep30` vs `SIMP` | `inertia_y_norm` `ep2 → ep30` vs `SIMP` | `hollow_ratio_xy` `ep2 → ep30` vs `SIMP` | `overshoot_frac` (`x > lx+2`) `ep2 → ep30` vs `SIMP` | `z_centroid` `ep2 → ep30` vs `SIMP` |
 |---|---|---|---|---|---|
-| **S1** (`x=63, y=16, z=[3,5]`) | `6 / 8 / 12` vs `32 / 32 / 28` | `0,025` vs `0,508` (**-20×**) | `0,00` vs `0,63` | `0,0%` vs `0,0%` | `3,41` vs `5,79` |
-| **S2** (`x=63, y=6, z=[3,5]`) | `8 / 7 / 17` vs `32 / 32 / 26` | `0,052` vs `0,518` (**-10×**) | `0,09` vs `0,58` | `0,0%` vs `0,0%` | `2,97` vs `5,79` |
-| **S3** (`x=44, y=24, z=[3,5]`) | `5 / 6 / 11` vs `32 / 28 / 19` | `0,044` vs `0,380` (**-8,6×**) | `0,07` vs `0,41` | **`12,4%`** vs `0,0%` | `2,84` vs `5,26` |
-| **S4** (`x=58, y=16, z=[3,5]`) | `7 / 7 / 7` vs `32 / 32 / 24` | `0,012` vs `0,494` (**-42×**) | `0,01` vs `0,57` | **`6,8%`** vs `0,0%` | `3,46` vs `5,71` |
-| **S5** (`x=52, y=11, z=[1,3]`) | `7 / 6 / 11` vs `32 / 32 / 24` | `0,042` vs `0,431` (**-10×**) | `0,16` vs `0,40` | **`12,3%`** vs `0,0%` | `3,05` vs **`0,99`** |
-| **S6** (`x=36, y=16, z=[3,5]`) | `5 / 5 / 7` vs `32 / 26 / 16` | `0,016` vs `0,341` (**-21×**) | `0,00` vs `0,42` | **`16,4%`** vs `0,0%` | `2,90` vs `4,25` |
+| **S1** (`x=63, y=16, z=[3,5]`) | `6/8/12` → **`16/11/9`** vs `32/32/28` | `0,025 → 0,035` vs `0,508` | `0,00 → 0,13` vs `0,63` | `0,0% → 0,0%` vs `0,0%` | `3,41 → 4,43` vs `5,79` |
+| **S2** (`x=63, y=6, z=[3,5]`) | `8/7/17` → `20/16/12` *(ilha pr.: `9/10/9`)* vs `32/32/26` | `0,052 → 0,112` *(ilha pr.: `0,058`)* vs `0,518` | `0,09 → 0,43` *(ilha pr.: `0,00`)* vs `0,58` | `0,0% → 0,0%` vs `0,0%` | `2,97 → 4,04` *(4,40)* vs `5,79` |
+| **S3** (`x=44, y=24, z=[3,5]`) | `5/6/11` → **`10/8/9`** vs `32/28/19` | `0,044 → 0,055` vs `0,380` | `0,07 → 0,00` vs `0,41` | `12,4% →` **`8,6%`** vs `0,0%` | `2,84 → 3,09` vs `5,26` |
+| **S4** (`x=58, y=16, z=[3,5]`) | `7/7/7` → **`9/8/8`** vs `32/32/24` | `0,012 → 0,015` vs `0,494` | `0,01 → 0,00` vs `0,57` | `6,8% →` **`5,3%`** vs `0,0%` | `3,46 → 4,28` vs `5,71` |
+| **S5** (`x=52, y=11, z=[1,3]`) | `7/6/11` → **`9/9/7`** vs `32/32/24` | `0,042 → 0,026` vs `0,431` | `0,16 → 0,00` vs `0,40` | `12,3% →` **`7,5%`** vs `0,0%` | `3,05 → 2,99` vs **`0,99`** |
+| **S6** (`x=36, y=16, z=[3,5]`) | `5/5/7` → **`11/7/9`** vs `32/26/16` | `0,016 → 0,031` vs `0,341` | `0,00 → 0,01` vs `0,42` | `16,4% →` **`5,2%`** vs `0,0%` | `2,90 → 4,27` vs `4,25` |
 
 ---
 
-## 3. Análise Aprofundada dos Padrões Aprendidos + Algoritmo de Jogo
+## 4. Análise Aprofundada dos Padrões Aprendidos + Algoritmo de Jogo (`ep2 → ep30`)
 
-### 3.1 Dinâmica de Crescimento (Fase 1) e Disciplina Espacial
-- **Capacidade de ponte 3D em todos os regimes:** a rede não colapsou nem estagnou em ilhas soltas em nenhum cenário. Em S1, S3, S4, S5 e S6, o crescimento partiu de `x = 0` alinhado à altura/profundidade da carga e fechou o caminho em **`18` a `41` passos**. No caso mais assimétrico e distante (`S2`, `x=63, y=6`), precisou de exatos `60` passos (`V = 11,7%` na conexão) para espalhar até a borda inferior.
-- **Vazamento pós-carga (*overshoot* em X):** nos cenários em que `lx < 63` (`S3 x=44`, `S5 x=52`, `S6 x=36`), a estrutura MCTS chegou até **`x_max = 63`** (`overshoot_frac` entre `12,3%` e `16,4%`), adicionando voxels em zona de tensão nula à direita da carga. Isso revela que, com 2 épocas, o MCTS durante a Fase 2 ainda escolhe adições na ponta livre onde a rede neural atribui logit residual razoável, porque a Value Head não penaliza adequadamente o desperdício de massa inútil na extremidade livre.
-- **Insensibilidade parcial à condição 3D `RAIL_XY` em `Z` (`S5`):** no cenário `S5` (`RAIL_XY`, carga excêntrica em `z = [1, 3]`), o SIMP concentra o material do lado carregado (`z_centroid = 0,99`, ocupando apenas `z = 0..4`), pois o suporte `RAIL_XY` permite deslizamento livre em `Z` e qualquer massa simétrica em `Z` distante gera torção/flexão lateral desnecessária. Já o `ep2` distribuiu material quase simetricamente no eixo `Z` (`z_centroid = 3,05`, `z = 0..7`), mostrando que em 2 épocas o backbone ainda trata a dimensão `Z` de forma quase homogênea.
+### 4.1 Dinâmica de Crescimento (Fase 1), Geometria Raiz→Ponta e Nuance da Ilha em `S2`
 
-### 3.2 Geometria Estrutural na Fase 2: Viga Compacta vs Treliça Otimizada
-A inspeção combinada de `inertia_y_norm`, `y_span` e `hollow_ratio_xy` explica mecanicamente o gap de rigidez:
-1. **Déficit de momento de inércia ($I_z \propto \sum y_i^2$):** a rigidez à flexão de um engaste cresce quadraticamente com a distância ao eixo neutro. O SIMP explora 100% da altura disponível (`y = 0` e `y = 31`, `inertia_y_norm ≈ 0,34–0,52`). O `ep2` mantém os voxels concentrados dentro de uma faixa de ~5–12 voxels ao redor do eixo (`inertia_y_norm ≈ 0,012–0,052`), custando um fator de **10× a 40×** em rigidez antes mesmo de contar vazios internos.
-2. **Alargamento invertido (`y_span_tip > y_span_root`):** mecanicamente, o momento fletor máximo $M(x) = F \cdot (L - x)$ ocorre no engaste (`x = 0`), exigindo seção alta na raiz (`y_span_root = 32`) e estreita na ponta (`y_span_tip = 16–28`), exatamente como o SIMP faz. No `ep2`, ocorreu o oposto em S1, S2, S3, S5 e S6 (`y_span_root = 5–8` < `y_span_tip = 7–17`): ao conectar na ponta perto da carga na Fase 1/início da Fase 2, o MCTS empilhou material junto à carga (`x ≈ lx`) enquanto deixou o engaste fino.
-3. **Ausência de escavação (`hollow_ratio_xy` próximo de 0):** o `hollow_ratio_xy` (fração de vazios internos dentro da envoltória lateral X-Y) foi `0,00` em S1 e S6, `0,01` em S4 e no máximo `0,16` em S5 (contra `0,40–0,63` no SIMP). Isso bate diretamente com a distribuição de ações na Fase 2:
+- **Ponte estrutural muito mais rígida já ao fim da Fase 1 (`C_P2_ini`):** antes mesmo de qualquer avaliação FEM na Fase 2, o `ep30` fechou conectividade com geometrias **`3,0×` (`S1`: `75.281 → 25.228`), `5,5×` (`S3`: `61.312 → 11.150`), `5,2×` (`S4`: `95.658 → 18.293`), `3,2×` (`S5`: `51.728 → 16.008`) e `6,7×` (`S6`: `42.207 → 6.263`) mais rígidas** que o `ep2`. O aumento discreto de passos de Fase 1 em `S1, S3, S4, S5, S6` (`30–41` vs `18–34`) refletiu alargamento do engaste durante o crescimento, e não falha de conexão.
+- **Correção da inversão raiz → ponta (`6/6` cenários):** no `ep2`, `5/6` cenários empilharam mais largura na ponta carregada do que no engaste (`y_span_root < y_span_tip`, ex. `6/8/12` em `S1`). No **`ep30`, todos os `6` cenários apresentam `y_span_root >= y_span_tip`** (`16/11/9` em `S1`, `20/16/12` em `S2`, `10/8/9` em `S3`, `9/8/8` em `S4`, `9/9/7` em `S5`, `11/7/9` em `S6`), alinhando a distribuição de altura com o gradiente do momento fletor $M(x) = F\,(L-x)$. Em `S1`, a largura do engaste quase triplicou (`6 → 16` voxels).
+- **Queda consistente de *overshoot* pós-carga em `X`:** nos cenários com carga interna (`lx < 63`), a fração de massa desperdiçada além da carga (`x > lx + 2`) caiu de `12,4% → 8,6%` (`S3`), `6,8% → 5,3%` (`S4`), `12,3% → 7,5%` (`S5`) e `16,4% → 5,2%` (`S6`), mostrando maior respeito do MCTS+Policy ao limite mecânico de tensão nula além de `lx`.
+- **Decomposição da anomalia em `ep30__S2` (`n_islands = 2`, `374` voxels soltos):** na inspeção direta do volume final (`step 79`) e da transição (`step 49`) via conectividade 6-vizinhos:
+  1. Ao conectar na Fase 1 (`step 49`), a rede havia crescido **dois ramos distintos** a partir de `x = 0`: um banzo inferior em `y = 0..3` e uma viga principal inclinada em `y = 3..19`. Como o ramo principal alcançou a carga em `x = 63` antes de uma diagonal unir os dois ramos (`317` voxels desconectados no passo `49`), a Fase 1 encerrou com `n_islands = 2`.
+  2. Na Fase 2 (`step 49 → 79`), a massa conectada ficou com **`1.434` voxels (`V = 8,75%`, `x = 0..63`, `y = 3..19`, `y_span = 9/10/9`, `I_y = 0,058`, `hollow_ratio_xy = 0,00`, `z = 4,40`)**, enquanto o ramo secundário em `x = 0..51, y = 0..3, z = 0..5` cresceu para **`374` voxels soltos (`20,7%`)**. Isso explica simultaneamente por que `S2` exibiu `hollow_ratio_xy = 0,43` e `I_y = 0,112` brutos (artefato do vão entre as duas ilhas separadas) e por que sofreu penalidade severa de ilha (`final_score = -0,087` apesar de `fem_reward = -0,046`).
+- **Assimetria em `Z` no `RAIL_XY` excêntrico (`S5`):** o MCTS do `ep30` ainda manteve `z_centroid = 2,99` (`ep2 = 3,05`), contra `0,99` do SIMP — confirmando que o rollout ainda não especializa o deslocamento excêntrico em `Z` sob condições de contorno `RAIL_XY`.
 
-| Cenário | Refutação P1 | Refutação P2 | Top-8 Conc. P1 / P2 | Prof. Média Árvore | Fase 2 `ADD` / `REMOVE` | Value Head `MAE` (P2) | Viés `V_net - R_FEM` | Correlação `r(V_net, R_FEM)` |
-|---|---|---|---|---|---|---|---|---|
-| **S1** | `73,2%` | `100,0%` | `60,6%` / `66,5%` | `18,5` | `239` / `1` | `0,632` | `+0,632` | `+0,478` |
-| **S2** | `83,3%` | `100,0%` | `67,4%` / `73,5%` | `17,1` | `240` / `0` | `0,422` | `+0,422` | `+0,360` |
-| **S3** | `83,3%` | `96,7%` | `54,3%` / `67,3%` | `19,2` | `240` / `0` | `0,685` | `+0,685` | `+0,759` |
-| **S4** | `91,2%` | `96,7%` | `61,1%` / `67,5%` | `17,6` | `240` / `0` | `0,703` | `+0,703` | **`-0,786`** |
-| **S5** | `93,9%` | `100,0%` | `59,5%` / `65,7%` | `18,8` | `240` / `0` | `0,597` | `+0,597` | `+0,621` |
-| **S6** | `94,4%` | `90,0%` | `53,9%` / `61,2%` | `19,5` | `240` / `0` | `0,535` | `+0,531` | `-0,101` |
+### 4.2 Diagnóstico do Algoritmo (`MCTS` + *Shift* Covariável da `Value Head`)
 
-### 3.3 Diagnóstico do Algoritmo (`MCTS` + `Value Head` + `Blueprint Head`)
-- **MCTS está atuando forte (`refutation = 73%–100%`):** em quase 100% dos passos, o MCTS (`160 sims`, profundidade ~18, concentração Top-8 entre `54%` e `73%`) corrige o `argmax` bruto da Policy Head graças ao PBRS na Fase 1 e à penalidade de desconexão/ilhas na Fase 2.
-- **Gargalo central na Fase 2 — viés positivo da Value Head (`+0,42` a `+0,70`):** no passo 0 (domínio vazio) a rede já prevê `V_net = +0,28` a `+0,45`; durante a Fase 2, para barras com `fem_reward = -0,18..-0,06` (`C ≈ 46k–86k`), a rede continua prevendo `+0,38` a `+0,61`. Sem penalização realista da compliance dentro das folhas da árvore, o MCTS nunca prefere `REMOVE` (`1` ação em `1.440`), pois `REMOVE` arrisca cortar caminho ou reduzir o `V_net` otimista das vizinhanças sólidas.
-  - *Nota encorajadora:* os logs do treino Stage 3 (30 épocas) já mostraram queda da loss da Value Head de `0,0041` (época 2 val) para `0,0006` (época 24 train), o que deve reduzir drasticamente esse viés no teste `ep30`. Ainda assim, a remoção ativa de material interno em estados fora-da-distribuição do warmup será consolidada principalmente na **Etapa 6 (Self-Play MCTS com recompensa FEM real)**.
-- **Blueprint Head já vê mais altura que a Policy (`step 0`):** na inspeção do tensor `blueprint` no passo 0 (antes de qualquer voxel sólido):
-
-| Cenário | `bp_mean` / `bp_max` | Voxels `bp>0,5` | `bp_y_std` vs `EP2_y_std` | `bp_inertia_y` vs `EP2_inertia_y` | `BP_Dice(t=0,5)` | `BP_Dice(t=0,2)` | `MCTS_final_Dice` |
+| Cenário | Refutação P1 / P2 (`ep30`) | Top-8 Conc. P1 / P2 (`ep30`) | Prof. Média (`ep2 → ep30`) | Fase 2 `ADD/REM` (`ep2 → ep30`) | `Value MAE` P2 (`ep2 → ep30`) | Viés `V_net - R_FEM` (`ep2 → ep30`) | Correlação `r(V_net, R_FEM)` (`ep2 → ep30`) |
 |---|---|---|---|---|---|---|---|
-| **S1** | `0,267` / `0,977` | `3.500` | `4,32` vs `2,53` | `0,073` vs `0,025` (**2,9×**) | `0,110` | `0,110` | `0,065` |
-| **S2** | `0,266` / `0,985` | `3.339` | `4,87` vs `3,66` | `0,093` vs `0,052` (**1,8×**) | `0,059` | `0,117` | `0,061` |
-| **S3** | `0,218` / `0,993` | `2.780` | `5,31` vs `3,36` | `0,110` vs `0,044` (**2,5×**) | `0,143` | `0,266` | `0,077` |
-| **S4** | `0,246` / `0,974` | `3.127` | `4,27` vs `1,73` | `0,071` vs `0,012` (**5,9×**) | `0,064` | `0,140` | `0,049` |
-| **S5** | `0,217` / `0,991` | `2.488` | `3,81` vs `3,27` | `0,057` vs `0,042` (**1,4×**) | `0,096` | `0,150` | `0,083` |
-| **S6** | `0,183` / `0,993` | `2.145` | `4,69` vs `2,05` | `0,086` vs `0,016` (**5,4×**) | `0,170` | `0,278` | `0,096` |
+| **S1** | `81,2%` / `88,9%` | `68,1%` / `83,9%` | `18,5 → 13,5` | `239/1 → 216/0` | `0,632 → 0,420` | `+0,632 → +0,420` | `+0,478 →` **`+0,610`** |
+| **S2** | `71,4%` / `100,0%` | `69,0%` / `75,5%` | `17,1 → 15,2` | `240/0 → 240/0` | `0,422 → 0,436` | `+0,422 → +0,436` | `+0,360 → +0,109` |
+| **S3** | `61,8%` / `88,9%` | `62,1%` / `76,0%` | `19,2 → 17,5` | `240/0 → 216/0` | `0,685 → 0,453` | `+0,685 → +0,453` | `+0,759 → -0,871` |
+| **S4** | `83,3%` / `82,1%` | `69,2%` / `81,3%` | `17,6 → 11,7` | `240/0 → 223/1` | `0,703 →` **`0,321`** | `+0,703 → +0,321` | `-0,786 →` **`+0,838`** |
+| **S5** | `73,2%` / `96,7%` | `70,6%` / `81,1%` | `18,8 → 13,6` | `240/0 → 240/0` | `0,597 →` **`0,333`** | `+0,597 → +0,333` | `+0,621 → -0,280` |
+| **S6** | `83,9%` / `80,0%` | `57,7%` / `68,5%` | `19,5 → 18,8` | `240/0 → 200/0` | `0,535 → 0,441` | `+0,531 → +0,441` | `-0,101 →` **`+0,884`** |
+| **Total / Méd.** | — | — | `18,5 → 15,1` | **`1439/1 → 1335/1`** | `0,596 →` **`0,401`** | `+0,595 →` **`+0,401`** | — |
 
-Embora no domínio completamente vazio (`step = 0`) o `Blueprint Dice` contra o SIMP de 60 iterações fique em `0,06–0,17` (`0,11–0,28` em `t = 0,2`) — contrastando com `0,8479` na validação agregada de treino onde o estado já contém grande parte da trajetória construída — a Blueprint Head já codifica uma envoltória **1,4× a 5,9× mais alta em momento de inércia** do que a viga estreita produzida pelo rollout guloso/MCTS da época 2.
+O contraste entre **`Val MAE = 0,0134`** no dataset supervisionado e **`MAE = 0,401`** nos episódios reais revela o mecanismo exato que limita a Fase 2 após 30 épocas supervisionadas:
+
+1. **Política muito mais nítida e árvore mais seletiva:** na comparação `ep2 → ep30`, a concentração dos Top-8 logits visitados pelo MCTS subiu de `54–74%` para **`68–84%` na Fase 2** (`S1, S3, S4, S5`), a profundidade média caiu (`18,5 → 15,1`) por priors mais confiáveis, e a taxa de refutação P1 caiu em 5/6 cenários (ex.: `S3` de `83,3% → 61,8%`; `S5` de `93,9% → 73,2%`). Além disso, em `S1, S4, S6`, a `Value Head` passou a ordenar corretamente a melhoria relativa passo a passo (`r = +0,610`, `+0,838` e `+0,884`).
+2. **Por que `REMOVE = 1` em `1.336` ações persiste apesar do treino completo:** no warmup (`warmup_v3_3_kaggle.db`), a `Value Head` foi treinada sobre trajetórias geradas a partir de soluções já otimizadas do SIMP (onde quase toda estrutura de ~`10%` de volume possui alto `value_target` positivo, entre `+0,4` e `+0,7`). Quando o MCTS constrói sozinho uma **barra espessa de baixa inércia (`I_y ≈ 0,02–0,06`)**, ela cai **fora da distribuição de treino** — então a `Value Head` estima `V_net ≈ +0,32` a `+0,65` quando o `fem_reward` real FEniCSx é `-0,05` a `+0,25` (viés médio `+0,401`). Na busca em árvore (onde as folhas de Fase 2 usam apenas `V_net - island_penalty`, sem rodar FEniCSx dentro das simulações), `REMOVE` arrisca criar ilhas ou reduzir `V_net` otimista das áreas densas, enquanto `ADD` continua aumentando `V_net` até atingir o teto de convergência.
+3. **Implicação direta para o pipeline:** mais épocas supervisionadas em cima das trajetórias SIMP não eliminam esse *shift* covariável porque a rede nunca vê na base de warmup o valor real (`FEM`) das próprias vigas subótimas que ela gera no começo da vida. É exatamente esse papel que a **Etapa 6 (Self-Play MCTS com `value_target` recalculado via FEniCSx real)** resolve.
+
+### 4.3 Evolução da *Blueprint Head* no Passo 0 (`ep2` → `ep30`)
+
+Mesmo no domínio completamente vazio (`step = 0`), a `Blueprint Head` do `ep30` aumentou a confiança espacial (`bp_max > 0,999` em todos os cenários), manteve envoltória muito mais alta que a estrutura percorrida pelo MCTS e exibiu dois sinais qualitativos novos:
+
+| Cenário | `v0` (`ep2 → ep30`) | `bp_mean` (`ep2 → ep30`) | Voxels `bp>0,5` (`ep2 → ep30`) | `bp_y_std` (`ep2 → ep30`) | `bp_I_y` vs `MCTS_I_y` (`ep30`) | `BP_Dice(t=0,5)` (`ep2 → ep30`) | `BP_Dice(t=0,2)` (`ep2 → ep30`) | `z_cent(bp>0,5)` (`ep30`) |
+|---|---|---|---|---|---|---|---|---|
+| **S1** | `+0,279 → +0,260` | `0,267 → 0,268` | `3.500 → 4.061` | `4,32 → 4,72` | `0,087` vs `0,035` (**2,5×**) | `0,110 → 0,094` | `0,110 → 0,101` | `3,47` |
+| **S2** | `+0,278 → +0,272` | `0,266 → 0,260` | `3.339 → 3.844` | `4,87 →` **`5,81`** | **`0,132`** vs `0,112` *(0,058)* | `0,059 → 0,049` | `0,117 → 0,090` | `3,51` |
+| **S3** | `+0,348 → +0,350` | `0,218 → 0,203` | `2.780 → 3.143` | `5,31 → 5,14` | `0,103` vs `0,055` (**1,9×**) | `0,143 → 0,128` | `0,266 → 0,227` | `3,55` |
+| **S4** | `+0,276 → +0,248` | `0,246 → 0,250` | `3.127 → 3.722` | `4,27 → 4,35` | `0,074` vs `0,015` (**4,9×**) | `0,064 → 0,067` | `0,140 → 0,131` | `3,55` |
+| **S5** | `+0,312 → +0,289` | `0,217 → 0,232` | `2.488 → 3.472` | `3,81 → 4,91` | `0,094` vs `0,026` (**3,6×**) | `0,096 → 0,089` | `0,150 → 0,163` | **`3,29`** *(desloc. p/ `z=[1,3]`)* |
+| **S6** | `+0,451 → +0,426` | `0,183 → 0,163` | `2.145 → 2.420` | `4,69 → 4,22` | `0,069` vs `0,031` (**2,2×**) | `0,170 →` **`0,205`** | `0,278 →` **`0,328`** | `3,54` |
+
+- Em **`S2`**, `bp_I_y` saltou de `0,093` → **`0,132`** (`bp_y_std = 5,81`), demonstrando que o blueprint enxerga uma treliça larga cobrindo ambas as bordas que originou inclusive os dois ramos iniciais da Fase 1 (porém a política sequencial ainda não ligou os dois banzos antes do término da Fase 1).
+- Em **`S5`** (`z = [1, 3]`), enquanto o centroide Z do `Blueprint(t=0,5)` ficou entre `3,47` e `3,55` em todos os cenários simétricos em Z, em `S5` ele já deslocou para **`3,29`** — sinal incipiente de sensibilidade 3D na direção `Z`, embora ainda modesto frente ao `0,99` ótimo do SIMP.
+- Em **`S6`**, o acordo zero-shot entre `Blueprint(step=0)` e o SIMP atingiu `BP_Dice = 0,205` (`0,328` em `t = 0,2`), e **`MCTS_final_Dice` saltou de `0,096` (`ep2`) para `0,171` (`ep30`)**.
 
 ---
 
-## 4. Estimativa de Custo de Horas de GPU — Pré-Treino Completo (`Swin-UNETR`)
+## 5. Estimativa de Custo de Horas de GPU — Pré-Treino Completo (`Swin-UNETR`)
 
 Todos os cálculos abaixo combinam os **tempos reais observados** no Kaggle (`2 × Tesla T4` 16 GB, `429.345` amostras de treino + `47.705` de validação, preset `kaggle_t4_dual_simple` vs `kaggle_t4_dual_swin` em [`train_config.py`](file:///c:/Users/admin/Projetos/alphabuild/alphabuilder/src/neural/train_config.py#L102-L124)) e os **micro-benchmarks reais** medidos na GPU local (`Intel(R) Graphics [0x7dd1]`, PyTorch `2.5.1+xpu`, MONAI `1.5.1`):
 
-### 4.1 Razão Empírica Medida (`SimpleBackbone` vs `Swin-UNETR`)
+### 5.1 Razão Empírica Medida (`SimpleBackbone` vs `Swin-UNETR`)
 
 - **Parâmetros:** `4.433.132` (`SimpleBackbone`) vs `6.831.758` (`Swin-UNETR`, **`1,54×`**).
 - **Volume espacial após padding interno ([`model.py`](file:///c:/Users/admin/Projetos/alphabuild/alphabuilder/src/neural/model.py#L258)):**
@@ -109,15 +140,15 @@ Todos os cálculos abaixo combinam os **tempos reais observados** no Kaggle (`2 
   - `Swin-UNETR` `BS = 8` (preset máximo para caber em T4 16 GB): **`1.984,7 ms`** (`4,0 samples/s`) → **`3,66×` mais lento no mesmo `BS = 8`** e **`6,40×` mais lento comparado ao `SimpleBackbone` em `BS = 16`**!
 - **Passos DDP por época no Kaggle `2 × T4`:** `Simple` usa `BS = 64/GPU` (`128` global = `3.354 it/época`); `Swin` usa `BS = 8/GPU` (`16` global = **`26.834 it/época`**, `8×` mais sincronizações all-reduce/época).
 
-### 4.2 Tabela de Custo de Pré-Treino (`477.050` registros completos)
+### 5.2 Tabela de Custo de Pré-Treino (`477.050` registros completos)
 
-Base de referência observada no Kaggle `2 × Tesla T4` para o `SimpleBackbone` (`kaggle_t4_dual_simple`): **`21,0 min/época`** (`~340 samples/s`), totalizando **`~10,5h` wall-clock (`~21 GPU-h`) para 30 épocas** e **`~14,0h` wall-clock (`~28 GPU-h`) para 40 épocas**.
+Base de referência final medida no Kaggle `2 × Tesla T4` para o `SimpleBackbone` (`kaggle_t4_dual_simple`): **`21,04 min/época`** (`1.262,6 s/época` em média nas 30 épocas, `~340 samples/s`), totalizando **`10,52 h` wall-clock (`21,04 GPU-h`) para 30 épocas** e **`~14,0 h` wall-clock (`~28,0 GPU-h`) para 40 épocas**.
 
 Aplicando um fator conservador-realista de **`4,5×` a `6,5×`** por amostra (entre o fator iso-batch `3,66×` e o fator com saturação/all-reduce `~6,4×` observado no micro-benchmark):
 
 | Configuração / Hardware | Tempo por Época | 20 Épocas (Wall / GPU-h) | 30 Épocas (Wall / GPU-h) | 40 Épocas (Wall / GPU-h) | Observação Operacional |
 |---|---|---|---|---|---|
-| **`SimpleBackbone`** · Kaggle `2 × T4` (medido) | **`21,0 min`** | `7,0 h` / `14 GPU-h` | **`10,5 h` / `21 GPU-h`** | `14,0 h` / `28 GPU-h` | Cabe em 1 sessão Kaggle (30 épocas) |
+| **`SimpleBackbone`** · Kaggle `2 × T4` (**medido**) | **`21,0 min`** | `7,0 h` / `14,0 GPU-h` | **`10,52 h` / `21,04 GPU-h`** | `14,0 h` / `28,0 GPU-h` | Cabe em 1 sessão Kaggle (30 épocas) |
 | **`Swin-UNETR`** · Kaggle `2 × T4` (`BS=8/GPU`, est.) | **`95 – 135 min`** (`~1,6–2,25 h`) | `32 – 45 h` / **`64 – 90 GPU-h`** | **`48 – 68 h` / `96 – 136 GPU-h`** | `63 – 90 h` / **`126 – 180 GPU-h`** | Excede cota semanal de 30h; exige **5–7 resumes** ao longo de **2–4 semanas** |
 | **`Swin-UNETR`** · Nuvem `1 × RTX 4090` 24GB (est. ~3–4× sobre 2×T4, `BS=32`) | `~25 – 38 min` | `~8,5 – 12,5 h` GPU-h | **`~12,5 – 19 h` GPU-h** | `~17 – 25 h` GPU-h | Custo estimado spot (~US\$0,40/h): **~US\$5–US\$8** (30 épocas) |
 | **`Swin-UNETR`** · Nuvem `1 × A100` 40/80GB (est. ~4–5× sobre 2×T4, `BS=48–64`) | `~20 – 30 min` | `~6,5 – 10 h` GPU-h | **`~10 – 15 h` GPU-h** | `~13 – 20 h` GPU-h | Custo estimado spot (~US\$1,40/h): **~US\$14–US\$21** (30 épocas) |
@@ -129,36 +160,38 @@ Aplicando um fator conservador-realista de **`4,5×` a `6,5×`** por amostra (en
 
 ---
 
-## 5. Viabilidade para Inferência em Tempo Real no Hardware Atual
+## 6. Viabilidade para Inferência em Tempo Real no Hardware Atual
 
 Hardware medido (`katastopoulos` via WSL2 `archlinux`): **`Intel(R) Graphics [0x7dd1]`** (`xpu`, PyTorch `2.5.1+xpu` + IPEX) e CPU do host (NPU `Intel(R) AI Boost` existe no Windows mas não está exposta ao WSL2 e `openvino` ainda não está instalado nos ambientes Python atuais).
 
-### 5.1 Latências Medidas (`BS=1` Raio-X e `BS=8` MCTS Batch)
+### 6.1 Latências Medidas (`BS=1` Raio-X e `BS=8` MCTS Batch)
 
 | Arquitetura | `xpu` `BS=1` (FP32 / BF16) | `xpu` `BS=8` (FP32 / BF16) | `cpu` `BS=1` (FP32) | Raio-X Neural Interativo (`120 ms` debounce) | MCTS `160 sims` (`20 × BS=8`) só Rede | MCTS `160 sims` Passo Completo (F1 / F2+FEM) |
 |---|---|---|---|---|---|---|
-| **`SimpleBackbone`** (`4,43M`, `64×32×8`) | **`70,8 ms`** / `79,0 ms` (`~14 FPS`) | `218,0 ms` / **`183,7 ms`** | `183,7 ms` | **Viável em tempo real** (`< 120 ms`) | **`~3,7 s/passo`** | **`~3,7 s`** / **`~6,1 s`** (medido) |
+| **`SimpleBackbone`** (`4,43M`, `64×32×8`) | **`70,8 ms`** / `79,0 ms` (`~14 FPS`) | `218,0 ms` / **`183,7 ms`** | `183,7 ms` | **Viável em tempo real** (`< 120 ms`) | **`~3,7 s/passo`** | **`~3,5 s`** / **`~4,8–5,0 s`** *(medido nos 6 cenários `ep30`: 239–327s/ep)* |
 | **`Swin-UNETR`** (`6,83M`, pad `64×32×32`) | **`169,3 ms`** / `192,8 ms` (`~5,9 FPS`) | `865,6 ms` / **`836,7 ms`** | `270,4 ms` | **Viável** (~5–6 Hz; fluido ajustando debounce para ~200 ms) | **`~16,7 s/passo`** | **`~17–18 s`** / **`~19–20 s`** (est.) |
 
-### 5.2 Veredito Prático para o Hardware Atual
+### 6.2 Veredito Prático para o Hardware Atual
+
 1. **Raio-X Neural ao pintar voxels (`BS=1`):** **Sim, ambos são viáveis.** O `SimpleBackbone` roda a ~`71 ms` (`14 FPS`, folgado dentro dos `120 ms` do Studio); o `Swin-UNETR` roda a ~`169 ms` (`~6 FPS`) — há uma latência perceptível de ~`0,17 s` ao arrastar o pincel, perfeitamente usável para projeto interativo no Studio.
 2. **MCTS ao Vivo com `160` simulações no Studio:**
-   - No **`SimpleBackbone`**, **`~3,7–6,1 s/passo`** é confortável para acompanhar o episódio ao vivo (`~5–6 min` para `60–70` passos) e pausar/intervir.
+   - No **`SimpleBackbone`**, os episódios completos de `ep30` levaram entre **`239,0 s` (`S6`, `57` passos)** e **`327,0 s` (`S2`, `80` passos)** — ou seja, `~3,5 s/passo` na Fase 1 e `~4,8–5,0 s/passo` na Fase 2 com FEM real, perfeitamente confortável para acompanhar o episódio ao vivo e pausar/intervir.
    - No **`Swin-UNETR`**, **`~17–20 s/passo`** (`~21–24 min` por episódio completo de `70` passos) **não é tempo real interativo** com `160` simulações. Porém, reduzindo no Studio para **`40–64` simulações** (`5–8` batches de `BS=8`), o tempo cai para **`~4,5–7,5 s/passo`**, tornando o MCTS interativo perfeitamente utilizável no seu notebook.
 3. **Otimizações locais recomendadas:**
    - Foi observado nos benchmarks o aviso `Aten Op fallback from XPU to CPU` em [`model.py#L210`](file:///c:/Users/admin/Projetos/alphabuild/alphabuilder/src/neural/model.py#L210) (`torch.linspace` no CoordConv rodando em CPU a cada forward). Cachear a grade `cd, ch, cw, domain_mask` por shape/device evita cópias CPU→XPU repetidas e melhora especialmente `BS=1`.
    - Instalar `openvino` nativamente no Windows para exportar o `best_model.pt` (`FP16`/`INT8`) e usar GPU iGPU/NPU nativos deve reduzir ainda mais a latência de `BS=1`.
-   - **Self-Play de treino em massa (Etapa 6):** não é recomendável gerar centenas de episódios completos no notebook (`~3 ep/h` no Swin ou `~11 ep/h` no Simple); o Self-Play deve rodar em GPU NVIDIA (Kaggle/Colab/Nuvem).
+   - **Self-Play de treino em massa (Etapa 6):** não é recomendável gerar centenas de episódios completos no notebook (`~3 ep/h` no Swin ou `~11–13 ep/h` no Simple); o Self-Play deve rodar em GPU NVIDIA (Kaggle/Colab/Nuvem).
 
 ---
 
-## 6. Como Inspecionar os Episódios no AlphaBuilder Studio v4
+## 7. Como Inspecionar os Episódios no AlphaBuilder Studio v4
 
-Todos os 12 episódios já estão persistidos em [`data/eval_inference_v3_3.db`](file:///c:/Users/admin/Projetos/alphabuild/data/eval_inference_v3_3.db) no formato nativo `selfplay` (`games` + `game_steps` com densidade, políticas esparsas, visitas MCTS, Q-values MCTS e campos de deslocamento FEM em todos os passos de Fase 2 e no SIMP):
+Todos os **18 episódios** já estão persistidos em [`data/eval_inference_v3_3.db`](file:///c:/Users/admin/Projetos/alphabuild/data/eval_inference_v3_3.db) no formato nativo `selfplay` (`games` + `game_steps`, com densidade, políticas esparsas `COO1`, visitas MCTS, Q-values MCTS e campos de deslocamento FEM em todos os passos de Fase 2 e no SIMP):
 
-- **Nomes dos jogos no banco:**
-  - Rede + MCTS (2 épocas): `ep2__S1_cantilever_long_center` ... `ep2__S6_short_deep_clamp`
-  - Referência FEniTop SIMP: `simp__S1_cantilever_long_center` ... `simp__S6_short_deep_clamp`
+- **Nomes dos 18 jogos no banco (`6 × 3`):**
+  - **Smoke 2 épocas (`ep2`):** `ep2__S1_cantilever_long_center` ... `ep2__S6_short_deep_clamp`
+  - **Stage 3 completo — 30 épocas (`ep30`):** `ep30__S1_cantilever_long_center` ... `ep30__S6_short_deep_clamp`
+  - **Referência FEniTop SIMP (`simp`):** `simp__S1_cantilever_long_center` ... `simp__S6_short_deep_clamp`
 - **No app:** abra a gaveta **Biblioteca** (`L`), selecione o banco `eval_inference_v3_3.db` e use:
-  - **Inspetor:** para percorrer passo a passo Fase 1 → transição → Fase 2 com as lentes *Estrutura*, *Policy*, *Visitas MCTS*, *Refutação* e *Deformação / Tensão*.
-  - **Comparação:** para colocar lado a lado `ep2__S*` e `simp__S*` no mesmo cenário (e, após as `05:15 BRT`, também comparar `ep30__S*`).
+  - **Inspetor:** para percorrer passo a passo Fase 1 → transição → Fase 2 com as lentes *Estrutura*, *Policy*, *Visitas MCTS*, *Refutação* e *Deformação / Tensão* (inclusive visualizando a bifurcação em duas ilhas no passo `49` de `ep30__S2_cantilever_tip_bottom` e a viga limpa de `ep30__S6_short_deep_clamp`).
+  - **Comparação:** para colocar lado a lado **`ep2__S*`**, **`ep30__S*`** e **`simp__S*`** no mesmo cenário.
