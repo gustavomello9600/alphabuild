@@ -706,9 +706,9 @@ fn summarize_harvest_light(row: &HashMap<String, SqlValue>, kind: DbKind) -> Opt
     let fdisp = value_f64(row.get("final_max_displacement"));
     let is_conn = value_bool(row.get("final_is_connected"));
     let est_reward = match (fc, fv) {
-        (Some(c), Some(v)) => Some(
-            calculate_reward_breakdown(c, v, is_conn.unwrap_or(true), fdisp, 0.0).total_reward,
-        ),
+        (Some(c), Some(v)) => {
+            Some(calculate_reward_breakdown(c, v, is_conn.unwrap_or(true), fdisp, 0.0).total_reward)
+        }
         _ => None,
     };
     Some(EntrySummary {
