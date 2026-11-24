@@ -282,6 +282,22 @@ def _reduce_sums(sums: List[float], device: torch.device, is_distributed: bool) 
     return tensor.tolist()
 
 
+def _make_pbar(iterable, desc: str, is_main_process: bool):
+    """Create a clean tqdm progress bar that avoids flooding non-TTY Kaggle logs."""
+    is_tty = bool(getattr(sys.stderr, "isatty", lambda: False)())
+    return tqdm(
+        iterable,
+        desc=desc,
+        leave=False,
+        disable=not is_main_process,
+        mininterval=2.0 if is_tty else 45.0,
+        maxinterval=90.0,
+        ncols=100,
+        dynamic_ncols=False,
+        ascii=True,
+    )
+
+
 def train_epoch(
     model: nn.Module,
     dataloader: DataLoader,
@@ -307,7 +323,8 @@ def train_epoch(
     grad_ratio: Optional[float] = None
     is_phys_uvit = config.architecture == "phys_uvit"
 
-    pbar = tqdm(dataloader, desc="Train", leave=False, disable=not is_main_process)
+    pbar = _make_pbar(dataloader, desc="Train", is_main_process=is_main_process)
+    log_step = max(1, int(config.log_every_n_steps))
     for batch_idx, batch in enumerate(pbar):
         state = batch["state"].to(device, non_blocking=True)
         target_policy = batch["policy"].to(device, non_blocking=True)
@@ -396,8 +413,9 @@ def train_epoch(
         sum_conn += metrics["conn_loss"] * bs
         n_samples += bs
 
-        if is_main_process and batch_idx % 10 == 0:
+        if is_main_process and batch_idx % log_step == 0:
             pbar.set_postfix(
+                refresh=False,
                 loss=f"{metrics['loss']:.4f}",
                 pol=f"{metrics['policy_loss']:.4f}",
                 val=f"{metrics['value_loss']:.4f}",
@@ -461,7 +479,7 @@ def validate_epoch(
     is_phys_uvit = config.architecture == "phys_uvit"
 
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Val", leave=False, disable=not is_main_process):
+        for batch in _make_pbar(dataloader, desc="Val", is_main_process=is_main_process):
             state = batch["state"].to(device, non_blocking=True)
             target_policy = batch["policy"].to(device, non_blocking=True)
             target_value = batch["value"].to(device, non_blocking=True)
@@ -625,8 +643,10 @@ def save_checkpoint(
     metrics: Dict[str, float],
     config: TrainConfig,
     path: Path,
+    scheduler=None,
+    best_val_loss: Optional[float] = None,
 ) -> None:
-    """Save training checkpoint compatible with AlphaBuilderInference."""
+    """Save training checkpoint compatible with AlphaBuilderInference and clean resume."""
     raw_model = model.module if hasattr(model, "module") else model
     checkpoint = {
         "epoch": epoch,
@@ -634,6 +654,7 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "metrics": metrics,
         "val_loss": float(metrics.get("loss", float("inf"))),
+        "best_val_loss": float(best_val_loss) if best_val_loss is not None else float(metrics.get("loss", float("inf"))),
         "config": {
             "architecture": config.architecture,
             "use_swin": config.use_swin,
@@ -649,7 +670,34 @@ def save_checkpoint(
             "lambda_sed": config.lambda_sed,
         },
     }
+    if scheduler is not None:
+        checkpoint["scheduler_state_dict"] = scheduler.state_dict()
     torch.save(checkpoint, path)
+
+
+def load_checkpoint_state(
+    path: Path,
+    model: nn.Module,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler=None,
+) -> Tuple[int, float]:
+    """Load checkpoint and return (next_epoch, best_val_loss)."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    target_model = model.module if hasattr(model, "module") else model
+    raw_sd = checkpoint["model_state_dict"]
+    state_dict = {(k[7:] if k.startswith("module.") else k): v for k, v in raw_sd.items()}
+    target_model.load_state_dict(state_dict)
+    if optimizer is not None and "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    next_epoch = int(checkpoint["epoch"]) + 1
+    if scheduler is not None:
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        else:
+            for _ in range(next_epoch):
+                scheduler.step()
+    best_loss = float(checkpoint.get("best_val_loss", checkpoint.get("val_loss", float("inf"))))
+    return next_epoch, best_loss
 
 
 def load_checkpoint(
@@ -658,14 +706,8 @@ def load_checkpoint(
     optimizer: Optional[torch.optim.Optimizer] = None,
 ) -> int:
     """Load checkpoint and return next epoch index."""
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    target_model = model.module if hasattr(model, "module") else model
-    raw_sd = checkpoint["model_state_dict"]
-    state_dict = {(k[7:] if k.startswith("module.") else k): v for k, v in raw_sd.items()}
-    target_model.load_state_dict(state_dict)
-    if optimizer is not None and "optimizer_state_dict" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    return int(checkpoint["epoch"]) + 1
+    next_epoch, _ = load_checkpoint_state(path, model, optimizer=optimizer)
+    return next_epoch
 
 
 def _build_scheduler(optimizer: torch.optim.Optimizer, config: TrainConfig):
@@ -782,18 +824,28 @@ def main(
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
 
         start_epoch = 0
-        if resume:
-            if is_main_process:
-                print(f"Resuming from checkpoint: {resume}")
-            start_epoch = load_checkpoint(Path(resume), model, optimizer)
-
         best_val_loss = float("inf")
         patience_counter = 0
         history: List[dict] = []
         ckpt_dir = Path(config.checkpoint_dir)
 
+        if resume:
+            resume_path = Path(resume)
+            if is_main_process:
+                print(f"Resuming from checkpoint: {resume_path}", flush=True)
+            start_epoch, best_val_loss = load_checkpoint_state(resume_path, model, optimizer, scheduler=scheduler)
+            hist_candidate = resume_path.parent / "metrics_history.json"
+            if hist_candidate.exists():
+                try:
+                    loaded_hist = json.loads(hist_candidate.read_text(encoding="utf-8"))
+                    history = [h for h in loaded_hist if int(h.get("epoch", 0)) <= start_epoch]
+                except Exception:
+                    history = []
+
         for epoch in range(start_epoch, config.epochs):
             epoch_start = time.time()
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
             if isinstance(train_loader.sampler, DistributedSampler):
                 train_loader.sampler.set_epoch(epoch)
 
@@ -820,11 +872,18 @@ def main(
             current_lr = optimizer.param_groups[0]["lr"]
             epoch_time = time.time() - epoch_start
             samples_per_sec = len(train_loader.dataset) / max(epoch_time, 1e-6)
+            peak_vram_gb = (
+                torch.cuda.max_memory_allocated(device) / (1024.0 ** 3)
+                if device.type == "cuda"
+                else None
+            )
 
             stop_signal = False
             if is_main_process:
+                vram_msg = f", vram_peak={peak_vram_gb:.2f}GB" if peak_vram_gb is not None else ""
                 print(
-                    f"\nEpoch {epoch + 1}/{config.epochs} ({epoch_time:.1f}s, {samples_per_sec:.0f} samples/s, lr={current_lr:.2e})"
+                    f"\nEpoch {epoch + 1}/{config.epochs} ({epoch_time:.1f}s, {samples_per_sec:.0f} samples/s, lr={current_lr:.2e}{vram_msg})",
+                    flush=True,
                 )
                 print(
                     f"  Train | Loss={train_metrics['loss']:.4f} Pol={train_metrics['policy_loss']:.4f} "
@@ -833,7 +892,8 @@ def main(
                         f" grad_ratio={train_metrics['bp_pol_grad_ratio']:.3f}"
                         if "bp_pol_grad_ratio" in train_metrics
                         else ""
-                    )
+                    ),
+                    flush=True,
                 )
                 if val_loader is not None:
                     extra_val = ""
@@ -846,19 +906,21 @@ def main(
                         f"Pol={val_metrics['policy_loss']:.4f} Val={val_metrics['value_loss']:.4f} "
                         f"BP={val_metrics['blueprint_loss']:.4f} MAE={val_metrics.get('value_mae', 0.0):.4f} "
                         f"Top1={val_metrics.get('policy_top1_acc', 0.0):.3f} "
-                        f"Dice={val_metrics.get('blueprint_dice', 0.0):.3f}{extra_val}"
+                        f"Dice={val_metrics.get('blueprint_dice', 0.0):.3f}{extra_val}",
+                        flush=True,
                     )
 
-                history.append(
-                    {
-                        "epoch": epoch + 1,
-                        "lr": current_lr,
-                        "elapsed_sec": round(epoch_time, 2),
-                        "samples_per_sec": round(samples_per_sec, 1),
-                        "train": train_metrics,
-                        "val": val_metrics,
-                    }
-                )
+                hist_entry = {
+                    "epoch": epoch + 1,
+                    "lr": current_lr,
+                    "elapsed_sec": round(epoch_time, 2),
+                    "samples_per_sec": round(samples_per_sec, 1),
+                    "train": train_metrics,
+                    "val": val_metrics,
+                }
+                if peak_vram_gb is not None:
+                    hist_entry["peak_vram_gb"] = round(peak_vram_gb, 3)
+                history.append(hist_entry)
                 (ckpt_dir / "metrics_history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
 
                 if writer is not None:
@@ -872,14 +934,41 @@ def main(
                 if monitor_loss < best_val_loss - config.min_delta:
                     best_val_loss = monitor_loss
                     patience_counter = 0
-                    save_checkpoint(model, optimizer, epoch, val_metrics, config, ckpt_dir / "best_model.pt")
-                    print(f"  -> New best checkpoint saved ({best_val_loss:.4f})")
+                    save_checkpoint(
+                        model,
+                        optimizer,
+                        epoch,
+                        val_metrics,
+                        config,
+                        ckpt_dir / "best_model.pt",
+                        scheduler=scheduler,
+                        best_val_loss=best_val_loss,
+                    )
+                    print(f"  -> New best checkpoint saved ({best_val_loss:.4f})", flush=True)
                 else:
                     patience_counter += 1
 
                 if (epoch + 1) % config.save_every_n_epochs == 0:
-                    save_checkpoint(model, optimizer, epoch, val_metrics, config, ckpt_dir / f"checkpoint_epoch_{epoch + 1}.pt")
-                save_checkpoint(model, optimizer, epoch, val_metrics, config, ckpt_dir / "last_model.pt")
+                    save_checkpoint(
+                        model,
+                        optimizer,
+                        epoch,
+                        val_metrics,
+                        config,
+                        ckpt_dir / f"checkpoint_epoch_{epoch + 1}.pt",
+                        scheduler=scheduler,
+                        best_val_loss=best_val_loss,
+                    )
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    epoch,
+                    val_metrics,
+                    config,
+                    ckpt_dir / "last_model.pt",
+                    scheduler=scheduler,
+                    best_val_loss=best_val_loss,
+                )
 
                 if patience_counter >= config.patience:
                     print(f"\nEarly stopping triggered (patience={config.patience})")
