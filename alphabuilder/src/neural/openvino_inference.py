@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import openvino as ov
 
-from alphabuilder.src.neural.model import AlphaBuilderV31
+from alphabuilder.src.neural.model import AlphaBuilderV31, build_model, resolve_architecture
 
 logger = logging.getLogger("OpenVINO")
 
@@ -55,14 +55,20 @@ class AlphaBuilderOpenVINO:
 
         in_channels = int(merged_cfg.get("in_channels", 7))
         out_channels = int(merged_cfg.get("out_channels", 2))
-        feature_size = int(merged_cfg.get("feature_size", 24))
-        self.use_swin = bool(merged_cfg.get("use_swin", False))
+        self.architecture = resolve_architecture(merged_cfg)
+        self.use_swin = self.architecture == "swin"
+        default_feat = 32 if self.architecture == "phys_uvit" else 24
+        feature_size = int(merged_cfg.get("feature_size", default_feat))
 
-        self.pt_model = AlphaBuilderV31(
+        self.pt_model = build_model(
+            architecture=self.architecture,
             in_channels=in_channels,
             out_channels=out_channels,
             feature_size=feature_size,
             use_swin=self.use_swin,
+            embed_dim=int(merged_cfg.get("embed_dim", 192)),
+            transformer_depth=int(merged_cfg.get("transformer_depth", 5)),
+            num_heads=int(merged_cfg.get("num_heads", 6)),
         )
 
         raw_sd = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint

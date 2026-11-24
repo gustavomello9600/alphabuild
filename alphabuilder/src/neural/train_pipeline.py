@@ -39,12 +39,14 @@ from alphabuilder.src.neural.dataset import (  # noqa: E402
     detect_schema_version,
     make_symmetry_collate_fn,
 )
-from alphabuilder.src.neural.model import AlphaBuilderV31  # noqa: E402
+from alphabuilder.src.neural.model import AlphaBuilderV31, VALID_ARCHITECTURES, build_model  # noqa: E402
 from alphabuilder.src.neural.train_config import CONFIGS, TrainConfig, get_config  # noqa: E402
 from alphabuilder.src.neural.trainer import (  # noqa: E402
     blueprint_loss,
     compute_backbone_grad_ratio,
     compute_blueprint_dice,
+    compute_connectivity_accuracy,
+    compute_log_c_mae,
     compute_policy_top1_accuracy,
     compute_total_loss,
     policy_loss,
@@ -221,19 +223,36 @@ def create_model(
     local_rank: int = 0,
     is_main_process: bool = True,
 ) -> nn.Module:
-    """Create AlphaBuilderV31 and wrap in DDP or DataParallel when appropriate."""
-    model = AlphaBuilderV31(
+    """Create configured architecture (SimpleBackbone, Swin-UNETR, or Phys-UViT 3D) and wrap in DDP."""
+    model = build_model(
+        architecture=config.architecture,
         in_channels=config.in_channels,
         out_channels=config.out_channels,
         feature_size=config.feature_size,
         use_swin=config.use_swin,
+        embed_dim=config.embed_dim,
+        transformer_depth=config.transformer_depth,
+        num_heads=config.num_heads,
     ).to(device)
+
+    # Freeze unused auxiliary SED head when lambda_sed <= 0 to keep DDP graphs 100% utilized
+    if config.lambda_sed <= 0.0 and hasattr(model, "sed_head"):
+        for p in model.sed_head.parameters():
+            p.requires_grad_(False)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if is_main_process:
-        arch = "Swin-UNETR" if config.use_swin else "SimpleBackbone"
-        print(f"\nModel: {arch} (feature_size={config.feature_size})")
+        if config.architecture == "phys_uvit":
+            arch = (
+                f"Phys-UViT 3D (feature_size={config.feature_size}, "
+                f"embed_dim={config.embed_dim}, depth={config.transformer_depth}, heads={config.num_heads})"
+            )
+        elif config.use_swin or config.architecture == "swin":
+            arch = f"Swin-UNETR (feature_size={config.feature_size})"
+        else:
+            arch = f"SimpleBackbone (feature_size={config.feature_size})"
+        print(f"\nModel: {arch}")
         print(f"   Parameters: {total_params:,} (trainable: {trainable_params:,})")
 
     if is_distributed:
@@ -278,11 +297,15 @@ def train_epoch(
     use_amp = bool(config.use_amp and device.type == "cuda")
 
     sum_loss = 0.0
+    sum_core = 0.0
     sum_pol = 0.0
     sum_val = 0.0
     sum_bp = 0.0
+    sum_log_c = 0.0
+    sum_conn = 0.0
     n_samples = 0
     grad_ratio: Optional[float] = None
+    is_phys_uvit = config.architecture == "phys_uvit"
 
     pbar = tqdm(dataloader, desc="Train", leave=False, disable=not is_main_process)
     for batch_idx, batch in enumerate(pbar):
@@ -293,17 +316,31 @@ def train_epoch(
         policy_mask = batch["policy_mask"].to(device, non_blocking=True) if "policy_mask" in batch else None
         target_bp = batch["blueprint"].to(device, non_blocking=True) if "blueprint" in batch else None
         bp_mask = batch["blueprint_mask"].to(device, non_blocking=True) if "blueprint_mask" in batch else None
+        target_log_c = batch["log_compliance"].to(device, non_blocking=True) if "log_compliance" in batch else None
+        comp_mask = batch["compliance_mask"].to(device, non_blocking=True) if "compliance_mask" in batch else None
+        target_conn = batch["conn_target"].to(device, non_blocking=True) if "conn_target" in batch else None
+        conn_mask = batch["conn_mask"].to(device, non_blocking=True) if "conn_mask" in batch else None
 
         bs = state.shape[0]
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
-            outputs = model(state, return_blueprint=(config.lambda_bp > 0.0 and target_bp is not None))
-            if len(outputs) == 3:
-                pred_policy, pred_value, pred_bp = outputs
+            if is_phys_uvit:
+                pred_policy, pred_value, aux = model(
+                    state, return_aux=True, compute_sed=(config.lambda_sed > 0.0)
+                )
+                pred_bp = aux["blueprint"] if (config.lambda_bp > 0.0 and target_bp is not None) else None
+                pred_log_c = aux["log_compliance"]
+                pred_conn_logit = aux["conn_logit"]
             else:
-                pred_policy, pred_value = outputs
-                pred_bp = None
+                outputs = model(state, return_blueprint=(config.lambda_bp > 0.0 and target_bp is not None))
+                if len(outputs) == 3:
+                    pred_policy, pred_value, pred_bp = outputs
+                else:
+                    pred_policy, pred_value = outputs
+                    pred_bp = None
+                pred_log_c = None
+                pred_conn_logit = None
 
             loss, metrics = compute_total_loss(
                 pred_policy=pred_policy,
@@ -315,9 +352,17 @@ def train_epoch(
                 pred_blueprint=pred_bp,
                 target_blueprint=target_bp,
                 blueprint_mask=bp_mask,
+                pred_log_c=pred_log_c,
+                target_log_c=target_log_c,
+                compliance_mask=comp_mask,
+                pred_conn_logit=pred_conn_logit,
+                target_conn=target_conn,
+                conn_mask=conn_mask,
                 lambda_policy=config.lambda_policy,
                 lambda_value=config.lambda_value,
                 lambda_bp=config.lambda_bp,
+                lambda_log_c=config.lambda_log_c,
+                lambda_conn=config.lambda_conn,
             )
 
         # Sample gradient norm ratio once at batch 0 on main process (unscaled float32 losses)
@@ -343,9 +388,12 @@ def train_epoch(
             optimizer.step()
 
         sum_loss += metrics["loss"] * bs
+        sum_core += metrics["core_loss"] * bs
         sum_pol += metrics["policy_loss"] * bs
         sum_val += metrics["value_loss"] * bs
         sum_bp += metrics["blueprint_loss"] * bs
+        sum_log_c += metrics["log_c_loss"] * bs
+        sum_conn += metrics["conn_loss"] * bs
         n_samples += bs
 
         if is_main_process and batch_idx % 10 == 0:
@@ -356,16 +404,23 @@ def train_epoch(
                 bp=f"{metrics['blueprint_loss']:.4f}",
             )
 
-    sum_loss, sum_pol, sum_val, sum_bp, total_n = _reduce_sums(
-        [sum_loss, sum_pol, sum_val, sum_bp, float(n_samples)], device, is_distributed
+    sum_loss, sum_core, sum_pol, sum_val, sum_bp, sum_log_c, sum_conn, total_n = _reduce_sums(
+        [sum_loss, sum_core, sum_pol, sum_val, sum_bp, sum_log_c, sum_conn, float(n_samples)],
+        device,
+        is_distributed,
     )
     denom = max(total_n, 1.0)
     out = {
         "loss": sum_loss / denom,
+        "core_loss": sum_core / denom,
         "policy_loss": sum_pol / denom,
         "value_loss": sum_val / denom,
         "blueprint_loss": sum_bp / denom,
     }
+    if config.lambda_log_c > 0.0:
+        out["log_c_loss"] = sum_log_c / denom
+    if config.lambda_conn > 0.0:
+        out["conn_loss"] = sum_conn / denom
     if grad_ratio is not None:
         out["bp_pol_grad_ratio"] = grad_ratio
     return out
@@ -387,15 +442,23 @@ def validate_epoch(
     use_amp = bool(config.use_amp and device.type == "cuda")
 
     sum_loss = 0.0
+    sum_core = 0.0
     sum_pol = 0.0
     sum_val = 0.0
     sum_bp = 0.0
+    sum_log_c = 0.0
+    sum_conn = 0.0
     sum_mae = 0.0
     sum_top1 = 0.0
     cnt_top1 = 0.0
     sum_dice = 0.0
     cnt_dice = 0.0
+    sum_lc_mae = 0.0
+    cnt_lc = 0.0
+    sum_conn_acc = 0.0
+    cnt_conn = 0.0
     n_samples = 0
+    is_phys_uvit = config.architecture == "phys_uvit"
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Val", leave=False, disable=not is_main_process):
@@ -406,15 +469,29 @@ def validate_epoch(
             policy_mask = batch["policy_mask"].to(device, non_blocking=True) if "policy_mask" in batch else None
             target_bp = batch["blueprint"].to(device, non_blocking=True) if "blueprint" in batch else None
             bp_mask = batch["blueprint_mask"].to(device, non_blocking=True) if "blueprint_mask" in batch else None
+            target_log_c = batch["log_compliance"].to(device, non_blocking=True) if "log_compliance" in batch else None
+            comp_mask = batch["compliance_mask"].to(device, non_blocking=True) if "compliance_mask" in batch else None
+            target_conn = batch["conn_target"].to(device, non_blocking=True) if "conn_target" in batch else None
+            conn_mask = batch["conn_mask"].to(device, non_blocking=True) if "conn_mask" in batch else None
 
             bs = state.shape[0]
             with torch.amp.autocast("cuda", enabled=use_amp):
-                outputs = model(state, return_blueprint=(config.lambda_bp > 0.0 and target_bp is not None))
-                if len(outputs) == 3:
-                    pred_policy, pred_value, pred_bp = outputs
+                if is_phys_uvit:
+                    pred_policy, pred_value, aux = model(
+                        state, return_aux=True, compute_sed=False
+                    )
+                    pred_bp = aux["blueprint"] if (config.lambda_bp > 0.0 and target_bp is not None) else None
+                    pred_log_c = aux["log_compliance"]
+                    pred_conn_logit = aux["conn_logit"]
                 else:
-                    pred_policy, pred_value = outputs
-                    pred_bp = None
+                    outputs = model(state, return_blueprint=(config.lambda_bp > 0.0 and target_bp is not None))
+                    if len(outputs) == 3:
+                        pred_policy, pred_value, pred_bp = outputs
+                    else:
+                        pred_policy, pred_value = outputs
+                        pred_bp = None
+                    pred_log_c = None
+                    pred_conn_logit = None
 
                 _, metrics = compute_total_loss(
                     pred_policy=pred_policy,
@@ -426,15 +503,26 @@ def validate_epoch(
                     pred_blueprint=pred_bp,
                     target_blueprint=target_bp,
                     blueprint_mask=bp_mask,
+                    pred_log_c=pred_log_c,
+                    target_log_c=target_log_c,
+                    compliance_mask=comp_mask,
+                    pred_conn_logit=pred_conn_logit,
+                    target_conn=target_conn,
+                    conn_mask=conn_mask,
                     lambda_policy=config.lambda_policy,
                     lambda_value=config.lambda_value,
                     lambda_bp=config.lambda_bp,
+                    lambda_log_c=config.lambda_log_c,
+                    lambda_conn=config.lambda_conn,
                 )
 
             sum_loss += metrics["loss"] * bs
+            sum_core += metrics["core_loss"] * bs
             sum_pol += metrics["policy_loss"] * bs
             sum_val += metrics["value_loss"] * bs
             sum_bp += metrics["blueprint_loss"] * bs
+            sum_log_c += metrics["log_c_loss"] * bs
+            sum_conn += metrics["conn_loss"] * bs
             sum_mae += float((pred_value.float() - target_value.float()).abs().sum().item())
             n_samples += bs
 
@@ -451,23 +539,82 @@ def validate_epoch(
                     sum_dice += dice * max(1.0, valid_b_cnt)
                     cnt_dice += max(1.0, valid_b_cnt)
 
-    sum_loss, sum_pol, sum_val, sum_bp, sum_mae, sum_top1, cnt_top1, sum_dice, cnt_dice, total_n = _reduce_sums(
-        [sum_loss, sum_pol, sum_val, sum_bp, sum_mae, sum_top1, cnt_top1, sum_dice, cnt_dice, float(n_samples)],
+            if pred_log_c is not None and target_log_c is not None:
+                lc_mae = compute_log_c_mae(pred_log_c, target_log_c, compliance_mask=comp_mask)
+                if lc_mae is not None:
+                    valid_c_cnt = float((comp_mask > 0.5).sum().item()) if comp_mask is not None else float(bs)
+                    sum_lc_mae += lc_mae * max(1.0, valid_c_cnt)
+                    cnt_lc += max(1.0, valid_c_cnt)
+
+            if pred_conn_logit is not None and target_conn is not None:
+                c_acc = compute_connectivity_accuracy(pred_conn_logit, target_conn, conn_mask=conn_mask)
+                if c_acc is not None:
+                    valid_k_cnt = float((conn_mask > 0.5).sum().item()) if conn_mask is not None else float(bs)
+                    sum_conn_acc += c_acc * max(1.0, valid_k_cnt)
+                    cnt_conn += max(1.0, valid_k_cnt)
+
+    (
+        sum_loss,
+        sum_core,
+        sum_pol,
+        sum_val,
+        sum_bp,
+        sum_log_c,
+        sum_conn,
+        sum_mae,
+        sum_top1,
+        cnt_top1,
+        sum_dice,
+        cnt_dice,
+        sum_lc_mae,
+        cnt_lc,
+        sum_conn_acc,
+        cnt_conn,
+        total_n,
+    ) = _reduce_sums(
+        [
+            sum_loss,
+            sum_core,
+            sum_pol,
+            sum_val,
+            sum_bp,
+            sum_log_c,
+            sum_conn,
+            sum_mae,
+            sum_top1,
+            cnt_top1,
+            sum_dice,
+            cnt_dice,
+            sum_lc_mae,
+            cnt_lc,
+            sum_conn_acc,
+            cnt_conn,
+            float(n_samples),
+        ],
         device,
         is_distributed,
     )
     denom = max(total_n, 1.0)
     out = {
         "loss": sum_loss / denom,
+        "core_loss": sum_core / denom,
         "policy_loss": sum_pol / denom,
         "value_loss": sum_val / denom,
         "blueprint_loss": sum_bp / denom,
         "value_mae": sum_mae / denom,
     }
+    if config.lambda_log_c > 0.0:
+        out["log_c_loss"] = sum_log_c / denom
+    if config.lambda_conn > 0.0:
+        out["conn_loss"] = sum_conn / denom
     if cnt_top1 > 0:
         out["policy_top1_acc"] = sum_top1 / cnt_top1
     if cnt_dice > 0:
         out["blueprint_dice"] = sum_dice / cnt_dice
+    if cnt_lc > 0:
+        out["log_c_mae"] = sum_lc_mae / cnt_lc
+    if cnt_conn > 0:
+        out["conn_acc"] = sum_conn_acc / cnt_conn
     return out
 
 
@@ -488,11 +635,18 @@ def save_checkpoint(
         "metrics": metrics,
         "val_loss": float(metrics.get("loss", float("inf"))),
         "config": {
+            "architecture": config.architecture,
             "use_swin": config.use_swin,
             "feature_size": config.feature_size,
+            "embed_dim": config.embed_dim,
+            "transformer_depth": config.transformer_depth,
+            "num_heads": config.num_heads,
             "in_channels": config.in_channels,
             "out_channels": config.out_channels,
             "lambda_bp": config.lambda_bp,
+            "lambda_log_c": config.lambda_log_c,
+            "lambda_conn": config.lambda_conn,
+            "lambda_sed": config.lambda_sed,
         },
     }
     torch.save(checkpoint, path)
@@ -538,6 +692,7 @@ def main(
     lr: Optional[float] = None,
     lambda_bp: Optional[float] = None,
     use_swin: Optional[bool] = None,
+    architecture: Optional[str] = None,
     num_workers: Optional[int] = None,
     resume: Optional[str] = None,
 ) -> None:
@@ -565,8 +720,12 @@ def main(
             config.learning_rate = lr
         if lambda_bp is not None:
             config.lambda_bp = lambda_bp
-        if use_swin is not None:
+        if architecture is not None:
+            config.architecture = architecture
+            config.use_swin = architecture == "swin"
+        elif use_swin is not None:
             config.use_swin = use_swin
+            config.architecture = "swin" if use_swin else "simple"
         if num_workers is not None:
             config.num_workers = num_workers
 
@@ -575,9 +734,14 @@ def main(
 
         if is_main_process:
             print("=" * 64)
-            print(f"AlphaBuilder v3.3 Training Pipeline | config={config_name} | device={device}")
+            print(
+                f"AlphaBuilder Training Pipeline | config={config_name} | arch={config.architecture} | device={device}"
+            )
             print(f"  per_gpu_bs={config.batch_size} | world_size={world_size} | global_bs={config.batch_size * world_size}")
-            print(f"  loss_weights: pol={config.lambda_policy}, val={config.lambda_value}, bp={config.lambda_bp}")
+            print(
+                f"  loss_weights: pol={config.lambda_policy}, val={config.lambda_value}, "
+                f"bp={config.lambda_bp}, logC={config.lambda_log_c}, conn={config.lambda_conn}"
+            )
             print("=" * 64)
 
         writer = None
@@ -672,12 +836,17 @@ def main(
                     )
                 )
                 if val_loader is not None:
+                    extra_val = ""
+                    if "log_c_mae" in val_metrics:
+                        extra_val += f" logC_MAE={val_metrics['log_c_mae']:.4f}"
+                    if "conn_acc" in val_metrics:
+                        extra_val += f" Conn={val_metrics['conn_acc']:.3f}"
                     print(
-                        f"  Val   | Loss={val_metrics['loss']:.4f} Pol={val_metrics['policy_loss']:.4f} "
-                        f"Val={val_metrics['value_loss']:.4f} BP={val_metrics['blueprint_loss']:.4f} "
-                        f"MAE={val_metrics.get('value_mae', 0.0):.4f} "
+                        f"  Val   | Loss={val_metrics['loss']:.4f} Core={val_metrics.get('core_loss', val_metrics['loss']):.4f} "
+                        f"Pol={val_metrics['policy_loss']:.4f} Val={val_metrics['value_loss']:.4f} "
+                        f"BP={val_metrics['blueprint_loss']:.4f} MAE={val_metrics.get('value_mae', 0.0):.4f} "
                         f"Top1={val_metrics.get('policy_top1_acc', 0.0):.3f} "
-                        f"Dice={val_metrics.get('blueprint_dice', 0.0):.3f}"
+                        f"Dice={val_metrics.get('blueprint_dice', 0.0):.3f}{extra_val}"
                     )
 
                 history.append(
@@ -746,6 +915,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--lambda-bp", type=float, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--arch", type=str, default=None, choices=list(VALID_ARCHITECTURES))
     parser.add_argument("--use-swin", dest="use_swin", action="store_true", default=None)
     parser.add_argument("--no-swin", dest="use_swin", action="store_false")
     parser.add_argument("--resume", type=str, default=None)
@@ -762,6 +932,7 @@ if __name__ == "__main__":
         lr=args.lr,
         lambda_bp=args.lambda_bp,
         use_swin=args.use_swin,
+        architecture=args.arch,
         num_workers=args.num_workers,
         resume=args.resume,
     )

@@ -611,7 +611,11 @@ def run_neural_mcts_episode(
         game_id=game_id,
     )
 
-    engine_name = "swin-unetr" if getattr(model, "use_swin", False) else "simple"
+    engine_name = getattr(
+        model,
+        "architecture",
+        "swin-unetr" if getattr(model, "use_swin", False) else "simple",
+    )
     _delete_game(db_path, game_id)
     save_game(
         db_path,
@@ -1181,7 +1185,7 @@ def main() -> None:
     print(f"\nLoading checkpoint {args.checkpoint} on device={args.device} ...", flush=True)
     model = AlphaBuilderInference(args.checkpoint, device=args.device)
     print(
-        f"Loaded model: arch={'swin-unetr' if model.use_swin else 'simple'} | "
+        f"Loaded model: arch={getattr(model, 'architecture', 'swin-unetr' if model.use_swin else 'simple')} | "
         f"device={model.device_str} | epoch={model.epoch} | val_loss={model.val_loss}",
         flush=True,
     )

@@ -19,6 +19,8 @@ LAMBDA_POLICY = 1.0
 LAMBDA_VALUE = 2.0
 LAMBDA_BLUEPRINT_WARMUP = 0.50
 LAMBDA_BLUEPRINT_SELFPLAY = 0.25
+LAMBDA_LOG_C_DEFAULT = 0.20
+LAMBDA_CONN_DEFAULT = 0.25
 
 W_NEG = 1.5
 HUBER_BETA = 0.2
@@ -133,6 +135,75 @@ def blueprint_loss(
     return sample_loss.mean()
 
 
+def log_compliance_loss(
+    pred_log_c: torch.Tensor,
+    target_log_c: torch.Tensor,
+    compliance_mask: Optional[torch.Tensor] = None,
+    beta: float = HUBER_BETA,
+) -> torch.Tensor:
+    """Masked SmoothL1 loss on log10(compliance) for connected states with FEM ground truth."""
+    pred_f = pred_log_c.float().reshape(-1)
+    target_f = target_log_c.float().reshape(-1)
+    loss_vec = F.smooth_l1_loss(pred_f, target_f, reduction="none", beta=beta)
+    if compliance_mask is not None:
+        valid = compliance_mask.reshape(-1) > 0.5
+        if not valid.any():
+            return pred_log_c.sum() * 0.0
+        return loss_vec[valid].mean()
+    return loss_vec.mean()
+
+
+def connectivity_loss(
+    pred_conn_logit: torch.Tensor,
+    target_conn: torch.Tensor,
+    conn_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Masked BCEWithLogits loss on topological connectivity indicator."""
+    pred_f = pred_conn_logit.float().reshape(-1)
+    target_f = target_conn.float().reshape(-1)
+    loss_vec = F.binary_cross_entropy_with_logits(pred_f, target_f, reduction="none")
+    if conn_mask is not None:
+        valid = conn_mask.reshape(-1) > 0.5
+        if not valid.any():
+            return pred_conn_logit.sum() * 0.0
+        return loss_vec[valid].mean()
+    return loss_vec.mean()
+
+
+def compute_log_c_mae(
+    pred_log_c: torch.Tensor,
+    target_log_c: torch.Tensor,
+    compliance_mask: Optional[torch.Tensor] = None,
+) -> Optional[float]:
+    """Compute MAE on log10(compliance) over valid connected samples."""
+    with torch.no_grad():
+        err = (pred_log_c.float().reshape(-1) - target_log_c.float().reshape(-1)).abs()
+        if compliance_mask is not None:
+            valid = compliance_mask.reshape(-1) > 0.5
+            if not valid.any():
+                return None
+            err = err[valid]
+        return float(err.mean().item())
+
+
+def compute_connectivity_accuracy(
+    pred_conn_logit: torch.Tensor,
+    target_conn: torch.Tensor,
+    conn_mask: Optional[torch.Tensor] = None,
+) -> Optional[float]:
+    """Compute binary connectivity accuracy over valid samples."""
+    with torch.no_grad():
+        preds = (torch.sigmoid(pred_conn_logit.float().reshape(-1)) > 0.5).float()
+        targets = (target_conn.float().reshape(-1) > 0.5).float()
+        if conn_mask is not None:
+            valid = conn_mask.reshape(-1) > 0.5
+            if not valid.any():
+                return None
+            preds = preds[valid]
+            targets = targets[valid]
+        return float((preds == targets).float().mean().item())
+
+
 def compute_blueprint_dice(
     pred_bp: torch.Tensor,
     target_bp: torch.Tensor,
@@ -194,15 +265,24 @@ def compute_total_loss(
     pred_blueprint: Optional[torch.Tensor] = None,
     target_blueprint: Optional[torch.Tensor] = None,
     blueprint_mask: Optional[torch.Tensor] = None,
+    pred_log_c: Optional[torch.Tensor] = None,
+    target_log_c: Optional[torch.Tensor] = None,
+    compliance_mask: Optional[torch.Tensor] = None,
+    pred_conn_logit: Optional[torch.Tensor] = None,
+    target_conn: Optional[torch.Tensor] = None,
+    conn_mask: Optional[torch.Tensor] = None,
     lambda_policy: float = LAMBDA_POLICY,
     lambda_value: float = LAMBDA_VALUE,
     lambda_bp: float = LAMBDA_BLUEPRINT_WARMUP,
+    lambda_log_c: float = 0.0,
+    lambda_conn: float = 0.0,
     w_neg: float = W_NEG,
     huber_beta: float = HUBER_BETA,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute multi-head loss:
         L_total = lambda_policy * L_pol + lambda_value * L_val + lambda_bp * L_bp
+                  + lambda_log_c * L_logC + lambda_conn * L_conn
     """
     p_loss = policy_loss(
         pred_policy,
@@ -219,11 +299,30 @@ def compute_total_loss(
         total = total + lambda_bp * bp_loss_tensor
         bp_val = float(bp_loss_tensor.detach().item())
 
+    core_val = float(total.detach().item())
+
+    log_c_val = 0.0
+    if pred_log_c is not None and target_log_c is not None and lambda_log_c > 0.0:
+        lc_loss_tensor = log_compliance_loss(
+            pred_log_c, target_log_c, compliance_mask=compliance_mask, beta=huber_beta
+        )
+        total = total + lambda_log_c * lc_loss_tensor
+        log_c_val = float(lc_loss_tensor.detach().item())
+
+    conn_val = 0.0
+    if pred_conn_logit is not None and target_conn is not None and lambda_conn > 0.0:
+        c_loss_tensor = connectivity_loss(pred_conn_logit, target_conn, conn_mask=conn_mask)
+        total = total + lambda_conn * c_loss_tensor
+        conn_val = float(c_loss_tensor.detach().item())
+
     return total, {
         "loss": float(total.detach().item()),
+        "core_loss": core_val,
         "policy_loss": float(p_loss.detach().item()),
         "value_loss": float(v_loss.detach().item()),
         "blueprint_loss": bp_val,
+        "log_c_loss": log_c_val,
+        "conn_loss": conn_val,
     }
 
 
@@ -256,23 +355,30 @@ def compute_backbone_grad_ratio(
     return float((bp_sq ** 0.5) / pol_norm)
 
 
-def _forward_with_optional_blueprint(
+def _forward_model_outputs(
     model: nn.Module,
     state: torch.Tensor,
     want_blueprint: bool,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    want_aux: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    base_model = model.module if hasattr(model, "module") else model
+    if want_aux and getattr(base_model, "architecture", "") == "phys_uvit":
+        outputs = model(state, return_aux=True, compute_sed=False)
+        aux = outputs[2]
+        return outputs[0], outputs[1], aux["blueprint"], aux["log_compliance"], aux["conn_logit"]
+
     if want_blueprint:
         try:
             outputs = model(state, return_blueprint=True)
             if isinstance(outputs, tuple) and len(outputs) == 3:
-                return outputs[0], outputs[1], outputs[2]
-            return outputs[0], outputs[1], None
+                return outputs[0], outputs[1], outputs[2], None, None
+            return outputs[0], outputs[1], None, None, None
         except TypeError:
             pass
     outputs = model(state)
     if isinstance(outputs, tuple) and len(outputs) == 3:
-        return outputs[0], outputs[1], outputs[2]
-    return outputs[0], outputs[1], None
+        return outputs[0], outputs[1], outputs[2], None, None
+    return outputs[0], outputs[1], None, None, None
 
 
 def train_one_epoch(
@@ -281,14 +387,18 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     lambda_bp: float = LAMBDA_BLUEPRINT_WARMUP,
+    lambda_log_c: float = 0.0,
+    lambda_conn: float = 0.0,
 ) -> Dict[str, float]:
-    """Train model for one epoch cleanly (compatible with 2-head and 3-head models)."""
+    """Train model for one epoch cleanly (compatible with 2-head, 3-head, and PhysUViT3D models)."""
     model.train()
 
     total_loss = 0.0
     total_policy_loss = 0.0
     total_value_loss = 0.0
     total_bp_loss = 0.0
+    total_log_c_loss = 0.0
+    total_conn_loss = 0.0
     num_batches = 0
 
     for batch in dataloader:
@@ -299,10 +409,18 @@ def train_one_epoch(
         policy_mask = batch["policy_mask"].to(device) if "policy_mask" in batch else None
         target_bp = batch["blueprint"].to(device) if "blueprint" in batch else None
         bp_mask = batch["blueprint_mask"].to(device) if "blueprint_mask" in batch else None
+        target_log_c = batch["log_compliance"].to(device) if "log_compliance" in batch else None
+        comp_mask = batch["compliance_mask"].to(device) if "compliance_mask" in batch else None
+        target_conn = batch["conn_target"].to(device) if "conn_target" in batch else None
+        conn_mask = batch["conn_mask"].to(device) if "conn_mask" in batch else None
 
+        want_aux = bool(lambda_log_c > 0.0 or lambda_conn > 0.0)
         optimizer.zero_grad(set_to_none=True)
-        pred_policy, pred_value, pred_bp = _forward_with_optional_blueprint(
-            model, state, want_blueprint=(target_bp is not None and lambda_bp > 0.0)
+        pred_policy, pred_value, pred_bp, pred_log_c, pred_conn_logit = _forward_model_outputs(
+            model,
+            state,
+            want_blueprint=(target_bp is not None and lambda_bp > 0.0),
+            want_aux=want_aux,
         )
 
         loss, metrics = compute_total_loss(
@@ -315,7 +433,15 @@ def train_one_epoch(
             pred_blueprint=pred_bp,
             target_blueprint=target_bp,
             blueprint_mask=bp_mask,
+            pred_log_c=pred_log_c,
+            target_log_c=target_log_c,
+            compliance_mask=comp_mask,
+            pred_conn_logit=pred_conn_logit,
+            target_conn=target_conn,
+            conn_mask=conn_mask,
             lambda_bp=lambda_bp,
+            lambda_log_c=lambda_log_c,
+            lambda_conn=lambda_conn,
         )
 
         loss.backward()
@@ -325,6 +451,8 @@ def train_one_epoch(
         total_policy_loss += metrics["policy_loss"]
         total_value_loss += metrics["value_loss"]
         total_bp_loss += metrics["blueprint_loss"]
+        total_log_c_loss += metrics["log_c_loss"]
+        total_conn_loss += metrics["conn_loss"]
         num_batches += 1
 
     denom = max(num_batches, 1)
@@ -333,4 +461,6 @@ def train_one_epoch(
         "policy_loss": total_policy_loss / denom,
         "value_loss": total_value_loss / denom,
         "blueprint_loss": total_bp_loss / denom,
+        "log_c_loss": total_log_c_loss / denom,
+        "conn_loss": total_conn_loss / denom,
     }

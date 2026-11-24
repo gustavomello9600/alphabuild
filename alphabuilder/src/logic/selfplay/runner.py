@@ -467,7 +467,11 @@ def run_episode(
         load_config=load_config,
         bc_type=config.bc_type,
     )
-    engine_name = "swin-unetr" if getattr(model, "use_swin", False) else "simple"
+    engine_name = getattr(
+        model,
+        "architecture",
+        "swin-unetr" if getattr(model, "use_swin", False) else "simple",
+    )
     game_info = GameInfo(
         game_id=state.game_id,
         neural_engine=engine_name,

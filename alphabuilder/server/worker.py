@@ -145,6 +145,18 @@ def read_checkpoint_metadata(path: Path) -> dict[str, Any]:
         return {}
 
 
+def _resolve_checkpoint_architecture(metadata: dict[str, Any]) -> str:
+    arch = metadata.get("architecture")
+    if isinstance(arch, str) and arch.strip():
+        norm = arch.strip().lower().replace("-", "_")
+        if norm in ("swin_unetr", "swinunetr"):
+            return "swin"
+        if norm in ("physuvit", "phys_uvit_3d", "physuvit3d"):
+            return "phys_uvit"
+        return norm
+    return "swin" if bool(metadata.get("use_swin", False)) else "simple"
+
+
 class ModelManager:
     """Owns the active checkpoint; only touched inside the ComputeWorker."""
 
@@ -179,7 +191,7 @@ class ModelManager:
             metadata = read_checkpoint_metadata(path)
             preview = {
                 key: metadata[key]
-                for key in ("use_swin", "feature_size", "epoch", "val_loss")
+                for key in ("architecture", "use_swin", "feature_size", "epoch", "val_loss")
                 if key in metadata and metadata[key] is not None
             }
             models.append(
@@ -202,7 +214,8 @@ class ModelManager:
         if path.suffix.lower() not in {".pt", ".pth"}:
             raise ApiError(400, "INVALID_INPUT", "model_id must reference a .pt/.pth file")
         metadata = read_checkpoint_metadata(path)
-        use_swin = bool(metadata.get("use_swin", False))
+        arch = _resolve_checkpoint_architecture(metadata)
+        use_swin = arch == "swin"
         if use_swin and not has_monai():
             raise ApiError(
                 501,
@@ -228,9 +241,9 @@ class ModelManager:
         info = {
             "loaded": True,
             "model_id": model_id,
-            "architecture": "swin" if use_swin else "simple",
+            "architecture": getattr(model, "architecture", arch),
             "feature_size": int(
-                metadata.get("feature_size", getattr(model, "feature_size", 24))
+                metadata.get("feature_size", getattr(model, "feature_size", 32 if arch == "phys_uvit" else 24))
             ),
             "in_channels": int(metadata.get("in_channels", getattr(model, "in_channels", 7))),
             "has_blueprint_head": bool(metadata.get("has_blueprint_head", True)),

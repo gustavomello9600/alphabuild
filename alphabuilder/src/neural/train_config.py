@@ -14,8 +14,12 @@ class TrainConfig:
     """Base training configuration for AlphaBuilder v3.3."""
 
     # Model architecture
+    architecture: str = "simple"
     use_swin: bool = False
     feature_size: int = 24
+    embed_dim: int = 192
+    transformer_depth: int = 5
+    num_heads: int = 6
     in_channels: int = 7
     out_channels: int = 2
 
@@ -27,10 +31,13 @@ class TrainConfig:
     warmup_epochs: int = 3
     grad_clip_norm: float = 1.0
 
-    # Loss weights (calibrated v3.3)
+    # Loss weights (calibrated v3.3 + v4.0 factored physics)
     lambda_policy: float = 1.0
     lambda_value: float = 2.0
     lambda_bp: float = 0.50
+    lambda_log_c: float = 0.0
+    lambda_conn: float = 0.0
+    lambda_sed: float = 0.0
 
     # DataLoader & Symmetry settings
     num_workers: int = 4
@@ -59,6 +66,12 @@ class TrainConfig:
     use_amp: bool = True
 
     def __post_init__(self):
+        if self.use_swin and self.architecture == "simple":
+            self.architecture = "swin"
+        if self.architecture == "swin":
+            self.use_swin = True
+        elif self.architecture == "phys_uvit":
+            self.use_swin = False
         Path(self.checkpoint_dir).mkdir(parents=True, exist_ok=True)
         Path(self.log_dir).mkdir(parents=True, exist_ok=True)
 
@@ -117,6 +130,66 @@ CONFIGS = {
         epochs=40,
         learning_rate=2e-4,
         warmup_epochs=3,
+        num_workers=4,
+        prefetch_factor=4,
+        use_amp=True,
+    ),
+    "local_phys_uvit": TrainConfig(
+        architecture="phys_uvit",
+        use_swin=False,
+        feature_size=32,
+        embed_dim=192,
+        transformer_depth=5,
+        num_heads=6,
+        batch_size=4,
+        epochs=20,
+        learning_rate=3e-4,
+        weight_decay=1e-2,
+        warmup_epochs=2,
+        lambda_log_c=0.20,
+        lambda_conn=0.25,
+        lambda_sed=0.0,
+        num_workers=0,
+        prefetch_factor=2,
+        pin_memory=False,
+        persistent_workers=False,
+        use_amp=False,
+        log_every_n_steps=50,
+    ),
+    "kaggle_t4_phys_uvit": TrainConfig(
+        architecture="phys_uvit",
+        use_swin=False,
+        feature_size=32,
+        embed_dim=192,
+        transformer_depth=5,
+        num_heads=6,
+        batch_size=32,
+        epochs=30,
+        learning_rate=3e-4,
+        weight_decay=1e-2,
+        warmup_epochs=3,
+        lambda_log_c=0.20,
+        lambda_conn=0.25,
+        lambda_sed=0.0,
+        num_workers=4,
+        prefetch_factor=4,
+        use_amp=True,
+    ),
+    "kaggle_t4_dual_phys_uvit": TrainConfig(
+        architecture="phys_uvit",
+        use_swin=False,
+        feature_size=32,
+        embed_dim=192,
+        transformer_depth=5,
+        num_heads=6,
+        batch_size=32,  # Per GPU (64 global under 2-rank DDP)
+        epochs=30,
+        learning_rate=3e-4,
+        weight_decay=1e-2,
+        warmup_epochs=3,
+        lambda_log_c=0.20,
+        lambda_conn=0.25,
+        lambda_sed=0.0,
         num_workers=4,
         prefetch_factor=4,
         use_amp=True,

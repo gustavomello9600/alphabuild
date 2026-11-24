@@ -9,10 +9,12 @@ Architecture with shared spatial encoder/decoder backbone and three heads:
 Supports SwinUNETR (MONAI, with full-resolution enc0 skip) and upgraded SimpleBackbone (RF >= 64).
 Uses GroupNorm (affine=True) everywhere instead of InstanceNorm3d so BC/force scales survive.
 """
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .phys_uvit import PhysUViT3D
 
 try:
     from monai.networks.nets.swin_unetr import SwinTransformer
@@ -94,6 +96,7 @@ class AlphaBuilderV31(nn.Module):
         self.out_channels = out_channels
         self.feature_size = feature_size
         self.use_swin = bool(use_swin)
+        self.architecture = "swin" if self.use_swin else "simple"
         # Spatial channels: raw input + 3 normalized CoordConv channels + 1 valid domain mask
         self.aug_in_channels = in_channels + 4
 
@@ -507,3 +510,58 @@ class SimplePolicyDecoder(nn.Module):
         global_emb = self.bottleneck_to_full(F.adaptive_avg_pool3d(bottleneck, 1).flatten(1))
         x = x + global_emb.view(x.shape[0], -1, 1, 1, 1)
         return x
+
+
+VALID_ARCHITECTURES = ("simple", "swin", "phys_uvit")
+
+
+def resolve_architecture(
+    config: Optional[Dict[str, Any]] = None,
+    use_swin: Optional[bool] = None,
+) -> str:
+    """Resolve canonical neural architecture name from checkpoint/run config."""
+    cfg = config or {}
+    arch = cfg.get("architecture")
+    if isinstance(arch, str) and arch.strip():
+        norm = arch.strip().lower().replace("-", "_").replace(" ", "_")
+        if norm in ("swin_unetr", "swinunetr"):
+            norm = "swin"
+        elif norm in ("physuvit", "phys_uvit_3d", "physuvit3d"):
+            norm = "phys_uvit"
+        if norm not in VALID_ARCHITECTURES:
+            raise ValueError(f"Unknown architecture: {arch!r}. Supported: {VALID_ARCHITECTURES}")
+        return norm
+    swin_flag = bool(use_swin) if use_swin is not None else bool(cfg.get("use_swin", False))
+    return "swin" if swin_flag else "simple"
+
+
+def build_model(
+    architecture: Optional[str] = None,
+    in_channels: int = 7,
+    out_channels: int = 2,
+    feature_size: int = 24,
+    use_swin: Optional[bool] = None,
+    embed_dim: int = 192,
+    transformer_depth: int = 5,
+    num_heads: int = 6,
+) -> nn.Module:
+    """Instantiate AlphaBuilder neural architecture cleanly across v3.3 and v4.0."""
+    arch = resolve_architecture(
+        {"architecture": architecture, "use_swin": use_swin} if architecture is not None else None,
+        use_swin=use_swin,
+    )
+    if arch == "phys_uvit":
+        return PhysUViT3D(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            feature_size=feature_size,
+            embed_dim=embed_dim,
+            transformer_depth=transformer_depth,
+            num_heads=num_heads,
+        )
+    return AlphaBuilderV31(
+        in_channels=in_channels,
+        out_channels=out_channels,
+        feature_size=feature_size,
+        use_swin=(arch == "swin"),
+    )

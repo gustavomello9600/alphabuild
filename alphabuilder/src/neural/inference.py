@@ -8,11 +8,11 @@ This module provides:
 """
 
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 
-from .model import AlphaBuilderV31
+from .model import AlphaBuilderV31, build_model, resolve_architecture
 
 
 def pad_to_target_centered(
@@ -102,6 +102,7 @@ class AlphaBuilderInference:
             self.epoch = getattr(self.backend, "epoch", -1)
             self.val_loss = getattr(self.backend, "val_loss", float("inf"))
             self.use_swin = getattr(self.backend, "use_swin", False)
+            self.architecture = getattr(self.backend, "architecture", "swin" if self.use_swin else "simple")
             return
 
         self.is_npu = False
@@ -119,14 +120,22 @@ class AlphaBuilderInference:
         self.epoch = checkpoint.get("epoch", -1) if isinstance(checkpoint, dict) else -1
         metrics = checkpoint.get("metrics", {}) if isinstance(checkpoint, dict) else {}
         self.val_loss = checkpoint.get("val_loss", metrics.get("loss", float("inf"))) if isinstance(checkpoint, dict) else float("inf")
-        self.use_swin = bool(self.config.get("use_swin", False))
+        self.architecture = resolve_architecture(self.config)
+        self.use_swin = self.architecture == "swin"
 
-        self.model = AlphaBuilderV31(
+        default_feat = 32 if self.architecture == "phys_uvit" else 24
+        self.model = build_model(
+            architecture=self.architecture,
             in_channels=int(self.config.get("in_channels", 7)),
             out_channels=int(self.config.get("out_channels", 2)),
-            feature_size=int(self.config.get("feature_size", 24)),
+            feature_size=int(self.config.get("feature_size", default_feat)),
             use_swin=self.use_swin,
+            embed_dim=int(self.config.get("embed_dim", 192)),
+            transformer_depth=int(self.config.get("transformer_depth", 5)),
+            num_heads=int(self.config.get("num_heads", 6)),
         )
+        self.feature_size = self.model.feature_size
+        self.in_channels = self.model.in_channels
 
         raw_sd = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
         state_dict = {
@@ -229,6 +238,32 @@ class AlphaBuilderInference:
         bp_probs = torch.sigmoid(pred_bp)[0, 0].cpu().numpy()
         return value, policy[0], policy[1], bp_probs
 
+    def predict_with_aux(
+        self,
+        state: np.ndarray,
+        compute_sed: bool = False,
+    ) -> Tuple[float, np.ndarray, np.ndarray, Dict[str, object]]:
+        """Predict (value, policy_add, policy_remove, aux_dict) including factored physics heads."""
+        if self.architecture != "phys_uvit" or self.is_npu:
+            val, p_add, p_rem, bp_probs = self.predict_with_blueprint(state)
+            return val, p_add, p_rem, {"blueprint_probs": bp_probs}
+
+        tensor, original_shape = self.preprocess(state)
+        with torch.no_grad():
+            pred_policy, pred_value, aux = self.model(tensor, return_aux=True, compute_sed=compute_sed)
+        self._sync()
+
+        value = float(pred_value.cpu().item())
+        policy = self.postprocess(pred_policy[0].cpu().numpy(), original_shape)
+        out_aux: Dict[str, object] = {
+            "blueprint_probs": torch.sigmoid(aux["blueprint"])[0, 0].cpu().numpy(),
+            "log_compliance": float(aux["log_compliance"][0, 0].cpu().item()),
+            "conn_prob": float(torch.sigmoid(aux["conn_logit"])[0, 0].cpu().item()),
+        }
+        if aux.get("sed_u") is not None:
+            out_aux["sed_u"] = aux["sed_u"][0].cpu().numpy()
+        return value, policy[0], policy[1], out_aux
+
     def predict_batch(
         self,
         states: List[np.ndarray],
@@ -270,6 +305,7 @@ class AlphaBuilderInference:
             f"  device={self.device},\n"
             f"  epoch={self.epoch},\n"
             f"  val_loss={self.val_loss:.4f},\n"
+            f"  architecture={self.architecture},\n"
             f"  use_swin={self.use_swin}\n"
             f")"
         )

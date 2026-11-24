@@ -158,6 +158,7 @@ class TopologyDatasetV31(Dataset):
         self._phases: Optional[np.ndarray] = None
         self._is_final: Optional[np.ndarray] = None
         self._is_connected: Optional[np.ndarray] = None
+        self._compliances: Optional[np.ndarray] = None
 
         # Legacy v1 containers
         self._v1_records: List[dict] = []
@@ -228,9 +229,14 @@ class TopologyDatasetV31(Dataset):
                 "final_is_connected": final_is_conn,
             }
 
+        cursor.execute("PRAGMA table_info(records)")
+        rec_cols = {row[1] for row in cursor.fetchall()}
+        has_compliance = "compliance" in rec_cols
+        comp_col_sql = ", compliance" if has_compliance else ", NULL AS compliance"
+
         query = (
             "SELECT episode_id, step, phase, density_blob, policy_add_blob, "
-            "policy_remove_blob, fitness_score, is_final_step, is_connected "
+            f"policy_remove_blob, fitness_score, is_final_step, is_connected{comp_col_sql} "
             "FROM records"
         )
         if self.phase_filter:
@@ -246,9 +252,10 @@ class TopologyDatasetV31(Dataset):
         phases_list: List[int] = []
         final_list: List[int] = []
         conn_list: List[int] = []
+        comp_list: List[float] = []
 
         for row in cursor:
-            ep_id, step, phase, density_blob, add_blob, rem_blob, fitness, is_final, is_conn = row
+            ep_id, step, phase, density_blob, add_blob, rem_blob, fitness, is_final, is_conn, comp = row
             ep_key = str(ep_id)
             ep_idx = ep_id_to_idx.get(ep_key)
             if ep_idx is None:
@@ -260,6 +267,8 @@ class TopologyDatasetV31(Dataset):
             phases_list.append(0 if phase == "GROWTH" else 1)
             final_list.append(1 if is_final else 0)
             conn_list.append(1 if is_conn else 0)
+            comp_val = float(comp) if (comp is not None and float(comp) > 0.0) else float("nan")
+            comp_list.append(comp_val)
 
             if self.preload_to_ram:
                 d0 = len(buf)
@@ -296,6 +305,7 @@ class TopologyDatasetV31(Dataset):
         self._phases = np.asarray(phases_list, dtype=np.uint8)
         self._is_final = np.asarray(final_list, dtype=np.uint8)
         self._is_connected = np.asarray(conn_list, dtype=np.uint8)
+        self._compliances = np.asarray(comp_list, dtype=np.float32)
 
     def _load_v1(self) -> None:
         conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
@@ -471,12 +481,42 @@ class TopologyDatasetV31(Dataset):
     def __getitem__(self, idx: int) -> dict:
         if self.schema_version == "v2":
             state, policy, blueprint, bp_valid, value, phase, is_final, is_connected = self._decode_v2_record(idx)
+            comp_raw = float(self._compliances[idx]) if self._compliances is not None else float("nan")
+            comp_valid = bool(np.isfinite(comp_raw) and comp_raw > 0.0 and is_connected)
+            log_compliance = float(np.log10(comp_raw)) if comp_valid else 0.0
+            conn_target = 1.0 if is_connected else 0.0
+            conn_valid = True
         else:
             state, policy, blueprint, bp_valid, value, phase, is_final, is_connected = self._decode_v1_record(idx)
+            comp_valid = False
+            log_compliance = 0.0
+            conn_target = 1.0 if is_connected else 0.0
+            conn_valid = False
 
         if self.augment:
-            state, policy, blueprint, bp_valid, value = self._apply_augmentation(
-                state, policy, blueprint, bp_valid, value, phase, is_final, is_connected
+            (
+                state,
+                policy,
+                blueprint,
+                bp_valid,
+                value,
+                log_compliance,
+                comp_valid,
+                conn_target,
+                conn_valid,
+            ) = self._apply_augmentation_v4(
+                state,
+                policy,
+                blueprint,
+                bp_valid,
+                value,
+                phase,
+                is_final,
+                is_connected,
+                log_compliance=log_compliance,
+                comp_valid=comp_valid,
+                conn_target=conn_target,
+                conn_valid=conn_valid,
             )
 
         if self.compute_legal_mask and state.shape[0] >= 7:
@@ -507,10 +547,85 @@ class TopologyDatasetV31(Dataset):
             "value": torch.tensor([value], dtype=torch.float32),
             "blueprint": torch.from_numpy(np.ascontiguousarray(blueprint)).float(),
             "blueprint_mask": torch.tensor(1.0 if bp_valid else 0.0, dtype=torch.float32),
+            "log_compliance": torch.tensor([log_compliance], dtype=torch.float32),
+            "compliance_mask": torch.tensor(1.0 if comp_valid else 0.0, dtype=torch.float32),
+            "conn_target": torch.tensor([conn_target], dtype=torch.float32),
+            "conn_mask": torch.tensor(1.0 if conn_valid else 0.0, dtype=torch.float32),
             "phase": phase,
             "is_final": is_final,
             "is_connected": is_connected,
         }
+
+    def _apply_augmentation_v4(
+        self,
+        state: np.ndarray,
+        policy: np.ndarray,
+        blueprint: np.ndarray,
+        bp_valid: bool,
+        value: float,
+        phase: str,
+        is_final: bool,
+        is_connected: bool,
+        log_compliance: float = 0.0,
+        comp_valid: bool = False,
+        conn_target: float = 0.0,
+        conn_valid: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, bool, float, float, bool, float, bool]:
+        """
+        Apply reformulated negative sampling (updating factored physics targets safely)
+        followed by 8x per-sample rigid flips.
+        """
+        # STEP 1: Reformulated Negative Sampling
+        if is_final:
+            if np.random.random() < 0.25:
+                new_state, new_policy, new_val = erosion_attack(state, policy, value)
+                if new_state is not state:
+                    state, policy, value = new_state, new_policy, new_val
+                    comp_valid = False
+                    conn_valid = False
+        elif phase == "REFINEMENT" and is_connected:
+            r = np.random.random()
+            if r < 0.04:
+                new_state, new_policy, new_val = load_multiplier(state, policy, value, k=3.0)
+                if new_val != value:
+                    state, policy, value = new_state, new_policy, new_val
+                    # Original 1x blueprint no longer describes optimal 3x design
+                    bp_valid = False
+                    # Exact linear elasticity scaling: C(3F) = 9 * C(F)
+                    if comp_valid:
+                        log_compliance = log_compliance + 2.0 * float(np.log10(3.0))
+            elif r < 0.08:
+                new_state, new_policy, new_val = sabotage(state, policy, value)
+                if new_state is not state:
+                    state, policy, value = new_state, new_policy, new_val
+                    comp_valid = False
+                    conn_valid = False
+            elif r < 0.14:
+                new_state, new_policy, new_val = saboteur(state, policy, value)
+                if new_state is not state:
+                    state, policy, value = new_state, new_policy, new_val
+                    comp_valid = False
+                    conn_valid = False
+
+        # STEP 2: 8x Rigid Reflections (preserve shape without square padding)
+        if np.random.random() < 0.5:
+            state, policy, blueprint = flip_x(state, policy, blueprint)
+        if np.random.random() < 0.5:
+            state, policy, blueprint = flip_y(state, policy, blueprint)
+        if np.random.random() < 0.5:
+            state, policy, blueprint = flip_z(state, policy, blueprint)
+
+        return (
+            state,
+            policy,
+            blueprint,
+            bp_valid,
+            value,
+            log_compliance,
+            comp_valid,
+            conn_target,
+            conn_valid,
+        )
 
     def _apply_augmentation(
         self,
@@ -523,36 +638,11 @@ class TopologyDatasetV31(Dataset):
         is_final: bool,
         is_connected: bool,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, bool, float]:
-        """
-        Apply reformulated negative sampling followed by 8x per-sample rigid flips.
-        (The final 2x rot90 is applied at batch level by `make_symmetry_collate_fn` -> 16x.)
-        """
-        # STEP 1: Reformulated Negative Sampling
-        if is_final:
-            if np.random.random() < 0.25:
-                state, policy, value = erosion_attack(state, policy, value)
-        elif phase == "REFINEMENT" and is_connected:
-            r = np.random.random()
-            if r < 0.04:
-                new_state, new_policy, new_val = load_multiplier(state, policy, value, k=3.0)
-                if new_val != value:
-                    state, policy, value = new_state, new_policy, new_val
-                    # Original 1x blueprint no longer describes optimal 3x design
-                    bp_valid = False
-            elif r < 0.08:
-                state, policy, value = sabotage(state, policy, value)
-            elif r < 0.14:
-                state, policy, value = saboteur(state, policy, value)
-
-        # STEP 2: 8x Rigid Reflections (preserve shape without square padding)
-        if np.random.random() < 0.5:
-            state, policy, blueprint = flip_x(state, policy, blueprint)
-        if np.random.random() < 0.5:
-            state, policy, blueprint = flip_y(state, policy, blueprint)
-        if np.random.random() < 0.5:
-            state, policy, blueprint = flip_z(state, policy, blueprint)
-
-        return state, policy, blueprint, bp_valid, value
+        """Backward-compatible wrapper returning the v3.3 5-tuple."""
+        s, p, b, bv, v, _, _, _, _ = self._apply_augmentation_v4(
+            state, policy, blueprint, bp_valid, value, phase, is_final, is_connected
+        )
+        return s, p, b, bv, v
 
     def get_memory_usage_mb(self) -> float:
         """Estimate RAM usage of preloaded buffers in megabytes."""
@@ -575,6 +665,7 @@ class TopologyDatasetV31(Dataset):
                 self._phases,
                 self._is_final,
                 self._is_connected,
+                self._compliances,
             ):
                 if arr is not None:
                     total_bytes += arr.nbytes
