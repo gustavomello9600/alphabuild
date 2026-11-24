@@ -101,7 +101,9 @@ No paradigma AlphaZero [`silver2018general`], expandir `160–800` nós de árvo
 
 ## 4. A Arquitetura Completa (`Phys-UViT 3D`) e Seus Mecanismos Internos
 
-Combinando os 5 princípios acima, obtemos o diagrama completo ponta a ponta abaixo:
+Combinando os 5 princípios acima, obtemos a ilustração volumétrica 3D completa de todas as camadas e, em seguida, o diagrama esquemático técnico ponta a ponta:
+
+![Ilustração 3D Completa da Arquitetura Phys-UViT 3D](figures/arch_06_phys_uvit_3d_illustration.png)
 
 ![Arquitetura Completa Phys-UViT 3D](figures/arch_03_macro_architecture.png)
 
