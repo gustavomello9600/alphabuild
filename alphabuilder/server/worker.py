@@ -405,6 +405,9 @@ class LiveSession:
         self._cancel = threading.Event()
         self._one_step = False
         self._mcts: Any = None
+        # Incremented on external state edits so an in-flight step computed
+        # from the previous density can be discarded instead of overwriting it.
+        self._state_generation = 0
         self._runner = threading.Thread(
             target=self._run_loop, name=f"ab-session-{self.session_id[-6:]}", daemon=True
         )
@@ -513,6 +516,7 @@ class LiveSession:
                 self.bc_type = bc_type
             self.bc_masks = generate_bc_masks(self.dims, self.bc_type)
             self.forces = generate_forces(self.dims, self.load_config)
+            self._state_generation += 1
             self._mcts = None
         self.publish_state()
 
@@ -553,6 +557,7 @@ class LiveSession:
                     bc_masks = tuple(m.copy() for m in self.bc_masks)
                     forces = self.forces.copy()
                     include_blueprint = self.include_blueprint
+                    generation = self._state_generation
                 if paused and not one_step:
                     self._pause.wait(0.05)
                     continue
@@ -570,6 +575,10 @@ class LiveSession:
                     priority=1,
                 ).result()
                 with self._lock:
+                    if generation != self._state_generation:
+                        # The user edited the state while this step was running:
+                        # discard the stale result and recompute from the edit.
+                        continue
                     self.density = outcome.density
                     self.phase = outcome.phase
                     self.step = outcome.step
@@ -914,10 +923,13 @@ class LiveSession:
                 top_k_expansion=self.request.phase1_mcts.top_k_expansion,
                 predict_batch_fn=predict_batch_fn,
             )
-        self._mcts.predict_fn = predict_fn
-        self._mcts.predict_batch_fn = predict_batch_fn
-        self._mcts.config = self._mcts_config(phase)
-        result = self._mcts.search(density, bc_masks, force_tuple)
+        # Hold a local reference: an edit can reset self._mcts while this step
+        # is still running, and the stale outcome is discarded by generation.
+        mcts = self._mcts
+        mcts.predict_fn = predict_fn
+        mcts.predict_batch_fn = predict_batch_fn
+        mcts.config = self._mcts_config(phase)
+        result = mcts.search(density, bc_masks, force_tuple)
 
         valid_add, valid_remove = get_legal_moves(
             density, 0.5, bc_masks=bc_masks, forces=force_tuple
@@ -932,7 +944,7 @@ class LiveSession:
 
         pv_branches = select_pv_branches(
             result.root,
-            max_actions=self._mcts.config.action_batch_size,
+            max_actions=mcts.config.action_batch_size,
             max_depth=4,
         )
         if pv_branches:
@@ -1067,7 +1079,7 @@ class LiveSession:
             "num_simulations": int(result.num_simulations),
             "nodes_expanded": 0,
             "max_depth": 0,
-            "cache_hits": len(getattr(self._mcts, "eval_cache", {})),
+            "cache_hits": len(getattr(mcts, "eval_cache", {})),
             "top8_concentration": 0.0,
             "refutation": False,
         }
@@ -1226,21 +1238,21 @@ class LiveSession:
             end_reason = "MAX_STEPS"
 
         if reset_tree:
-            self._mcts.reset()
+            mcts.reset()
         elif actions:
             if len(pv_branches) == 1:
                 for act, _, _ in pv_branches[0]:
-                    self._mcts.step(act)
+                    mcts.step(act)
                 if phase == "GROWTH" and alpha_guide > 0.0 and abs(phi_after - phi_before) > 1e-9:
-                    self._mcts.eval_cache = {}
+                    mcts.eval_cache = {}
             elif not pv_branches and len(actions) == 1:
-                self._mcts.step(actions[0])
+                mcts.step(actions[0])
                 if phase == "GROWTH" and alpha_guide > 0.0 and abs(phi_after - phi_before) > 1e-9:
-                    self._mcts.eval_cache = {}
+                    mcts.eval_cache = {}
             else:
-                self._mcts.reset()
+                mcts.reset()
         else:
-            self._mcts.clear_tree()
+            mcts.clear_tree()
 
         return _StepOutcome(
             density=new_density,
