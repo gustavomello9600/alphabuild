@@ -43,12 +43,14 @@ export class OverlayLayer {
       transparent: true,
       opacity: 0.55,
       depthWrite: false,
+      depthTest: false,
     }),
     policyRem: new THREE.MeshBasicMaterial({
       color: "#FF2466",
       transparent: true,
       opacity: 0.55,
       depthWrite: false,
+      depthTest: false,
     }),
     policyWire: new THREE.MeshBasicMaterial({
       color: "#F5B700",
@@ -56,35 +58,42 @@ export class OverlayLayer {
       transparent: true,
       opacity: 0.55,
       depthWrite: false,
+      depthTest: false,
     }),
     mctsAdd: new THREE.MeshBasicMaterial({
       color: "#00F0FF",
       transparent: true,
       opacity: 0.42,
       depthWrite: false,
+      depthTest: false,
     }),
     mctsRem: new THREE.MeshBasicMaterial({
       color: "#F5B700",
       transparent: true,
       opacity: 0.42,
       depthWrite: false,
+      depthTest: false,
     }),
     diffAdd: new THREE.MeshBasicMaterial({
       color: "#00E599",
       transparent: true,
       opacity: 0.8,
       depthWrite: false,
+      depthTest: false,
     }),
     diffRem: new THREE.MeshBasicMaterial({
       color: "#FF2466",
       transparent: true,
       opacity: 0.8,
       depthWrite: false,
+      depthTest: false,
     }),
     selected: new THREE.MeshBasicMaterial({
       color: "#EEF2F8",
       transparent: true,
       opacity: 0.92,
+      depthWrite: false,
+      depthTest: false,
     }),
   };
 
@@ -106,6 +115,9 @@ export class OverlayLayer {
       mesh.count = 0;
       mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
       mesh.frustumCulled = false;
+      // Analytic overlays (especially REMOVE candidates inside solid voxels)
+      // must remain visible through the opaque structure.
+      mesh.renderOrder = 20;
       mesh.name = key;
       this.group.add(mesh);
       pool = { mesh, capacity, key };
@@ -168,6 +180,8 @@ export class OverlayLayer {
     });
     const sprite = new THREE.Sprite(material);
     sprite.scale.set(1.8, 0.9, 1);
+    // Keep PV labels above the x-ray overlay boxes.
+    sprite.renderOrder = 30;
     return sprite;
   }
 

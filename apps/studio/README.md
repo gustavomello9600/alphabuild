@@ -85,6 +85,7 @@ Ao revisar um frame antigo, o Estúdio fica em modo leitura; volte ao vivo para 
 - No Estúdio, **arrastar com o botão esquerdo orbita a câmera e nunca cria voxels**; um clique curto (sem arrastar) aplica a ferramenta de pintura/remoção/suporte.
 - Clique ou arraste no filmstrip para saltar imediatamente ao frame correspondente; a reprodução é pausada durante o scrub.
 - A lente **Refutação** compara o argmax da Policy Head com a ação mais visitada pelo MCTS e mostra coordenadas, `N` e `Q` no painel MCTS & PV.
+- As lentes **Policy** e **Diff de decisão** desenham candidatos `REMOVE` e voxels removidos em x-ray, sem serem ocultados pela malha sólida ou pela profundidade da câmera.
 
 ## Tela cheia
 
