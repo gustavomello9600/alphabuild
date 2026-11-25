@@ -660,13 +660,333 @@ def build_fig05_selfplay_projections_and_scaling_laws(eval_data: dict) -> None:
     _save(fig, "fig05_selfplay_projections_and_scaling_laws.png")
 
 
+def _make_binary_truss_s1() -> np.ndarray:
+    """Reconstruct the exact dolfinx/fast_amg pure 0/1 binary truss witness on S1 (V=15.37%, C~356.4)."""
+    from alphabuilder.src.logic.harvest.generators import get_load_region_bounds
+
+    lc = {"x": 63, "y": 16, "z_start": 3, "z_end": 5, "bc_type": "FULL_CLAMP"}
+    lx, y0, y1, z0, z1 = get_load_region_bounds((64, 32, 8), lc)
+    g = np.zeros((64, 32, 8), dtype=np.float32)
+    for x in range(64):
+        t = x / 63.0
+        y_bot = int(round(0 + t * 14))
+        y_top = int(round(31 - t * 14))
+        g[x, y_bot : min(32, y_bot + 3), 2:6] = 1.0
+        g[x, max(0, y_top - 2) : y_top + 1, 2:6] = 1.0
+        if x % 16 == 0 or x == 63:
+            g[x, y_bot : y_top + 1, 2:6] = 1.0
+    for bay in range(4):
+        x0_b, x1_b = bay * 16, min(63, (bay + 1) * 16)
+        for s in np.linspace(0, 1, 32):
+            xx = int(round(x0_b + s * (x1_b - x0_b)))
+            t = xx / 63.0
+            yb = int(round(t * 14))
+            yt = int(round(31 - t * 14))
+            y_d1 = int(round(yb + s * (yt - yb)))
+            y_d2 = int(round(yt - s * (yt - yb)))
+            g[xx, max(0, y_d1 - 1) : min(32, y_d1 + 1), 2:6] = 1.0
+            g[xx, max(0, y_d2 - 1) : min(32, y_d2 + 1), 2:6] = 1.0
+    g[max(0, lx - 1) : lx + 1, max(0, y0 - 1) : min(32, y1 + 1), max(0, z0 - 1) : min(8, z1 + 1)] = 1.0
+    return g
+
+
+def build_fig06_real_3d_geometries_comparison(eval_data: dict) -> None:
+    """
+    Fig 06: Grade 4x4 comparando geometrias 3D reais extraidas de `eval_inference_v4_stage5.db`
+    (projeção lateral XY média em Z + corte transversal YZ em x=32).
+    """
+    from alphabuilder.src.logic.storage import deserialize_array
+
+    ep30_data = _load_json(EVAL_EP30_JSON) if EVAL_EP30_JSON.exists() else {"episodes": []}
+    ep30_by_sc = {e["scenario_id"]: e for e in ep30_data.get("episodes", [])}
+    phys_by_sc = {e["scenario_id"]: e for e in eval_data["episodes"]}
+    sb = eval_data["simp_baselines"]
+
+    scens = [
+        ("S1_cantilever_long_center", "S1: Cantilever Longa\n(x=63, y=16, FULL)"),
+        ("S2_cantilever_tip_bottom", "S2: Ponta Inferior\n(x=63, y=6, FULL)"),
+        ("S4_rail_xy_center", "S4: Guia RAIL_XY\n(x=58, y=16, RAIL)"),
+        ("S6_short_deep_clamp", "S6: Curta Profunda\n(x=36, y=16, FULL)"),
+    ]
+    cols = ["SIMP Contínuo\n(FEniTop ref.)", "SIMP Binário\n(rho > 0.50)", "Simple ep30\n(Stage 3 Baseline)", "Phys-UViT ep19\n(Stage 5C)"]
+
+    fig, axes = plt.subplots(4, 4, figsize=(16.0, 9.6), constrained_layout=True)
+    conn = sqlite3.connect(f"file:{EVAL_DB}?mode=ro", uri=True)
+    try:
+        for r_idx, (sc_id, r_lbl) in enumerate(scens):
+            row_s = conn.execute("SELECT density_blob FROM game_steps WHERE game_id=? ORDER BY step DESC LIMIT 1", (f"simp__{sc_id}",)).fetchone()
+            row_e = conn.execute("SELECT density_blob FROM game_steps WHERE game_id=? ORDER BY step DESC LIMIT 1", (f"ep30__{sc_id}",)).fetchone()
+            row_p = conn.execute("SELECT density_blob FROM game_steps WHERE game_id=? ORDER BY step DESC LIMIT 1", (f"phys_uvit_ep19__{sc_id}",)).fetchone()
+
+            rho_cont = deserialize_array(row_s[0]).astype(np.float32)
+            rho_bin = (rho_cont > 0.5).astype(np.float32)
+            rho_ep30 = deserialize_array(row_e[0]).astype(np.float32)
+            rho_phys = deserialize_array(row_p[0]).astype(np.float32)
+
+            s_base = sb[sc_id]
+            e_meta = ep30_by_sc.get(sc_id, {})
+            p_meta = phys_by_sc[sc_id]
+
+            panels = [
+                (rho_cont, "Greens", f"V={s_base['vol_cont']*100:.1f}% | C={s_base['comp_cont']:,.0f}\nScore={s_base['reward_cont']:+.3f} | Iy={s_base['geometry']['inertia_y_norm']:.3f}"),
+                (rho_bin, "Reds" if not s_base["is_connected_bin"] else "Oranges", f"V={s_base['vol_bin']*100:.1f}% | C={s_base['comp_bin']:,.0f}\nScore={s_base['reward_bin']:+.3f} | {'QUEBRADO' if not s_base['is_connected_bin'] else 'Conectado'}"),
+                (rho_ep30, "YlOrBr", f"V={e_meta.get('final_volume',0)*100:.1f}% | C={e_meta.get('final_compliance',0):,.0f}\nScore={e_meta.get('final_score',0):+.3f} | isl={e_meta.get('geometry',{}).get('n_islands',1)}, ovX={e_meta.get('geometry',{}).get('overshoot_frac',0)*100:.1f}%"),
+                (rho_phys, "Blues", f"V={p_meta['final_volume']*100:.1f}% | C={p_meta['final_compliance']:,.0f}\nScore={p_meta['final_score']:+.3f} | Iy={p_meta['geometry']['inertia_y_norm']:.3f}, ovX=0%"),
+            ]
+
+            for c_idx, (vol3d, cmap_name, subtitle) in enumerate(panels):
+                ax = axes[r_idx, c_idx]
+                xy = vol3d.mean(axis=2).T  # (32, 64)
+                yz = vol3d[min(32, vol3d.shape[0] - 1), :, :]  # (32, 8)
+                # Build canvas with XY [0..63] + gap [64..66] + YZ cross-section [67..74]
+                canvas = np.full((32, 76), np.nan, dtype=np.float32)
+                canvas[:, :64] = xy
+                canvas[:, 67:75] = yz
+                cmap_obj = plt.get_cmap(cmap_name).copy()
+                cmap_obj.set_bad(color="#F1F5F9")
+                ax.imshow(canvas, origin="lower", cmap=cmap_obj, vmin=0.0, vmax=1.0, aspect="auto")
+                ax.axvline(64.5, color="#64748B", lw=1.0, ls=":")
+                if r_idx == 0:
+                    ax.text(70.5, 30.2, "YZ", fontsize=7.0, fontweight="bold", ha="center", va="top", color="#334155")
+                # Draw support x=0 and load x-marker
+                lx = int(sc_id == "S4_rail_xy_center") * 58 + int(sc_id == "S6_short_deep_clamp") * 36 + int(sc_id in ("S1_cantilever_long_center", "S2_cantilever_tip_bottom")) * 63
+                ly = 6 if "S2" in sc_id else 16
+                ax.axvline(0.5, color="#0F172A", lw=2.0)
+                ax.scatter([lx], [ly], s=32, color="#DC2626", marker="v", zorder=5)
+
+                ax.set_xticks([])
+                ax.set_yticks([])
+                if r_idx == 0:
+                    ax.set_title(cols[c_idx], fontsize=10.2, fontweight="bold", pad=6)
+                if c_idx == 0:
+                    ax.set_ylabel(r_lbl, fontsize=9.0, fontweight="bold")
+                ax.text(
+                    0.02,
+                    0.96,
+                    subtitle,
+                    transform=ax.transAxes,
+                    va="top",
+                    ha="left",
+                    fontsize=7.3,
+                    bbox=dict(boxstyle="round,pad=0.22", facecolor="#FFFFFF", alpha=0.88, edgecolor="#CBD5E1", lw=0.6),
+                )
+    finally:
+        conn.close()
+
+    fig.suptitle(
+        "Geometrias 3D Reais Geradas no Stage 5C: Projeção Lateral XY (esq.) + Seção Transversal YZ em x=32 (dir.)",
+        fontsize=12.6,
+        fontweight="bold",
+    )
+    _save(fig, "fig06_real_3d_geometries_comparison.png")
+
+
+def build_fig07_sed_field_and_counterfactual_surgery() -> None:
+    """
+    Fig 07: Campo exato de Densidade de Energia de Deformação (SED_e via fast_amg)
+    em S1 para Phys-UViT ep19 vs Treliça Binária 0/1 + seleção de voxels mortos p/ Probes.
+    """
+    from alphabuilder.src.logic.mcts.legal_moves import get_legal_remove_moves
+    from alphabuilder.src.logic.harvest.generators import generate_bc_masks
+    from alphabuilder.src.logic.selfplay.fast_fem import evaluate_fem_fast
+    from alphabuilder.src.logic.storage import deserialize_array
+
+    conn = sqlite3.connect(f"file:{EVAL_DB}?mode=ro", uri=True)
+    try:
+        blob = conn.execute(
+            "SELECT density_blob FROM game_steps WHERE game_id='phys_uvit_ep19__S1_cantilever_long_center' ORDER BY step DESC LIMIT 1"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    d_phys = deserialize_array(blob).astype(np.float32)
+    d_truss = _make_binary_truss_s1()
+    cfg_s1 = {"x": 63, "y": 16, "z_start": 3, "z_end": 5, "bc_type": "FULL_CLAMP"}
+    res_p = evaluate_fem_fast(d_phys, cfg_s1)
+    res_t = evaluate_fem_fast(d_truss, cfg_s1)
+    print(f"fig07 SED verify | Phys S1 C={res_p.compliance:.2f} | Binary Truss C={res_t.compliance:.2f} V={res_t.vol_frac*100:.2f}%")
+
+    # Sum SED over Z for XY visualization; mask voids as NaN so background renders light grey
+    sed_p_xy = np.where(d_phys.max(axis=2).T > 0.5, np.log10(1.0 + 1000.0 * res_p.sed_map.sum(axis=2).T), np.nan)
+    sed_t_xy = np.where(d_truss.max(axis=2).T > 0.5, np.log10(1.0 + 1000.0 * res_t.sed_map.sum(axis=2).T), np.nan)
+
+    vmax = max(float(np.nanmax(sed_p_xy)), float(np.nanmax(sed_t_xy)))
+    cmap_sed = plt.get_cmap("inferno").copy()
+    cmap_sed.set_bad(color="#F1F5F9")
+
+    fig = plt.figure(figsize=(15.8, 5.2), constrained_layout=True)
+    gs = GridSpec(1, 3, figure=fig, width_ratios=[1.15, 1.15, 1.0])
+
+    ax1 = fig.add_subplot(gs[0, 0])
+    im1 = ax1.imshow(sed_p_xy, origin="lower", cmap=cmap_sed, vmin=0.0, vmax=vmax, aspect="auto")
+    ax1.set_title(f"A. Phys-UViT ep19 em S1 (C={res_p.compliance:,.0f} J, V=8.89%)\nConcentração Severa no Engaste Estreito")
+    ax1.set_xlabel("Coordenada X (Engaste x=0 -> Carga x=63)")
+    ax1.set_ylabel("Coordenada Y (Altura Útil)")
+    ax1.scatter([63], [16], color="#38BDF8", s=60, marker="<", edgecolor="white", zorder=5)
+
+    ax2 = fig.add_subplot(gs[0, 1])
+    im2 = ax2.imshow(sed_t_xy, origin="lower", cmap=cmap_sed, vmin=0.0, vmax=vmax, aspect="auto")
+    ax2.set_title(f"B. Treliça Binária 0/1 (C={res_t.compliance:.1f} J, V=15.37%)\nBanzos Afastados Distribuem Energia Uniformemente")
+    ax2.set_xlabel("Coordenada X")
+    ax2.set_ylabel("Coordenada Y")
+    ax2.scatter([63], [16], color="#38BDF8", s=60, marker="<", edgecolor="white", zorder=5)
+    fig.colorbar(im2, ax=[ax1, ax2], label=r"$\log_{10}(1 + 1000 \cdot \sum_z \mathrm{SED}_e)$", pad=0.02, fraction=0.025)
+
+    # Panel C: Sorted per-voxel SED spectrum + bottom-16 counterfactual REMOVE probe candidates
+    ax3 = fig.add_subplot(gs[0, 2])
+    mx, my, mz = generate_bc_masks((64, 32, 8), "FULL_CLAMP")
+    forces_s1 = np.zeros((3, 64, 32, 8), dtype=np.float32)
+    forces_s1[1, 63, 15:17, 3:5] = -1.0
+    legal_rem = get_legal_remove_moves(d_phys, threshold=0.5, bc_masks=(mx, my, mz), forces=(forces_s1[0], forces_s1[1], forces_s1[2])) > 0.5
+    sed_p_sorted = np.sort(res_p.sed_map[d_phys > 0.5])
+    sed_t_sorted = np.sort(res_t.sed_map[d_truss > 0.5])
+    sed_rem_legal = np.sort(res_p.sed_map[legal_rem])
+
+    ax3.plot(np.linspace(0, 100, len(sed_p_sorted)), sed_p_sorted, color=COLORS["phys"], lw=2.2, label="Phys-UViT ep19 (1,456 voxels)")
+    ax3.plot(np.linspace(0, 100, len(sed_t_sorted)), sed_t_sorted, color=COLORS["stage6"], lw=2.2, label="Treliça Binária 0/1 (2,518 voxels)")
+    if len(sed_rem_legal) >= 16:
+        pct_cutoff = 100.0 * 16.0 / len(sed_p_sorted)
+        ax3.axvspan(0, pct_cutoff * 3.5, color="#FEE2E2", alpha=0.65, label="Zona Alvo Probes SED (menor SED)")
+        ax3.scatter([pct_cutoff], [sed_rem_legal[15]], color=COLORS["simp_bin"], s=55, zorder=6)
+        ax3.annotate(
+            f"Top-16 remoção legal\nSED <= {sed_rem_legal[15]:.2e} J\n(vs pico {sed_p_sorted[-1]:.1f} J)",
+            xy=(pct_cutoff, sed_rem_legal[15]),
+            xytext=(18.0, 2e-3),
+            fontsize=7.9,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#FEF2F2", edgecolor=COLORS["simp_bin"], lw=0.8),
+            arrowprops=dict(arrowstyle="->", color=COLORS["simp_bin"], lw=1.1),
+        )
+
+    ax3.set_yscale("log")
+    ax3.set_xlim(-1, 101)
+    ax3.set_ylim(1e-7, 2e3)
+    ax3.set_xlabel("Percentil dos Voxels Sólidos Ordenados por SED [%]")
+    ax3.set_ylabel("Energia por Voxel SED_e [J] (escala log)")
+    ax3.set_title("C. Espectro SED_e e Seleção Cirúrgica Stage 6")
+    ax3.grid(color=COLORS["grid"], linewidth=0.7)
+    ax3.legend(loc="lower right", fontsize=7.6, frameon=True)
+
+    fig.suptitle(
+        "Física Microscópica via SED_e (fast_amg): Por Que Probes Contrafactuais Enxergam Massa Ociosa",
+        fontsize=12.5,
+        fontweight="bold",
+    )
+    _save(fig, "fig07_sed_field_and_counterfactual_surgery.png")
+
+
+def build_fig08_training_dynamics_stage3_vs_stage5() -> None:
+    """
+    Fig 08: Curvas reais das 30 épocas do Stage 3 (`Simple`) vs Stage 5 (`Phys-UViT 3D`)
+    evidenciando convergência das cabeças físicas e o Teto de Imitação Supervisionada.
+    """
+    h3 = _load_json(REPO_ROOT / "data" / "analysis" / "stage3_simple_metrics_history.json")
+    h5 = _load_json(REPO_ROOT / "data" / "analysis" / "stage5_phys_uvit_metrics_history.json")
+
+    ep3 = np.array([r["epoch"] for r in h3])
+    ep5 = np.array([r["epoch"] for r in h5])
+
+    fig, axes = plt.subplots(2, 2, figsize=(14.4, 7.4), constrained_layout=True)
+
+    # Panel A: Val Core Loss
+    ax = axes[0, 0]
+    ax.plot(ep3, [r["val"]["loss"] for r in h3], color=COLORS["ep30"], lw=2.2, marker="s", ms=3.8, label="Simple (Stage 3 Val Core)")
+    ax.plot(ep5, [r["val"]["core_loss"] for r in h5], color=COLORS["phys"], lw=2.3, marker="o", ms=4.0, label="Phys-UViT 3D (Stage 5 Val Core)")
+    ax.axvline(19, color=COLORS["simp_cont"], ls="--", lw=1.4)
+    ax.scatter([19], [h5[18]["val"]["core_loss"]], color=COLORS["simp_cont"], s=75, zorder=6, label=f"Melhor Ep 19 ({h5[18]['val']['core_loss']:.4f}, -4.2%)")
+    ax.set_title("A. Perda Principal de Validação (Policy + Value + Blueprint)")
+    ax.set_xlabel("Época")
+    ax.set_ylabel("Val Core Loss")
+    ax.grid(color=COLORS["grid"], linewidth=0.7)
+    ax.legend(loc="upper right", fontsize=8.0, frameon=True)
+
+    # Panel B: Value MAE
+    ax = axes[0, 1]
+    ax.plot(ep3, [r["val"]["value_mae"] for r in h3], color=COLORS["ep30"], lw=2.2, marker="s", ms=3.8, label="Simple Value MAE")
+    ax.plot(ep5, [r["val"]["value_mae"] for r in h5], color=COLORS["phys"], lw=2.3, marker="o", ms=4.0, label="Phys-UViT 3D Value MAE")
+    ax.axvline(19, color=COLORS["simp_cont"], ls="--", lw=1.4)
+    ax.text(19.5, 0.025, f"Ep 19: MAE={h5[18]['val']['value_mae']:.4f}\n(mas OOD Bias=+0.463\nsem Self-Play!)", fontsize=8.1, bbox=dict(boxstyle="round,pad=0.3", facecolor="#FEFCE8", edgecolor="#CA8A04"))
+    ax.set_title("B. Erro Médio Absoluto de Valor In-Distribution (MAE)")
+    ax.set_xlabel("Época")
+    ax.set_ylabel("Value MAE")
+    ax.grid(color=COLORS["grid"], linewidth=0.7)
+    ax.legend(loc="upper right", fontsize=8.0, frameon=True)
+
+    # Panel C: Blueprint Dice & Policy Top-1 Accuracy
+    ax = axes[1, 0]
+    ax.plot(ep3, [r["val"]["blueprint_dice"] * 100 for r in h3], color=COLORS["ep30"], lw=2.0, ls="--", label="Simple Blueprint Dice [%]")
+    ax.plot(ep5, [r["val"]["blueprint_dice"] * 100 for r in h5], color=COLORS["phys"], lw=2.3, label="Phys-UViT Blueprint Dice [%]")
+    ax.plot(ep3, [r["val"]["policy_top1_acc"] * 100 for r in h3], color="#F59E0B", lw=1.7, ls=":", label="Simple Policy Top-1 [%]")
+    ax.plot(ep5, [r["val"]["policy_top1_acc"] * 100 for r in h5], color=COLORS["stage6"], lw=2.0, label="Phys-UViT Policy Top-1 [%]")
+    ax.axvline(19, color=COLORS["simp_cont"], ls="--", lw=1.3)
+    ax.set_title("C. Convergência Estrutural (Blueprint Dice 91% e Policy Top-1)")
+    ax.set_xlabel("Época")
+    ax.set_ylabel("Acurácia / Dice [%]")
+    ax.grid(color=COLORS["grid"], linewidth=0.7)
+    ax.legend(loc="lower right", fontsize=7.8, frameon=True)
+
+    # Panel D: Factored Physics Heads (log10 C MAE & Conn Acc)
+    ax = axes[1, 1]
+    lc_mae = [r["val"]["log_c_mae"] for r in h5]
+    conn_acc = [r["val"]["conn_acc"] * 100 for r in h5]
+    ax2 = ax.twinx()
+    l1 = ax.plot(ep5, lc_mae, color=COLORS["simp_bin"], lw=2.3, marker="o", ms=3.8, label="log10(C) MAE In-Dist [décadas]")
+    l2 = ax2.plot(ep5, conn_acc, color=COLORS["simp_cont"], lw=2.2, ls="--", marker="^", ms=4.0, label="Acurácia Conectividade [%]")
+    ax.axvline(19, color=COLORS["simp_cont"], ls="--", lw=1.3)
+    ax.set_title("D. Cabeças Físicas Fatoradas (Stage 5 Phys-UViT 3D)")
+    ax.set_xlabel("Época")
+    ax.set_ylabel("log10(C) MAE [décadas]", color=COLORS["simp_bin"])
+    ax2.set_ylabel("Acurácia Conectividade [%]", color=COLORS["simp_cont"])
+    ax.set_ylim(0.022, 0.132)
+    ax2.set_ylim(99.86, 100.015)
+    ax.grid(color=COLORS["grid"], linewidth=0.7)
+    lines = l1 + l2
+    labels = [l.get_label() for l in lines]
+    ax.legend(lines, labels, loc="center right", bbox_to_anchor=(0.98, 0.56), fontsize=7.9, frameon=True)
+    ax.text(
+        0.34,
+        0.79,
+        f"Teto de Imitação Supervisionada:\n"
+        f"log10(C) cai até {min(lc_mae):.4f} décadas In-Dist,\n"
+        f"mas sofre shift para 1.103 décadas em rolagens OOD.",
+        transform=ax.transAxes,
+        fontsize=7.9,
+        va="center",
+        bbox=dict(boxstyle="round,pad=0.32", facecolor="#FFF1F2", edgecolor=COLORS["simp_bin"], lw=0.8),
+    )
+
+    fig.suptitle(
+        "Dinâmica Real de Treinamento (30 Épocas, 2x T4): Stage 3 Simple vs. Stage 5 Phys-UViT 3D",
+        fontsize=12.6,
+        fontweight="bold",
+    )
+    _save(fig, "fig08_training_dynamics_stage3_vs_stage5.png")
+
+
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Generate AlphaBuilder Master Study Charts.")
+    parser.add_argument("--only", type=str, default="", help="Comma-separated figure numbers e.g. 6,7,8")
+    args = parser.parse_args()
+    only = {int(x.strip()) for x in args.only.split(",") if x.strip()} if args.only else set(range(1, 9))
+
     eval_data = _load_json(EVAL_JSON)
-    build_fig01_compliance_gap_autopsy(eval_data)
-    build_fig02_reward_landscape_and_overtaking_path(eval_data)
-    build_fig03_ood_blindness_diagnosis()
-    build_fig04_four_tier_curriculum_and_selfplay_loop()
-    build_fig05_selfplay_projections_and_scaling_laws(eval_data)
+    if 1 in only:
+        build_fig01_compliance_gap_autopsy(eval_data)
+    if 2 in only:
+        build_fig02_reward_landscape_and_overtaking_path(eval_data)
+    if 3 in only:
+        build_fig03_ood_blindness_diagnosis()
+    if 4 in only:
+        build_fig04_four_tier_curriculum_and_selfplay_loop()
+    if 5 in only:
+        build_fig05_selfplay_projections_and_scaling_laws(eval_data)
+    if 6 in only:
+        build_fig06_real_3d_geometries_comparison(eval_data)
+    if 7 in only:
+        build_fig07_sed_field_and_counterfactual_surgery()
+    if 8 in only:
+        build_fig08_training_dynamics_stage3_vs_stage5()
 
 
 if __name__ == "__main__":
