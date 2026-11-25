@@ -704,6 +704,11 @@ def run_neural_mcts_episode(
     last_recorded_step = -1
     last_valid_compliance: Optional[float] = None
     last_final_score = 0.0
+    is_phys_uvit = getattr(model, "architecture", "") == "phys_uvit"
+    p2_log_c_preds: List[float] = []
+    p2_log_c_true: List[float] = []
+    p1_conn_probs: List[float] = []
+    p2_conn_probs: List[float] = []
 
     def _compute_mcts_diagnostics(result: SearchResult, pa: np.ndarray, pr: np.ndarray) -> Tuple[float, bool, int]:
         vdist = result.visit_distribution or {}
@@ -736,7 +741,23 @@ def run_neural_mcts_episode(
         phi_root[0], _ = calculate_pbrs_potential(state.density, bc_tuple, force_tuple, load_cfg)
         state_tensor = build_state_tensor(state.density, bc_tuple, force_tuple)
 
-        if state.current_step == 0:
+        step_log_c: Optional[float] = None
+        if is_phys_uvit:
+            raw_net_val, policy_add, policy_remove, step_aux = model.predict_with_aux(state_tensor)
+            step_bp = step_aux.get("blueprint_probs")
+            step_log_c = step_aux.get("log_compliance")  # type: ignore[assignment]
+            step_conn_prob = step_aux.get("conn_prob")
+            if state.current_step == 0:
+                bp_step0 = step_bp  # type: ignore[assignment]
+                step0_val_raw = float(raw_net_val)
+            elif cur_phase == Phase.REFINEMENT and bp_conn is None:
+                bp_conn = step_bp  # type: ignore[assignment]
+            if step_conn_prob is not None:
+                if cur_phase == Phase.GROWTH:
+                    p1_conn_probs.append(float(step_conn_prob))  # type: ignore[arg-type]
+                else:
+                    p2_conn_probs.append(float(step_conn_prob))  # type: ignore[arg-type]
+        elif state.current_step == 0:
             raw_net_val, policy_add, policy_remove, bp_step0 = model.predict_with_blueprint(state_tensor)
             step0_val_raw = float(raw_net_val)
         elif cur_phase == Phase.REFINEMENT and bp_conn is None:
@@ -789,6 +810,9 @@ def run_neural_mcts_episode(
                         compliance_history.append(compliance)
                         p2_value_preds.append(float(raw_net_val))
                         p2_fem_rewards.append(float(fem_reward))
+                        if is_phys_uvit and step_log_c is not None and compliance is not None:
+                            p2_log_c_preds.append(float(step_log_c))
+                            p2_log_c_true.append(float(np.log10(max(compliance, 1e-6))))
                 else:
                     fem_reward = -1.0
                     fem_collapsed = True
@@ -942,7 +966,15 @@ def run_neural_mcts_episode(
 
     # Record final post-action terminal snapshot if actions mutated density after `last_recorded_step`
     state_tensor_final = build_state_tensor(state.density, bc_tuple, force_tuple)
-    raw_val_final, pa_final, pr_final, bp_final = model.predict_with_blueprint(state_tensor_final)
+    final_log_c_pred: Optional[float] = None
+    final_conn_prob: Optional[float] = None
+    if is_phys_uvit:
+        raw_val_final, pa_final, pr_final, final_aux = model.predict_with_aux(state_tensor_final)
+        bp_final = final_aux["blueprint_probs"]  # type: ignore[assignment]
+        final_log_c_pred = float(final_aux["log_compliance"])  # type: ignore[arg-type]
+        final_conn_prob = float(final_aux["conn_prob"])  # type: ignore[arg-type]
+    else:
+        raw_val_final, pa_final, pr_final, bp_final = model.predict_with_blueprint(state_tensor_final)
     isl_final = analyze_structure_islands(state.density, load_cfg, bc_masks=bc_tuple)
     vol_final = float(np.mean(state.density > 0.5))
     vox_final = int((state.density > 0.5).sum())
@@ -1050,6 +1082,28 @@ def run_neural_mcts_episode(
         if vp.size >= 3 and np.std(vp) > 1e-9 and np.std(vr) > 1e-9:
             val_corr = float(np.corrcoef(vp, vr)[0, 1])
 
+    physics_aux_diagnostics: Optional[Dict[str, Any]] = None
+    if is_phys_uvit:
+        log_c_mae = log_c_bias = log_c_corr = None
+        if p2_log_c_preds and p2_log_c_true:
+            lp = np.asarray(p2_log_c_preds, dtype=np.float64)
+            lt = np.asarray(p2_log_c_true, dtype=np.float64)
+            log_c_mae = float(np.mean(np.abs(lp - lt)))
+            log_c_bias = float(np.mean(lp - lt))
+            if lp.size >= 3 and np.std(lp) > 1e-9 and np.std(lt) > 1e-9:
+                log_c_corr = float(np.corrcoef(lp, lt)[0, 1])
+        physics_aux_diagnostics = {
+            "n_log_c_samples": len(p2_log_c_preds),
+            "log_c_mae": log_c_mae,
+            "log_c_bias_pred_minus_true": log_c_bias,
+            "log_c_pearson_r": log_c_corr,
+            "final_log_c_pred": final_log_c_pred,
+            "final_log_c_true": float(np.log10(max(comp_final, 1e-6))) if comp_final is not None else None,
+            "p1_conn_prob_mean": float(np.mean(p1_conn_probs)) if p1_conn_probs else None,
+            "p2_conn_prob_mean": float(np.mean(p2_conn_probs)) if p2_conn_probs else None,
+            "final_conn_prob": final_conn_prob,
+        }
+
     simp_comp_bin = simp_summary.get("comp_bin") if simp_summary else None
     simp_comp_cont = simp_summary.get("comp_cont") if simp_summary else None
     comp_ratio_vs_simp_bin = (
@@ -1123,6 +1177,7 @@ def run_neural_mcts_episode(
             "bias_net_minus_fem": val_bias,
             "pearson_r": val_corr,
         },
+        "physics_aux_diagnostics": physics_aux_diagnostics,
     }
 
 
