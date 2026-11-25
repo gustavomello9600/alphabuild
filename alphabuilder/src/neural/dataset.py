@@ -96,7 +96,7 @@ def make_symmetry_collate_fn(enable_rot90: bool = True) -> Callable:
                 state_rot[:, 2] = old_mx
                 batch["state"] = state_rot
 
-                for key in ("policy", "legal_mask", "blueprint"):
+                for key in ("policy", "legal_mask", "blueprint", "domain_mask", "sed_target"):
                     if key in batch and isinstance(batch[key], torch.Tensor) and batch[key].ndim == 5:
                         batch[key] = torch.rot90(batch[key], k=1, dims=(2, 3)).contiguous()
         return batch

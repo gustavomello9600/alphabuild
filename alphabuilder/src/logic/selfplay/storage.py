@@ -12,7 +12,7 @@ import sqlite3
 import json
 import uuid
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Sequence, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 import numpy as np
@@ -77,6 +77,7 @@ class GameInfo:
     total_steps: int = 0
     initial_cantilever_problem_real_scale_factor: float = 500000.0
     stiffness_E: float = 200e9
+    domain_mask: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -109,6 +110,7 @@ class GameStep:
     value_target: Optional[float] = None
     final_reward: Optional[float] = None
     fem_reward: Optional[float] = None
+    sed_map: Optional[np.ndarray] = None
 
 
 # =============================================================================
@@ -206,6 +208,7 @@ def initialize_selfplay_db(db_path: Path) -> None:
             total_steps INTEGER DEFAULT 0,
             initial_cantilever_problem_real_scale_factor REAL DEFAULT 500000.0,
             stiffness_E REAL DEFAULT 200000000000.0,
+            domain_mask_blob BLOB,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -240,6 +243,7 @@ def initialize_selfplay_db(db_path: Path) -> None:
             final_reward REAL,
             fem_reward REAL,
             displacement_map_blob BLOB,
+            sed_map_blob BLOB,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (game_id) REFERENCES games(game_id),
             UNIQUE(game_id, step)
@@ -259,6 +263,39 @@ def initialize_selfplay_db(db_path: Path) -> None:
         CREATE INDEX IF NOT EXISTS idx_games_version 
         ON games(checkpoint_version)
     """)
+
+    # Counterfactual FEM probes table (additive; teaches FactoredValueHead & sed_head exact deltas)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS fem_probes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_id TEXT NOT NULL,
+            step INTEGER NOT NULL,
+            probe_type TEXT NOT NULL,
+            density_blob BLOB NOT NULL,
+            is_connected INTEGER DEFAULT 0,
+            compliance_fem REAL,
+            max_displacement REAL,
+            volume_fraction REAL DEFAULT 0.0,
+            fem_reward REAL,
+            sed_map_blob BLOB,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (game_id) REFERENCES games(game_id)
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_fem_probes_game
+        ON fem_probes(game_id, step)
+    """)
+
+    # Additive schema evolution for pre-existing Stage 5/v3.3 SQLite files
+    for tbl, col_def in (
+        ("games", ("domain_mask_blob", "BLOB")),
+        ("game_steps", ("sed_map_blob", "BLOB")),
+        ("fem_probes", ("sed_map_blob", "BLOB")),
+    ):
+        existing = {r[1] for r in cursor.execute(f"PRAGMA table_info({tbl})").fetchall()}
+        if col_def[0] not in existing:
+            cursor.execute(f"ALTER TABLE {tbl} ADD COLUMN {col_def[0]} {col_def[1]}")
     
     conn.commit()
     conn.close()
@@ -280,13 +317,14 @@ def save_game(db_path: Path, game: GameInfo) -> None:
     cursor = conn.cursor()
     
     try:
+        dm_blob = serialize_array(game.domain_mask.astype(np.float32)) if game.domain_mask is not None else None
         cursor.execute("""
             INSERT OR REPLACE INTO games 
             (game_id, neural_engine, checkpoint_version, bc_masks_blob, 
              forces_blob, load_config, bc_type, resolution,
              final_score, final_compliance, final_volume, total_steps,
-             initial_cantilever_problem_real_scale_factor, stiffness_E)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             initial_cantilever_problem_real_scale_factor, stiffness_E, domain_mask_blob)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             game.game_id,
             game.neural_engine,
@@ -301,7 +339,8 @@ def save_game(db_path: Path, game: GameInfo) -> None:
             game.final_volume,
             game.total_steps,
             game.initial_cantilever_problem_real_scale_factor,
-            game.stiffness_E
+            game.stiffness_E,
+            dm_blob,
         ))
         conn.commit()
     except sqlite3.Error as e:
@@ -330,6 +369,7 @@ def record_step(
     fem_reward: Optional[float] = None,
     displacement_map: Optional[np.ndarray] = None,
     executed_action_stats: Optional[List[Tuple[Tuple[int, int, int, int], int, float]]] = None,
+    sed_map: Optional[np.ndarray] = None,
 ) -> None:
     """
     Record a single game step with all associated data and faithful MCTS branch statistics.
@@ -339,6 +379,7 @@ def record_step(
     # Compress arrays
     density_blob = serialize_array(state.density)
     displacement_map_blob = serialize_array(displacement_map) if displacement_map is not None else None
+    sed_map_blob = serialize_array(sed_map.astype(np.float32)) if sed_map is not None else None
     
     # Sparse compress policies
     idx_add, val_add = sparse_encode(policy_add)
@@ -447,7 +488,7 @@ def record_step(
     try:
         cursor = conn.cursor()
         
-        # v3 Insert with comprehensive metrics
+        # v3/v4 Insert with comprehensive metrics + optional SED map
         cursor.execute("""
             INSERT INTO game_steps (
                 game_id, step, phase, density_blob, 
@@ -457,8 +498,8 @@ def record_step(
                 n_islands, loose_voxels, is_connected,
                 compliance_fem, max_displacement, island_penalty, volume_fraction,
                 reward_components_json, connected_load_fraction, value_target,
-                final_reward, fem_reward, displacement_map_blob
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                final_reward, fem_reward, displacement_map_blob, sed_map_blob
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             state.game_id, state.current_step, state.phase.value, density_blob,
             p_add_blob, p_rem_blob,
@@ -469,7 +510,7 @@ def record_step(
             1 if (island_analysis and island_analysis['is_connected']) else 0,
             compliance_fem, max_displacement, island_penalty, volume_fraction,
             reward_components_json, connected_load_fraction, value_target,
-            final_reward, fem_reward, displacement_map_blob
+            final_reward, fem_reward, displacement_map_blob, sed_map_blob
         ))
         
         conn.commit()
@@ -612,20 +653,23 @@ def load_game(db_path: Path, game_id: str) -> Optional[GameInfo]:
     """Load game metadata by ID."""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    
-    cursor.execute("""
+    cols = {r[1] for r in cursor.execute("PRAGMA table_info(games)").fetchall()}
+    dm_expr = "domain_mask_blob" if "domain_mask_blob" in cols else "NULL AS domain_mask_blob"
+
+    cursor.execute(f"""
         SELECT neural_engine, checkpoint_version, bc_masks_blob, forces_blob,
                load_config, bc_type, resolution, final_score, final_compliance,
-               final_volume, total_steps, initial_cantilever_problem_real_scale_factor, stiffness_E
+               final_volume, total_steps, initial_cantilever_problem_real_scale_factor, stiffness_E,
+               {dm_expr}
         FROM games WHERE game_id = ?
     """, (game_id,))
-    
+
     row = cursor.fetchone()
     conn.close()
-    
+
     if row is None:
         return None
-    
+
     return GameInfo(
         game_id=game_id,
         neural_engine=row[0],
@@ -640,7 +684,8 @@ def load_game(db_path: Path, game_id: str) -> Optional[GameInfo]:
         final_volume=row[9],
         total_steps=row[10] or 0,
         initial_cantilever_problem_real_scale_factor=row[11] if len(row) > 11 else 500000.0,
-        stiffness_E=row[12] if len(row) > 12 else 200e9
+        stiffness_E=row[12] if len(row) > 12 else 200e9,
+        domain_mask=deserialize_array(row[13]).astype(np.float32) if len(row) > 13 and row[13] else None,
     )
 
 
@@ -1092,6 +1137,164 @@ def get_incomplete_games(db_path: Path, max_steps_limit: int = 600) -> List[Game
         return []
     finally:
         conn.close()
+
+
+def record_fem_probe(
+    db_path: Path,
+    game_id: str,
+    step: int,
+    probe_type: str,
+    density: np.ndarray,
+    is_connected: bool,
+    compliance_fem: Optional[float],
+    max_displacement: Optional[float],
+    volume_fraction: float,
+    fem_reward: Optional[float],
+    sed_map: Optional[np.ndarray] = None,
+) -> None:
+    """Record a counterfactual FEM probe (e.g. candidate SED-guided edit batch) without mutating trajectory."""
+    conn = sqlite3.connect(db_path)
+    try:
+        sed_blob = serialize_array(sed_map.astype(np.float32)) if sed_map is not None else None
+        conn.execute(
+            """
+            INSERT INTO fem_probes (
+                game_id, step, probe_type, density_blob, is_connected,
+                compliance_fem, max_displacement, volume_fraction, fem_reward, sed_map_blob
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(game_id),
+                int(step),
+                str(probe_type),
+                serialize_array(density.astype(np.float32)),
+                1 if is_connected else 0,
+                float(compliance_fem) if (compliance_fem is not None and np.isfinite(compliance_fem)) else None,
+                float(max_displacement) if (max_displacement is not None and np.isfinite(max_displacement)) else None,
+                float(volume_fraction),
+                float(fem_reward) if (fem_reward is not None and np.isfinite(fem_reward)) else None,
+                sed_blob,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def merge_selfplay_dbs(
+    source_dbs: Sequence[Path],
+    target_db: Path,
+) -> Tuple[int, int, int]:
+    """
+    Merge worker shard self-play SQLite databases cleanly into `target_db`.
+    Returns `(n_games, n_steps, n_probes)` merged.
+    """
+    target_db = Path(target_db)
+    initialize_selfplay_db(target_db)
+    dst = sqlite3.connect(target_db)
+    total_games = 0
+    total_steps = 0
+    total_probes = 0
+    try:
+        for src_path in source_dbs:
+            src_p = Path(src_path)
+            if not src_p.exists():
+                continue
+            src = sqlite3.connect(f"file:{src_p}?mode=ro", uri=True)
+            try:
+                g_cols = {r[1] for r in src.execute("PRAGMA table_info(games)").fetchall()}
+                dm_expr = "domain_mask_blob" if "domain_mask_blob" in g_cols else "NULL AS domain_mask_blob"
+                g_rows = src.execute(
+                    f"""
+                    SELECT game_id, neural_engine, checkpoint_version, bc_masks_blob,
+                           forces_blob, load_config, bc_type, resolution,
+                           final_score, final_compliance, final_volume, total_steps,
+                           initial_cantilever_problem_real_scale_factor, stiffness_E, {dm_expr}, created_at
+                    FROM games
+                    """
+                ).fetchall()
+                if g_rows:
+                    dst.executemany(
+                        """
+                        INSERT OR REPLACE INTO games (
+                            game_id, neural_engine, checkpoint_version, bc_masks_blob,
+                            forces_blob, load_config, bc_type, resolution,
+                            final_score, final_compliance, final_volume, total_steps,
+                            initial_cantilever_problem_real_scale_factor, stiffness_E, domain_mask_blob, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        g_rows,
+                    )
+                    total_games += len(g_rows)
+
+                s_cols = {r[1] for r in src.execute("PRAGMA table_info(game_steps)").fetchall()}
+                s_sed_expr = "sed_map_blob" if "sed_map_blob" in s_cols else "NULL AS sed_map_blob"
+                s_rows = src.execute(
+                    f"""
+                    SELECT game_id, step, phase, density_blob,
+                           policy_add_blob, policy_remove_blob,
+                           mcts_visit_add_blob, mcts_visit_remove_blob,
+                           mcts_q_add_blob, mcts_q_remove_blob,
+                           selected_actions_json, value, mcts_stats_json,
+                           n_islands, loose_voxels, is_connected,
+                           compliance_fem, max_displacement, island_penalty, volume_fraction,
+                           reward_components_json, connected_load_fraction, value_target,
+                           final_reward, fem_reward, displacement_map_blob, {s_sed_expr}, created_at
+                    FROM game_steps
+                    """
+                ).fetchall()
+                if s_rows:
+                    dst.executemany(
+                        """
+                        INSERT OR REPLACE INTO game_steps (
+                            game_id, step, phase, density_blob,
+                            policy_add_blob, policy_remove_blob,
+                            mcts_visit_add_blob, mcts_visit_remove_blob,
+                            mcts_q_add_blob, mcts_q_remove_blob,
+                            selected_actions_json, value, mcts_stats_json,
+                            n_islands, loose_voxels, is_connected,
+                            compliance_fem, max_displacement, island_penalty, volume_fraction,
+                            reward_components_json, connected_load_fraction, value_target,
+                            final_reward, fem_reward, displacement_map_blob, sed_map_blob, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        s_rows,
+                    )
+                    total_steps += len(s_rows)
+
+                has_probes = src.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='fem_probes'"
+                ).fetchone()[0]
+                if has_probes:
+                    p_cols = {r[1] for r in src.execute("PRAGMA table_info(fem_probes)").fetchall()}
+                    p_sed_expr = "sed_map_blob" if "sed_map_blob" in p_cols else "NULL AS sed_map_blob"
+                    p_rows = src.execute(
+                        f"""
+                        SELECT game_id, step, probe_type, density_blob, is_connected,
+                               compliance_fem, max_displacement, volume_fraction, fem_reward, {p_sed_expr}, created_at
+                        FROM fem_probes
+                        """
+                    ).fetchall()
+                    if p_rows:
+                        dst.executemany(
+                            """
+                            INSERT INTO fem_probes (
+                                game_id, step, probe_type, density_blob, is_connected,
+                                compliance_fem, max_displacement, volume_fraction, fem_reward, sed_map_blob, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            p_rows,
+                        )
+                        total_probes += len(p_rows)
+                dst.commit()
+            finally:
+                src.close()
+
+        dst.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        dst.commit()
+    finally:
+        dst.close()
+    return total_games, total_steps, total_probes
 
 
 def generate_game_id() -> str:

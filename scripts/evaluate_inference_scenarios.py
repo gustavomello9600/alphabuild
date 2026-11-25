@@ -53,6 +53,7 @@ from alphabuilder.src.logic.selfplay import (
     update_game_final,
 )
 from alphabuilder.src.logic.selfplay.evaluator import evaluate_main_island
+from alphabuilder.src.logic.selfplay.scenarios_stage6 import build_ood_benchmark_scenarios
 from alphabuilder.src.logic.selfplay.reward import (
     analyze_structure_islands,
     calculate_connectivity_reward,
@@ -132,7 +133,13 @@ def _build_masks_and_forces(
     resolution: Tuple[int, int, int],
     load_config: Dict[str, Any],
     bc_type: str,
+    scenario: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    if scenario is not None and scenario.get("bc_masks") is not None and scenario.get("forces") is not None:
+        return (
+            np.asarray(scenario["bc_masks"], dtype=np.float32),
+            np.asarray(scenario["forces"], dtype=np.float32),
+        )
     mask_x, mask_y, mask_z = generate_bc_masks(resolution, bc_type)
     bc_masks = np.stack([mask_x, mask_y, mask_z], axis=0).astype(np.float32)
 
@@ -583,25 +590,31 @@ def run_neural_mcts_episode(
     max_phase2_steps: int,
     simp_binary_mask: Optional[np.ndarray],
     simp_summary: Optional[Dict[str, Any]],
+    fem_backend: Optional[str] = None,
+    p2_stepped_batch: bool = False,
 ) -> Dict[str, Any]:
-    """Run one deterministic MCTS + FEniCSx episode on `scenario` and persist to `db_path`."""
+    """Run one deterministic MCTS + FEM episode on `scenario` and persist to `db_path`."""
     game_id = f"{prefix}__{scenario['id']}"
     load_cfg = dict(scenario["load_config"])
     bc_type = scenario["bc_type"]
     load_cfg["bc_type"] = bc_type
+    res = tuple(scenario.get("resolution", RESOLUTION))
+    domain_mask = scenario.get("domain_mask")
+    dm_arr = np.asarray(domain_mask, dtype=np.float32) if domain_mask is not None else None
+    has_custom_fields = bool(scenario.get("bc_masks") is not None or scenario.get("forces") is not None)
 
     print(
-        f"\n[{prefix.upper()}] Starting {scenario['id']} ({bc_type}, sims={num_simulations}) ...",
+        f"\n[{prefix.upper()}] Starting {scenario['id']} ({bc_type}, res={res}, sims={num_simulations}) ...",
         flush=True,
     )
     ep_start = time.perf_counter()
 
-    bc_masks, forces = _build_masks_and_forces(RESOLUTION, load_cfg, bc_type)
+    bc_masks, forces = _build_masks_and_forces(res, load_cfg, bc_type, scenario=scenario)
     bc_tuple = (bc_masks[0], bc_masks[1], bc_masks[2])
     force_tuple = (forces[0], forces[1], forces[2])
 
     state = EvalEpisodeState(
-        density=np.zeros(RESOLUTION, dtype=np.float32),
+        density=np.zeros(res, dtype=np.float32),
         bc_masks=bc_masks,
         forces=forces,
         load_config=load_cfg,
@@ -627,8 +640,9 @@ def run_neural_mcts_episode(
             forces=forces,
             load_config=load_cfg,
             bc_type=bc_type,
-            resolution=RESOLUTION,
+            resolution=res,
             total_steps=0,
+            domain_mask=dm_arr,
         ),
     )
 
@@ -641,7 +655,9 @@ def run_neural_mcts_episode(
         masks: Tuple[np.ndarray, np.ndarray, np.ndarray],
         force_vecs: Tuple[np.ndarray, np.ndarray, np.ndarray],
     ) -> float:
-        isl = analyze_structure_islands(density_grid, load_cfg, bc_masks=masks)
+        isl = analyze_structure_islands(
+            density_grid, load_cfg, bc_masks=masks, forces=force_vecs if has_custom_fields else None
+        )
         total_vox = int((density_grid > 0.5).sum())
         isl_pen = calculate_island_penalty(isl["n_islands"], isl["loose_voxels"], total_vox)
         if state.phase == Phase.REFINEMENT:
@@ -654,7 +670,7 @@ def run_neural_mcts_episode(
         return float(np.clip(float(net_val), -1.0, 1.0))
 
     def hybrid_predict(state_tensor: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
-        nv, pa, pr = model.predict(state_tensor)
+        nv, pa, pr = model.predict(state_tensor, domain_mask=dm_arr)
         masks = (state_tensor[1], state_tensor[2], state_tensor[3])
         fvecs = (state_tensor[4], state_tensor[5], state_tensor[6])
         return _shape_value(nv, state_tensor[0], masks, fvecs), pa, pr
@@ -662,7 +678,7 @@ def run_neural_mcts_episode(
     def hybrid_predict_batch(
         state_tensors: List[np.ndarray],
     ) -> Tuple[List[float], List[np.ndarray], List[np.ndarray]]:
-        nvs, pas, prs = model.predict_batch(state_tensors)
+        nvs, pas, prs = model.predict_batch(state_tensors, domain_mask=dm_arr)
         shaped = [
             _shape_value(nv, st[0], (st[1], st[2], st[3]), (st[4], st[5], st[6]))
             for nv, st in zip(nvs, state_tensors)
@@ -732,10 +748,16 @@ def run_neural_mcts_episode(
             _, max_d = result.root.tree_stats()
         return conc, refut, int(max_d)
 
+    half_p2 = max(1, max_phase2_steps // 2)
     while True:
         step_t0 = time.perf_counter()
         cur_phase = state.phase
-        cfg = p1_cfg if cur_phase == Phase.GROWTH else p2_cfg
+        if cur_phase == Phase.GROWTH:
+            cfg = p1_cfg
+        elif p2_stepped_batch and phase2_steps_run < half_p2:
+            cfg = p2_cfg._replace(action_batch_size=16)
+        else:
+            cfg = p2_cfg
         mcts.config = cfg
 
         phi_root[0], _ = calculate_pbrs_potential(state.density, bc_tuple, force_tuple, load_cfg)
@@ -743,7 +765,7 @@ def run_neural_mcts_episode(
 
         step_log_c: Optional[float] = None
         if is_phys_uvit:
-            raw_net_val, policy_add, policy_remove, step_aux = model.predict_with_aux(state_tensor)
+            raw_net_val, policy_add, policy_remove, step_aux = model.predict_with_aux(state_tensor, domain_mask=dm_arr)
             step_bp = step_aux.get("blueprint_probs")
             step_log_c = step_aux.get("log_compliance")  # type: ignore[assignment]
             step_conn_prob = step_aux.get("conn_prob")
@@ -758,17 +780,19 @@ def run_neural_mcts_episode(
                 else:
                     p2_conn_probs.append(float(step_conn_prob))  # type: ignore[arg-type]
         elif state.current_step == 0:
-            raw_net_val, policy_add, policy_remove, bp_step0 = model.predict_with_blueprint(state_tensor)
+            raw_net_val, policy_add, policy_remove, bp_step0 = model.predict_with_blueprint(state_tensor, domain_mask=dm_arr)
             step0_val_raw = float(raw_net_val)
         elif cur_phase == Phase.REFINEMENT and bp_conn is None:
-            raw_net_val, policy_add, policy_remove, bp_conn = model.predict_with_blueprint(state_tensor)
+            raw_net_val, policy_add, policy_remove, bp_conn = model.predict_with_blueprint(state_tensor, domain_mask=dm_arr)
         else:
-            raw_net_val, policy_add, policy_remove = model.predict(state_tensor)
+            raw_net_val, policy_add, policy_remove = model.predict(state_tensor, domain_mask=dm_arr)
 
-        result = mcts.search(state.density, bc_tuple, force_tuple)
+        result = mcts.search(state.density, bc_tuple, force_tuple, domain_mask=dm_arr)
 
         vol_frac = float(np.mean(state.density > 0.5))
-        isl = analyze_structure_islands(state.density, load_cfg, bc_masks=bc_tuple)
+        isl = analyze_structure_islands(
+            state.density, load_cfg, bc_masks=bc_tuple, forces=force_tuple if has_custom_fields else None
+        )
         total_vox = int((state.density > 0.5).sum())
         isl_pen = calculate_island_penalty(isl["n_islands"], isl["loose_voxels"], total_vox)
         conn_bonus_raw, conn_frac = calculate_connectivity_reward(state.density, bc_tuple, force_tuple)
@@ -790,6 +814,9 @@ def run_neural_mcts_episode(
                     load_cfg,
                     isl["main_island_mask"],
                     bc_type=bc_type,
+                    backend=fem_backend,
+                    bc_masks=bc_masks if has_custom_fields else None,
+                    forces=forces if has_custom_fields else None,
                 )
                 if fem_res.valid:
                     compliance = float(fem_res.compliance)
@@ -874,7 +901,7 @@ def run_neural_mcts_episode(
             displacement_map=displacement_map,
             executed_action_stats=executed_action_stats,
         )
-        _update_mcts_q_blobs(db_path, game_id, state.current_step, result.root, RESOLUTION)
+        _update_mcts_q_blobs(db_path, game_id, state.current_step, result.root, res)
         last_recorded_step = state.current_step
 
         if cur_phase == Phase.REFINEMENT and fem_reward is not None:
@@ -914,7 +941,12 @@ def run_neural_mcts_episode(
 
         # Convergence / Phase-2 budget checks (before or after transition)
         if cur_phase == Phase.REFINEMENT:
-            term_r = get_phase2_terminal_reward(state.density, load_cfg)
+            term_r = get_phase2_terminal_reward(
+                state.density,
+                load_cfg,
+                bc_masks=bc_tuple,
+                forces=force_tuple if has_custom_fields else None,
+            )
             if term_r is not None:
                 state.current_step += 1
                 end_reason = "TERMINAL"
@@ -945,7 +977,9 @@ def run_neural_mcts_episode(
             mcts.reset()
 
         if cur_phase == Phase.GROWTH:
-            post_isl = analyze_structure_islands(state.density, load_cfg, bc_masks=bc_tuple)
+            post_isl = analyze_structure_islands(
+                state.density, load_cfg, bc_masks=bc_tuple, forces=force_tuple if has_custom_fields else None
+            )
             if post_isl["is_connected"]:
                 phase1_steps_to_connect = state.current_step + 1
                 state.phase = Phase.REFINEMENT
@@ -969,13 +1003,15 @@ def run_neural_mcts_episode(
     final_log_c_pred: Optional[float] = None
     final_conn_prob: Optional[float] = None
     if is_phys_uvit:
-        raw_val_final, pa_final, pr_final, final_aux = model.predict_with_aux(state_tensor_final)
+        raw_val_final, pa_final, pr_final, final_aux = model.predict_with_aux(state_tensor_final, domain_mask=dm_arr)
         bp_final = final_aux["blueprint_probs"]  # type: ignore[assignment]
         final_log_c_pred = float(final_aux["log_compliance"])  # type: ignore[arg-type]
         final_conn_prob = float(final_aux["conn_prob"])  # type: ignore[arg-type]
     else:
-        raw_val_final, pa_final, pr_final, bp_final = model.predict_with_blueprint(state_tensor_final)
-    isl_final = analyze_structure_islands(state.density, load_cfg, bc_masks=bc_tuple)
+        raw_val_final, pa_final, pr_final, bp_final = model.predict_with_blueprint(state_tensor_final, domain_mask=dm_arr)
+    isl_final = analyze_structure_islands(
+        state.density, load_cfg, bc_masks=bc_tuple, forces=force_tuple if has_custom_fields else None
+    )
     vol_final = float(np.mean(state.density > 0.5))
     vox_final = int((state.density > 0.5).sum())
     isl_pen_final = calculate_island_penalty(isl_final["n_islands"], isl_final["loose_voxels"], vox_final)
@@ -986,7 +1022,15 @@ def run_neural_mcts_episode(
     fem_reward_final: Optional[float] = None
     disp_map_final: Optional[np.ndarray] = None
     if isl_final["is_connected"]:
-        fem_res_f = evaluate_main_island(state.density, load_cfg, isl_final["main_island_mask"], bc_type=bc_type)
+        fem_res_f = evaluate_main_island(
+            state.density,
+            load_cfg,
+            isl_final["main_island_mask"],
+            bc_type=bc_type,
+            backend=fem_backend,
+            bc_masks=bc_masks if has_custom_fields else None,
+            forces=forces if has_custom_fields else None,
+        )
         if fem_res_f.valid:
             comp_final = float(fem_res_f.compliance)
             max_disp_final = float(fem_res_f.max_displacement)
@@ -1207,6 +1251,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-simp", dest="run_simp", action="store_false", help="Reuse SIMP baselines from DB if present")
     parser.set_defaults(run_simp=False)
     parser.add_argument("--scenarios", type=str, default="", help="Optional comma-separated subset of scenario IDs")
+    parser.add_argument("--suite", type=str, default="canonical", choices=["canonical", "ood", "both"])
+    parser.add_argument("--fem-backend", type=str, default=None, choices=["auto", "dolfinx", "fast_amg"])
+    parser.add_argument("--p2-stepped-batch", action="store_true", default=False, help="Use 16->8 stepped Phase-2 batch size")
     return parser.parse_args()
 
 
@@ -1214,10 +1261,17 @@ def main() -> None:
     args = parse_args()
     initialize_selfplay_db(args.db_path)
 
-    selected = SCENARIOS
+    if args.suite == "canonical":
+        pool = list(SCENARIOS)
+    elif args.suite == "ood":
+        pool = build_ood_benchmark_scenarios()
+    else:
+        pool = list(SCENARIOS) + build_ood_benchmark_scenarios()
+
+    selected = pool
     if args.scenarios.strip():
         wanted = {s.strip() for s in args.scenarios.split(",") if s.strip()}
-        selected = [s for s in SCENARIOS if s["id"] in wanted]
+        selected = [s for s in pool if s["id"] in wanted]
         if not selected:
             raise ValueError(f"No matching scenarios for filter: {wanted}")
 
@@ -1231,7 +1285,7 @@ def main() -> None:
             simp_masks[sc["id"]] = (rho > 0.5)
             simp_summaries[sc["id"]] = summ
             print(f"[SIMP] Reusing existing baseline for {sc['id']} (C_bin={summ['comp_bin']})", flush=True)
-        elif args.run_simp:
+        elif args.run_simp and sc.get("id", "").startswith("S"):
             rho, summ = run_simp_baseline(args.db_path, sc, max_iter=60, target_vol_frac=0.15)
             simp_masks[sc["id"]] = (rho > 0.5)
             simp_summaries[sc["id"]] = summ
@@ -1258,6 +1312,8 @@ def main() -> None:
             max_phase2_steps=args.max_phase2_steps,
             simp_binary_mask=simp_masks.get(sc["id"]),
             simp_summary=simp_summaries.get(sc["id"]),
+            fem_backend=args.fem_backend,
+            p2_stepped_batch=args.p2_stepped_batch,
         )
         neural_results.append(res)
         gc.collect()

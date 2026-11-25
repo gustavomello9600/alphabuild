@@ -1,19 +1,22 @@
 """
-Self-Play Episode Runner for AlphaBuilder v3.3.
+Self-Play Episode Runner for AlphaBuilder v4.0.
 
 Implements complete MCTS self-play loop with:
-- Batch MCTS inference (`predict_batch_fn`) with Virtual Loss
-- Decaying Potential-Based Reward Shaping (PBRS) in Phase 1 (growth)
-- Pure physics FEM evaluation (`evaluate_main_island` matching FEniTop physics) in Phase 2
-- Faithful PV branch storage (`executed_action_stats`), tree/cache reset on phase transition
-- Physical collapse termination and reward-aligned backpropagation (`backpropagate_value_targets`)
+- 4-Tier progressive domain/BC/load/keep-out/multi-res scenarios (`scenarios_stage6.py`)
+- Early Phase-1 exploration boost (Dirichlet + temperature) to break center-bar bias
+- Decaying Potential-Based Reward Shaping (PBRS) with spatial distance guidance in Phase 1
+- Pure physics FEM evaluation (`evaluate_main_island` via dolfinx or fast_amg) + Strain Energy Density (`sed_map`)
+- Stepped Phase-2 budget (`16 -> 8` voxel micro-batches) + `REMOVE` candidate quota
+- Counterfactual SED-guided (or policy-ranked) Phase-2 probes stored in `fem_probes` and distilled when winning
 """
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import random
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
+from scipy import ndimage
 
 from ..storage import Phase
 from ..mcts.engine import (
@@ -25,10 +28,11 @@ from ..mcts.engine import (
     build_state_tensor,
     select_pv_branches,
 )
+from ..mcts.legal_moves import get_legal_add_moves, get_legal_remove_moves
+from ..mcts.node import MCTSNode
 from ...neural.inference import AlphaBuilderInference
 from ..harvest.generators import (
     generate_bc_masks,
-    generate_random_load_config,
     get_load_region_bounds,
 )
 from .evaluator import evaluate_main_island
@@ -42,6 +46,12 @@ from .reward import (
     get_guidance_alpha,
     get_phase2_terminal_reward,
 )
+from .scenarios_stage6 import (
+    HELD_OUT_CANONICAL_SCENARIOS,
+    SelfPlayScenario,
+    is_near_canonical_scenario,
+    sample_curriculum_scenario,
+)
 from . import (
     GameInfo,
     backpropagate_value_targets,
@@ -49,6 +59,7 @@ from . import (
     get_last_step,
     load_game,
     load_game_step,
+    record_fem_probe,
     record_step,
     save_game,
     update_game_final,
@@ -58,18 +69,71 @@ from . import (
 MCTS_CONFIG = MCTSConfig(num_simulations=80)
 
 
+def sample_selfplay_scenario(
+    resolution: Tuple[int, int, int] = (64, 32, 8),
+    rng: Optional[random.Random] = None,
+    rail_prob: float = 0.45,
+    eccentric_z_prob: float = 0.45,
+) -> Dict[str, Any]:
+    """Sample a Tier-0 cantilever load configuration disjoint from held-out S1-S6."""
+    r = rng if rng is not None else random.Random()
+    nx, ny, nz = resolution
+    x_lo = min(nx - 1, max(nx // 2, 24))
+    x_hi = nx - 1
+    y_lo = min(ny - 4, 4)
+    y_hi = max(y_lo, ny - 5)
+
+    for _ in range(128):
+        lx = int(r.randint(x_lo, x_hi))
+        ly = int(r.randint(y_lo, y_hi))
+        if nz >= 6 and r.random() < eccentric_z_prob:
+            z_start = int(r.randint(0, nz - 2))
+            z_end = min(nz, z_start + 2)
+        else:
+            zc = nz // 2
+            z_start = max(0, zc - 1)
+            z_end = min(nz, zc + 1)
+        bc_type = "RAIL_XY" if r.random() < rail_prob else "FULL_CLAMP"
+        cfg = {"x": lx, "y": ly, "z_start": z_start, "z_end": z_end, "bc_type": bc_type}
+        if resolution != (64, 32, 8) or not is_near_canonical_scenario(cfg, bc_type, tol_xy=1):
+            return cfg
+
+    return {"x": min(nx - 1, 48), "y": ny // 2, "z_start": 3, "z_end": 5, "bc_type": "FULL_CLAMP"}
+
+
 @dataclass
 class EpisodeConfig:
     """Configuration for a single self-play episode."""
 
     max_steps: int = 600
-    max_phase1_steps: int = 200
+    max_phase1_steps: int = 120
+    max_phase2_steps: int = 64
     target_volume_fraction: float = 0.15
     resolution: Tuple[int, int, int] = (64, 32, 8)
     bc_type: str = "FULL_CLAMP"
     use_guided_value: bool = True
-    generation: int = 0
+    generation: int = 1
     guidance_decay_generations: int = 5
+    num_simulations_p1: int = 160
+    num_simulations_p2: int = 160
+    mcts_batch_size: int = 8
+    add_root_noise: bool = True
+    p1_explore_steps: int = 12
+    p1_early_temperature: float = 1.35
+    p1_early_dirichlet_frac: float = 0.35
+    p2_c_puct: float = 1.0
+    p2_action_batch_size: int = 16
+    p2_action_batch_size_late: int = 8
+    p2_min_remove_candidates: int = 16
+    p2_remove_prior_floor: float = 0.25
+    p2_remove_probe_prob: float = 0.50
+    p2_remove_probe_min_vol: float = 0.055
+    fem_backend: Optional[str] = None
+    record_displacement_map: bool = False
+    record_sed_map: bool = True
+    tier_weights: Optional[Tuple[float, float, float, float]] = None
+    seed: Optional[int] = None
+    verbose: bool = True
 
 
 @dataclass
@@ -77,54 +141,69 @@ class EpisodeState:
     """Mutable state for the current episode."""
 
     density: np.ndarray
-    bc_masks: np.ndarray  # (3, D, H, W)
-    forces: np.ndarray    # (3, D, H, W)
+    bc_masks: np.ndarray                 # (3, D, H, W)
+    forces: np.ndarray                   # (3, D, H, W)
     load_config: Dict[str, Any]
     current_step: int = 0
     phase: Phase = Phase.GROWTH
     is_connected: bool = False
     game_id: str = ""
     compliance_history: List[float] = field(default_factory=list)
+    domain_mask: Optional[np.ndarray] = None  # (D, H, W) optional keep-out mask
 
 
 def create_empty_state(
     resolution: Tuple[int, int, int],
     load_config: Dict[str, Any],
     bc_type: str = "FULL_CLAMP",
+    bc_masks: Optional[np.ndarray] = None,
+    forces: Optional[np.ndarray] = None,
+    domain_mask: Optional[np.ndarray] = None,
 ) -> EpisodeState:
-    """Create initial empty episode state with aligned BC masks and force patch."""
+    """Create initial empty episode state supporting arbitrary BCs, 3D forces, and keep-out masks."""
     density = np.zeros(resolution, dtype=np.float32)
+    resolved_bc = str(load_config.get("bc_type", bc_type)).upper()
 
-    mask_x, mask_y, mask_z = generate_bc_masks(resolution, bc_type)
-    bc_masks = np.stack([mask_x, mask_y, mask_z], axis=0).astype(np.float32)
+    if bc_masks is None:
+        mask_x, mask_y, mask_z = generate_bc_masks(resolution, resolved_bc)
+        bc_arr = np.stack([mask_x, mask_y, mask_z], axis=0).astype(np.float32)
+    else:
+        bc_arr = np.asarray(bc_masks, dtype=np.float32)
 
-    fx = np.zeros(resolution, dtype=np.float32)
-    fy = np.zeros(resolution, dtype=np.float32)
-    fz = np.zeros(resolution, dtype=np.float32)
-
-    lx, y_min, y_max, z_min, z_max = get_load_region_bounds(resolution, load_config)
-    fy[lx, y_min:y_max, z_min:z_max] = -1.0
-    forces = np.stack([fx, fy, fz], axis=0).astype(np.float32)
+    if forces is None:
+        fx = np.zeros(resolution, dtype=np.float32)
+        fy = np.zeros(resolution, dtype=np.float32)
+        fz = np.zeros(resolution, dtype=np.float32)
+        lx, y_min, y_max, z_min, z_max = get_load_region_bounds(resolution, load_config)
+        fy[lx, y_min:y_max, z_min:z_max] = -1.0
+        forces_arr = np.stack([fx, fy, fz], axis=0).astype(np.float32)
+    else:
+        forces_arr = np.asarray(forces, dtype=np.float32)
 
     cfg_copy = dict(load_config)
-    cfg_copy["bc_type"] = bc_type
+    cfg_copy["bc_type"] = resolved_bc
 
     return EpisodeState(
         density=density,
-        bc_masks=bc_masks,
-        forces=forces,
+        bc_masks=bc_arr,
+        forces=forces_arr,
         load_config=cfg_copy,
         current_step=0,
         phase=Phase.GROWTH,
         is_connected=False,
         game_id=generate_game_id(),
+        domain_mask=np.asarray(domain_mask, dtype=np.float32) if domain_mask is not None else None,
     )
 
 
 def check_phase_transition(state: EpisodeState) -> bool:
-    """Check if structure connects support to the full load patch."""
+    """Check if structure connects support to all load patches."""
     connected_to_support, reached_load = check_structure_connectivity(
-        state.density, state.load_config, threshold=0.5
+        state.density,
+        state.load_config,
+        threshold=0.5,
+        bc_masks=(state.bc_masks[0], state.bc_masks[1], state.bc_masks[2]),
+        forces=(state.forces[0], state.forces[1], state.forces[2]),
     )
     return connected_to_support and reached_load
 
@@ -132,20 +211,26 @@ def check_phase_transition(state: EpisodeState) -> bool:
 def execute_mcts_step(
     state: EpisodeState,
     mcts: AlphaBuilderMCTS,
-    raw_predict_fn: Optional[Callable[[np.ndarray], Tuple[float, np.ndarray, np.ndarray]]] = None,
+    raw_predict_fn: Optional[Callable[..., Tuple[float, np.ndarray, np.ndarray]]] = None,
 ) -> Tuple[SearchResult, float, np.ndarray, np.ndarray]:
     """Run MCTS search and also capture raw unshaped network prediction at root."""
     bc_tuple = (state.bc_masks[0], state.bc_masks[1], state.bc_masks[2])
     force_tuple = (state.forces[0], state.forces[1], state.forces[2])
     state_tensor = build_state_tensor(state.density, bc_tuple, force_tuple)
 
-    raw_fn = raw_predict_fn if raw_predict_fn is not None else mcts.predict_fn
-    value, policy_add, policy_remove = raw_fn(state_tensor)
+    if raw_predict_fn is not None:
+        try:
+            value, policy_add, policy_remove = raw_predict_fn(state_tensor, domain_mask=state.domain_mask)
+        except TypeError:
+            value, policy_add, policy_remove = raw_predict_fn(state_tensor)
+    else:
+        value, policy_add, policy_remove = mcts.predict_fn(state_tensor)
 
     result = mcts.search(
         density=state.density,
         bc_masks=bc_tuple,
         forces=force_tuple,
+        domain_mask=state.domain_mask,
     )
     return result, float(value), policy_add, policy_remove
 
@@ -159,15 +244,125 @@ def apply_micro_batch(
         state.density[x, y, z] = 1.0 if channel == 0 else 0.0
 
 
+def _build_sed_or_policy_probe_batch(
+    density: np.ndarray,
+    bc_tuple: Tuple[np.ndarray, np.ndarray, np.ndarray],
+    force_tuple: Tuple[np.ndarray, np.ndarray, np.ndarray],
+    load_config: Dict[str, Any],
+    policy_remove: np.ndarray,
+    sed_map: Optional[np.ndarray] = None,
+    domain_mask: Optional[np.ndarray] = None,
+    max_k: int = 12,
+    min_vol_frac: float = 0.015,
+) -> List[Tuple[int, int, int, int]]:
+    """
+    Build a counterfactual Phase-2 batch that either:
+    - With `sed_map`: removes lowest-SED internal solid voxels (safely keeping connectivity)
+      AND adds highest-neighbor-SED legal boundary voxels (shifting mass from neutral core to stressed chords).
+    - Without `sed_map`: removes top policy_remove legal voxels safely keeping connectivity.
+    """
+    base_isl = analyze_structure_islands(
+        density, load_config, bc_masks=bc_tuple, forces=force_tuple
+    )
+    max_allowed_islands = max(1, int(base_isl["n_islands"]))
+    cand_density = density.copy()
+    chosen: List[Tuple[int, int, int, int]] = []
+
+    valid_rem = get_legal_remove_moves(density, threshold=0.5, bc_masks=bc_tuple, forces=force_tuple)
+    rem_coords = np.argwhere(valid_rem > 0)
+
+    n_rem_target = max(1, max_k // 2) if sed_map is not None else max_k
+    if rem_coords.size > 0:
+        if sed_map is not None:
+            # Lowest SED voxels carry near-zero strain energy (classic neutral-axis core)
+            rem_scores = sed_map[rem_coords[:, 0], rem_coords[:, 1], rem_coords[:, 2]]
+            order = np.argsort(rem_scores)
+        else:
+            rem_scores = policy_remove[rem_coords[:, 0], rem_coords[:, 1], rem_coords[:, 2]]
+            order = np.argsort(rem_scores)[::-1]
+
+        limit = min(len(order), max(n_rem_target * 5, 40))
+        for idx in order[:limit]:
+            if len(chosen) >= n_rem_target:
+                break
+            x, y, z = int(rem_coords[idx, 0]), int(rem_coords[idx, 1]), int(rem_coords[idx, 2])
+            cand_density[x, y, z] = 0.0
+            if float(np.mean(cand_density > 0.5)) < min_vol_frac:
+                cand_density[x, y, z] = 1.0
+                continue
+            post_isl = analyze_structure_islands(
+                cand_density, load_config, bc_masks=bc_tuple, forces=force_tuple
+            )
+            if post_isl["is_connected"] and int(post_isl["n_islands"]) <= max_allowed_islands:
+                chosen.append((1, x, y, z))
+            else:
+                cand_density[x, y, z] = 1.0
+
+    # If SED available, pair low-SED removals with high-SED boundary reinforcement (expanding I_y!)
+    if sed_map is not None and len(chosen) < max_k:
+        n_add_needed = max_k - len(chosen)
+        valid_add = get_legal_add_moves(
+            density, threshold=0.5, bc_masks=bc_tuple, domain_mask=domain_mask
+        )
+        add_coords = np.argwhere(valid_add > 0)
+        if add_coords.size > 0:
+            # Smooth SED slightly onto immediate 6-neighbors so high-stress boundary sites score highest
+            sed_nbr = ndimage.maximum_filter(sed_map, size=3)
+            add_scores = sed_nbr[add_coords[:, 0], add_coords[:, 1], add_coords[:, 2]]
+            add_order = np.argsort(add_scores)[::-1]
+            for idx in add_order[:n_add_needed]:
+                x, y, z = int(add_coords[idx, 0]), int(add_coords[idx, 1]), int(add_coords[idx, 2])
+                chosen.append((0, x, y, z))
+
+    return chosen
+
+
+def _inject_winning_probe_visits(
+    result: SearchResult,
+    probe_actions: List[Tuple[int, int, int, int]],
+    probe_reward: float,
+) -> List[Tuple[Tuple[int, int, int, int], int, float]]:
+    """Record counterfactual winning actions into root visit counts for policy distillation."""
+    root = getattr(result, "root", None)
+    existing_total = sum(int(c.visit_count) for c in root.children.values()) if (root and root.children) else 0
+    per_action_base = max(12, existing_total // max(len(probe_actions), 1))
+    action_stats: List[Tuple[Tuple[int, int, int, int], int, float]] = []
+
+    for rank_idx, act in enumerate(probe_actions):
+        boost = per_action_base + (len(probe_actions) - rank_idx)
+        if root is not None:
+            child = root.children.get(act)
+            if child is None:
+                child = MCTSNode(prior=1.0 / max(len(probe_actions), 1), action_to_parent=act, parent=root)
+                root.children[act] = child
+            child.visit_count += boost
+            child.value_sum += float(boost) * float(probe_reward)
+            child.max_value = max(child.max_value, float(probe_reward))
+            v_count = int(child.visit_count)
+        else:
+            if result.visit_distribution is not None:
+                result.visit_distribution[act] = int(result.visit_distribution.get(act, 0)) + boost
+            v_count = int(result.visit_distribution[act]) if result.visit_distribution else boost
+        action_stats.append((act, v_count, float(probe_reward)))
+
+    return action_stats
+
+
 def _run_episode_loop(
     state: EpisodeState,
     model: AlphaBuilderInference,
     db_path: Path,
     config: EpisodeConfig,
-) -> Tuple[str, float, int]:
+    tier: int = 0,
+    family: str = "cantilever",
+) -> Tuple[str, float, int, Dict[str, Any]]:
     """Unified execution loop shared cleanly by run_episode and resume_episode."""
     load_config = state.load_config
-    bc_type = str(load_config.get("bc_type", config.bc_type))
+    bc_type = str(load_config.get("bc_type", config.bc_type)).upper()
+    rng = random.Random(config.seed) if config.seed is not None else random.Random()
+    bc_masks_arg = state.bc_masks
+    forces_arg = state.forces
+
     alpha_guide = (
         get_guidance_alpha(
             generation=config.generation,
@@ -180,7 +375,9 @@ def _run_episode_loop(
     current_phi_root = [0.0]
 
     def _shape_value(net_val: float, density_grid: np.ndarray, masks, force_vecs) -> float:
-        isl = analyze_structure_islands(density_grid, load_config, bc_masks=masks)
+        isl = analyze_structure_islands(
+            density_grid, load_config, bc_masks=masks, forces=force_vecs
+        )
         total_voxels = int((density_grid > 0.5).sum())
         island_pen = calculate_island_penalty(isl["n_islands"], isl["loose_voxels"], total_voxels)
 
@@ -197,7 +394,10 @@ def _run_episode_loop(
         return max(-1.0, min(1.0, float(net_val)))
 
     def hybrid_predictor(state_tensor: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
-        net_val, p_add, p_remove = model.predict(state_tensor)
+        try:
+            net_val, p_add, p_remove = model.predict(state_tensor, domain_mask=state.domain_mask)
+        except TypeError:
+            net_val, p_add, p_remove = model.predict(state_tensor)
         masks = (state_tensor[1], state_tensor[2], state_tensor[3])
         force_vecs = (state_tensor[4], state_tensor[5], state_tensor[6])
         return _shape_value(net_val, state_tensor[0], masks, force_vecs), p_add, p_remove
@@ -205,7 +405,10 @@ def _run_episode_loop(
     def hybrid_batch_predictor(
         state_tensors: List[np.ndarray],
     ) -> Tuple[List[float], List[np.ndarray], List[np.ndarray]]:
-        net_vals, ps_add, ps_remove = model.predict_batch(state_tensors)
+        try:
+            net_vals, ps_add, ps_remove = model.predict_batch(state_tensors, domain_mask=state.domain_mask)
+        except TypeError:
+            net_vals, ps_add, ps_remove = model.predict_batch(state_tensors)
         final_vals = [
             _shape_value(
                 nv,
@@ -217,7 +420,24 @@ def _run_episode_loop(
         ]
         return final_vals, ps_add, ps_remove
 
-    init_cfg = PHASE1_CONFIG if state.phase == Phase.GROWTH else PHASE2_CONFIG
+    base_p1_cfg = PHASE1_CONFIG._replace(
+        num_simulations=config.num_simulations_p1,
+        batch_size=config.mcts_batch_size,
+        add_root_noise=config.add_root_noise,
+        min_remove_candidates=0,
+        remove_prior_floor=0.0,
+    )
+    base_p2_cfg = PHASE2_CONFIG._replace(
+        num_simulations=config.num_simulations_p2,
+        batch_size=config.mcts_batch_size,
+        action_batch_size=config.p2_action_batch_size,
+        c_puct=config.p2_c_puct,
+        add_root_noise=config.add_root_noise,
+        min_remove_candidates=config.p2_min_remove_candidates,
+        remove_prior_floor=config.p2_remove_prior_floor,
+    )
+
+    init_cfg = base_p1_cfg if state.phase == Phase.GROWTH else base_p2_cfg
     mcts_wrapper = AlphaBuilderMCTS(
         predict_fn=hybrid_predictor,
         num_simulations=init_cfg.num_simulations,
@@ -227,30 +447,44 @@ def _run_episode_loop(
         top_k_expansion=init_cfg.top_k_expansion,
         predict_batch_fn=hybrid_batch_predictor,
     )
+    mcts_wrapper.config = init_cfg
 
-    final_score = 0.0
+    final_score = -1.0
     last_valid_compliance: Optional[float] = None
+    last_recorded_step = -1
+    phase1_steps_to_connect: Optional[int] = None
+    phase2_steps_run = 0
+    p2_add_actions = 0
+    p2_rem_actions = 0
+    probes_run = 0
+    probes_adopted = 0
+    end_reason = "MAX_STEPS"
     start_time = time.time()
+
+    bc_tuple = (state.bc_masks[0], state.bc_masks[1], state.bc_masks[2])
+    force_tuple = (state.forces[0], state.forces[1], state.forces[2])
+    half_p2 = max(1, config.max_phase2_steps // 2)
 
     while state.current_step < config.max_steps:
         step_start = time.time()
-        current_config = PHASE1_CONFIG if state.phase == Phase.GROWTH else PHASE2_CONFIG
+        cur_phase = state.phase
+        if cur_phase == Phase.GROWTH:
+            if config.add_root_noise and state.current_step < config.p1_explore_steps:
+                current_config = base_p1_cfg._replace(
+                    policy_temperature=config.p1_early_temperature,
+                    root_exploration_fraction=config.p1_early_dirichlet_frac,
+                )
+            else:
+                current_config = base_p1_cfg
+        else:
+            p2_batch = (
+                config.p2_action_batch_size
+                if phase2_steps_run < half_p2
+                else config.p2_action_batch_size_late
+            )
+            current_config = base_p2_cfg._replace(action_batch_size=p2_batch)
 
-        mcts_wrapper.config = mcts_wrapper.config._replace(
-            num_simulations=current_config.num_simulations,
-            batch_size=current_config.batch_size,
-            action_batch_size=current_config.action_batch_size,
-            c_puct=current_config.c_puct,
-            top_k_expansion=current_config.top_k_expansion,
-            min_volume_fraction=current_config.min_volume_fraction,
-            max_volume_fraction=current_config.max_volume_fraction,
-            phase=current_config.phase,
-            policy_temperature=current_config.policy_temperature,
-            mixmax_beta=current_config.mixmax_beta,
-        )
-
-        bc_tuple = (state.bc_masks[0], state.bc_masks[1], state.bc_masks[2])
-        force_tuple = (state.forces[0], state.forces[1], state.forces[2])
+        mcts_wrapper.config = current_config
         current_phi_root[0], _ = calculate_pbrs_potential(state.density, bc_tuple, force_tuple, state.load_config)
 
         result, raw_net_val, policy_add, policy_remove = execute_mcts_step(
@@ -258,7 +492,9 @@ def _run_episode_loop(
         )
 
         vol_frac = float(np.mean(state.density > 0.5))
-        island_analysis = analyze_structure_islands(state.density, state.load_config, bc_masks=bc_tuple)
+        island_analysis = analyze_structure_islands(
+            state.density, state.load_config, bc_masks=bc_tuple, forces=force_tuple
+        )
         n_islands = island_analysis["n_islands"]
         loose_voxels = island_analysis["loose_voxels"]
         total_voxels = int((state.density > 0.5).sum())
@@ -268,9 +504,10 @@ def _run_episode_loop(
         max_disp: Optional[float] = None
         fem_reward: Optional[float] = None
         displacement_map: Optional[np.ndarray] = None
+        sed_map: Optional[np.ndarray] = None
         fem_collapsed = False
 
-        if state.phase == Phase.REFINEMENT:
+        if cur_phase == Phase.REFINEMENT:
             if not island_analysis["is_connected"]:
                 fem_reward = -1.0
                 fem_collapsed = True
@@ -280,16 +517,23 @@ def _run_episode_loop(
                     state.load_config,
                     island_analysis["main_island_mask"],
                     bc_type=bc_type,
+                    backend=config.fem_backend,
+                    bc_masks=bc_masks_arg,
+                    forces=forces_arg,
+                    compute_sed=config.record_sed_map,
                 )
                 if fem_result.valid:
-                    compliance = fem_result.compliance
-                    max_disp = fem_result.max_displacement
-                    displacement_map = fem_result.displacement_map
-                    fem_reward = calculate_reward(
-                        compliance=compliance,
-                        vol_frac=vol_frac,
-                        is_valid=True,
-                        max_displacement=max_disp,
+                    compliance = float(fem_result.compliance)
+                    max_disp = float(fem_result.max_displacement)
+                    displacement_map = fem_result.displacement_map if config.record_displacement_map else None
+                    sed_map = fem_result.sed_map if config.record_sed_map else None
+                    fem_reward = float(
+                        calculate_reward(
+                            compliance=compliance,
+                            vol_frac=vol_frac,
+                            is_valid=True,
+                            max_displacement=max_disp,
+                        )
                     )
                     last_valid_compliance = compliance
                     if fem_reward == -1.0:
@@ -302,27 +546,14 @@ def _run_episode_loop(
 
         connectivity_bonus = 0.0
         connected_load_fraction = 0.0
-        if state.phase == Phase.GROWTH:
+        if cur_phase == Phase.GROWTH:
             connectivity_bonus, connected_load_fraction = calculate_connectivity_reward(
                 state.density, bc_tuple, force_tuple
             )
-
-        reward_components = {
-            "base_reward": 0.0,
-            "connectivity_bonus": connectivity_bonus,
-            "connected_load_fraction": connected_load_fraction,
-            "fem_reward": fem_reward if fem_reward is not None else 0.0,
-            "island_penalty": island_penalty,
-            "loose_penalty": calculate_island_penalty(1, loose_voxels, total_voxels, penalty_per_island=0.0)
-            if loose_voxels > 0
-            else 0.0,
-            "volume_penalty": 0.0,
-            "validity_penalty": -1.0 if fem_collapsed else 0.0,
-            "n_islands": n_islands,
-            "loose_voxels": loose_voxels,
-            "disconnected_volume_fraction": loose_voxels / total_voxels if total_voxels > 0 else 0.0,
-            "total": (fem_reward if fem_reward is not None else connectivity_bonus) - island_penalty,
-        }
+        else:
+            _, connected_load_fraction = calculate_connectivity_reward(
+                state.density, bc_tuple, force_tuple
+            )
 
         pv_branches = select_pv_branches(
             mcts_wrapper.root,
@@ -339,13 +570,141 @@ def _run_episode_loop(
             executed_actions = []
             executed_action_stats = None
 
-        value_target = fem_reward if (state.phase == Phase.REFINEMENT and fem_reward is not None) else None
+        adopted_probe = False
+        if (
+            cur_phase == Phase.REFINEMENT
+            and not fem_collapsed
+            and fem_reward is not None
+            and config.p2_remove_probe_prob > 0.0
+            and vol_frac >= config.p2_remove_probe_min_vol
+            and rng.random() < config.p2_remove_probe_prob
+        ):
+            probe_actions = _build_sed_or_policy_probe_batch(
+                state.density,
+                bc_tuple,
+                force_tuple,
+                state.load_config,
+                policy_remove,
+                sed_map=sed_map,
+                domain_mask=state.domain_mask,
+                max_k=current_config.action_batch_size,
+            )
+            if probe_actions:
+                probes_run += 1
+                probe_density = state.density.copy()
+                for ch, ax, ay, az in probe_actions:
+                    probe_density[ax, ay, az] = 1.0 if ch == 0 else 0.0
+                probe_vol = float(np.mean(probe_density > 0.5))
+                probe_isl = analyze_structure_islands(
+                    probe_density, state.load_config, bc_masks=bc_tuple, forces=force_tuple
+                )
+                probe_sed: Optional[np.ndarray] = None
+                if probe_isl["is_connected"]:
+                    probe_fem = evaluate_main_island(
+                        probe_density,
+                        state.load_config,
+                        probe_isl["main_island_mask"],
+                        bc_type=bc_type,
+                        backend=config.fem_backend,
+                        bc_masks=bc_masks_arg,
+                        forces=forces_arg,
+                        compute_sed=config.record_sed_map,
+                    )
+                    probe_comp = float(probe_fem.compliance) if probe_fem.valid else None
+                    probe_disp = float(probe_fem.max_displacement) if probe_fem.valid else None
+                    probe_sed = probe_fem.sed_map if (probe_fem.valid and config.record_sed_map) else None
+                    probe_fem_r = (
+                        float(calculate_reward(probe_comp, probe_vol, True, probe_disp))
+                        if probe_fem.valid and probe_comp is not None
+                        else -1.0
+                    )
+                else:
+                    probe_comp = None
+                    probe_disp = None
+                    probe_fem_r = -1.0
+
+                probe_tag = "sed_hybrid_topk" if sed_map is not None else "remove_topk"
+                record_fem_probe(
+                    db_path=db_path,
+                    game_id=state.game_id,
+                    step=state.current_step,
+                    probe_type=probe_tag,
+                    density=probe_density,
+                    is_connected=bool(probe_isl["is_connected"]),
+                    compliance_fem=probe_comp,
+                    max_displacement=probe_disp,
+                    volume_fraction=probe_vol,
+                    fem_reward=probe_fem_r,
+                    sed_map=probe_sed,
+                )
+
+                # Compare against MCTS step whenever MCTS had 0 REMOVE or probe offers real FEM improvement
+                has_remove_in_mcts = any(ch == 1 for ch, _, _, _ in executed_actions)
+                if probe_isl["is_connected"] and probe_fem_r > -1.0 and ((not has_remove_in_mcts) or sed_map is not None):
+                    mcts_next_r = float(fem_reward)
+                    if executed_actions:
+                        mcts_next_dens = state.density.copy()
+                        for ch, ax, ay, az in executed_actions:
+                            mcts_next_dens[ax, ay, az] = 1.0 if ch == 0 else 0.0
+                        mcts_isl = analyze_structure_islands(
+                            mcts_next_dens, state.load_config, bc_masks=bc_tuple, forces=force_tuple
+                        )
+                        if mcts_isl["is_connected"]:
+                            mcts_fem = evaluate_main_island(
+                                mcts_next_dens,
+                                state.load_config,
+                                mcts_isl["main_island_mask"],
+                                bc_type=bc_type,
+                                backend=config.fem_backend,
+                                bc_masks=bc_masks_arg,
+                                forces=forces_arg,
+                            )
+                            if mcts_fem.valid:
+                                mcts_next_r = float(
+                                    calculate_reward(
+                                        float(mcts_fem.compliance),
+                                        float(np.mean(mcts_next_dens > 0.5)),
+                                        True,
+                                        float(mcts_fem.max_displacement),
+                                    )
+                                )
+                            else:
+                                mcts_next_r = -1.0
+                        else:
+                            mcts_next_r = -1.0
+
+                    if probe_fem_r > mcts_next_r and probe_fem_r >= fem_reward - 0.002:
+                        executed_actions = probe_actions
+                        executed_action_stats = _inject_winning_probe_visits(
+                            result, probe_actions, probe_fem_r
+                        )
+                        adopted_probe = True
+                        probes_adopted += 1
+
+        reward_components = {
+            "base_reward": 0.0,
+            "connectivity_bonus": float(connectivity_bonus),
+            "connected_load_fraction": float(connected_load_fraction),
+            "fem_reward": float(fem_reward) if fem_reward is not None else 0.0,
+            "island_penalty": float(island_penalty),
+            "loose_penalty": calculate_island_penalty(1, loose_voxels, total_voxels, penalty_per_island=0.0)
+            if loose_voxels > 0
+            else 0.0,
+            "volume_penalty": 0.0,
+            "validity_penalty": -1.0 if fem_collapsed else 0.0,
+            "n_islands": int(n_islands),
+            "loose_voxels": int(loose_voxels),
+            "disconnected_volume_fraction": loose_voxels / total_voxels if total_voxels > 0 else 0.0,
+            "total": (float(fem_reward) if fem_reward is not None else float(connectivity_bonus)) - float(island_penalty),
+        }
+
+        value_target = fem_reward if (cur_phase == Phase.REFINEMENT and fem_reward is not None) else None
 
         record_step(
             db_path,
             state,
             result,
-            raw_net_val,
+            float(raw_net_val),
             policy_add,
             policy_remove,
             island_analysis=island_analysis,
@@ -360,112 +719,285 @@ def _run_episode_loop(
             fem_reward=fem_reward,
             displacement_map=displacement_map,
             executed_action_stats=executed_action_stats,
+            sed_map=sed_map,
         )
+        last_recorded_step = state.current_step
 
-        # Terminate immediately upon physical collapse or structural disconnection in Phase 2
         if fem_collapsed:
-            print(f"\n>>> Physical Collapse / Disconnection in Phase 2 at step {state.current_step}! <<<")
+            if config.verbose:
+                print(f"\n>>> Physical Collapse / Disconnection in Phase 2 at step {state.current_step}! <<<")
             final_score = -1.0
+            end_reason = "COLLAPSE"
             state.current_step += 1
             break
 
-        # Apply executed edits once and update MCTS tree properly for single vs multi-branch
+        if cur_phase == Phase.REFINEMENT:
+            phase2_steps_run += 1
+            p2_add_actions += sum(1 for c, _, _, _ in executed_actions if c == 0)
+            p2_rem_actions += sum(1 for c, _, _, _ in executed_actions if c == 1)
+
         if executed_actions:
             apply_micro_batch(state, executed_actions)
-            if len(pv_branches) == 1:
+
+        if cur_phase == Phase.REFINEMENT:
+            terminal_reward = get_phase2_terminal_reward(
+                state.density,
+                state.load_config,
+                bc_masks=bc_tuple,
+                forces=force_tuple,
+            )
+            if terminal_reward is not None:
+                if config.verbose:
+                    print(f"\n>>> Terminal state detected: reward={terminal_reward} <<<")
+                final_score = float(terminal_reward)
+                end_reason = "TERMINAL"
+                state.current_step += 1
+                break
+            if len(state.compliance_history) >= 15:
+                window = state.compliance_history[-15:]
+                min_c, max_c = min(window), max(window)
+                if max_c > 1e-9 and (max_c - min_c) / max_c < 1e-3:
+                    end_reason = "CONVERGENCE"
+                    state.current_step += 1
+                    break
+            if phase2_steps_run >= config.max_phase2_steps:
+                end_reason = "MAX_PHASE2_STEPS"
+                state.current_step += 1
+                break
+
+        if executed_actions and not adopted_probe:
+            if len(pv_branches) == 1 and pv_branches[0]:
                 for act, _, _ in pv_branches[0]:
                     mcts_wrapper.step(act)
+                if cur_phase == Phase.GROWTH:
+                    mcts_wrapper.eval_cache = {}
             elif not pv_branches and len(executed_actions) == 1:
                 mcts_wrapper.step(executed_actions[0])
+                if cur_phase == Phase.GROWTH:
+                    mcts_wrapper.eval_cache = {}
             else:
                 mcts_wrapper.clear_tree()
+        elif adopted_probe:
+            mcts_wrapper.clear_tree()
 
-        # Check Phase 1 -> Phase 2 transition; ALWAYS reset tree & cache across phases
-        if state.phase == Phase.GROWTH:
+        if cur_phase == Phase.GROWTH:
             if check_phase_transition(state):
-                print(f"\n>>> Phase Transition at step {state.current_step}! <<<")
+                phase1_steps_to_connect = state.current_step + 1
+                if config.verbose:
+                    print(f"\n>>> Phase Transition at step {phase1_steps_to_connect}! <<<")
                 state.phase = Phase.REFINEMENT
                 state.is_connected = True
                 state.compliance_history = []
                 mcts_wrapper.reset()
-            elif state.current_step >= config.max_phase1_steps:
-                print("\n>>> Max Phase 1 steps reached, forcing transition <<<")
-                state.phase = Phase.REFINEMENT
-                state.compliance_history = []
-                mcts_wrapper.reset()
-
-        # Check cheap structural terminal conditions after Phase 2 action
-        if state.phase == Phase.REFINEMENT:
-            terminal_reward = get_phase2_terminal_reward(state.density, state.load_config)
-            if terminal_reward is not None:
-                print(f"\n>>> Terminal state detected: reward={terminal_reward} <<<")
-                final_score = float(terminal_reward)
+            elif state.current_step + 1 >= config.max_phase1_steps:
+                if config.verbose:
+                    print(f"\n>>> Phase 1 timeout at step {state.current_step + 1} <<<")
+                final_score = -1.0
+                end_reason = "PHASE1_TIMEOUT"
                 state.current_step += 1
                 break
 
-        if state.phase == Phase.REFINEMENT and fem_reward is not None:
-            final_score = float(max(-1.0, min(1.0, 0.5 * fem_reward + 0.5 * raw_net_val - island_penalty)))
+        if cur_phase == Phase.REFINEMENT and fem_reward is not None:
+            final_score = float(max(-1.0, min(1.0, fem_reward - island_penalty)))
         else:
             final_score = float(max(-1.0, min(1.0, raw_net_val)))
 
         step_time = time.time() - step_start
-        if state.current_step % 10 == 0:
+        if config.verbose and state.current_step % 10 == 0:
             comp_str = f"C: {compliance:.1f}" if compliance is not None else "C: ---"
             print(
-                f"Step {state.current_step:4d} | Phase: {state.phase.value:10s} | "
+                f"Step {state.current_step:4d} | Phase: {cur_phase.value:10s} | "
                 f"V: {raw_net_val:+.3f} | {comp_str} | Vol: {vol_frac:.3f} | "
                 f"Isl: {n_islands} | B: {connectivity_bonus:.2f} | T: {step_time:.1f}s"
             )
 
         state.current_step += 1
-        update_game_final(
-            db_path=db_path,
-            game_id=state.game_id,
-            final_score=final_score,
-            final_compliance=last_valid_compliance,
-            final_volume=float(np.mean(state.density > 0.5)),
-            total_steps=state.current_step,
+
+    # Record final post-action terminal snapshot grounded in real FEM
+    isl_final = analyze_structure_islands(
+        state.density, state.load_config, bc_masks=bc_tuple, forces=force_tuple
+    )
+    vol_final = float(np.mean(state.density > 0.5))
+    vox_final = int((state.density > 0.5).sum())
+    isl_pen_final = calculate_island_penalty(isl_final["n_islands"], isl_final["loose_voxels"], vox_final)
+    _, conn_frac_final = calculate_connectivity_reward(state.density, bc_tuple, force_tuple)
+
+    comp_final: Optional[float] = None
+    max_disp_final: Optional[float] = None
+    fem_reward_final: Optional[float] = None
+    disp_map_final: Optional[np.ndarray] = None
+    sed_map_final: Optional[np.ndarray] = None
+    if isl_final["is_connected"]:
+        fem_res_f = evaluate_main_island(
+            state.density,
+            state.load_config,
+            isl_final["main_island_mask"],
+            bc_type=bc_type,
+            backend=config.fem_backend,
+            bc_masks=bc_masks_arg,
+            forces=forces_arg,
+            compute_sed=config.record_sed_map,
+        )
+        if fem_res_f.valid:
+            comp_final = float(fem_res_f.compliance)
+            max_disp_final = float(fem_res_f.max_displacement)
+            disp_map_final = fem_res_f.displacement_map if config.record_displacement_map else None
+            sed_map_final = fem_res_f.sed_map if config.record_sed_map else None
+            fem_reward_final = float(calculate_reward(comp_final, vol_final, True, max_disp_final))
+            last_valid_compliance = comp_final
+            final_score = float(max(-1.0, min(1.0, fem_reward_final - isl_pen_final)))
+        else:
+            final_score = -1.0
+    else:
+        final_score = -1.0
+
+    state.is_connected = bool(isl_final["is_connected"])
+
+    if state.current_step != last_recorded_step:
+        st_final = build_state_tensor(state.density, bc_tuple, force_tuple)
+        try:
+            raw_val_final, pa_final, pr_final = model.predict(st_final, domain_mask=state.domain_mask)
+        except TypeError:
+            raw_val_final, pa_final, pr_final = model.predict(st_final)
+        dummy_res = SearchResult(
+            actions=[],
+            visit_distribution={},
+            root_value=float(raw_val_final),
+            num_simulations=0,
+            root=None,
+        )
+        rc_final = {
+            "base_reward": 0.0,
+            "connectivity_bonus": 0.0,
+            "connected_load_fraction": float(conn_frac_final),
+            "fem_reward": float(fem_reward_final) if fem_reward_final is not None else -1.0,
+            "island_penalty": float(isl_pen_final),
+            "loose_penalty": 0.0,
+            "volume_penalty": 0.0,
+            "validity_penalty": 0.0 if isl_final["is_connected"] else -1.0,
+            "n_islands": int(isl_final["n_islands"]),
+            "loose_voxels": int(isl_final["loose_voxels"]),
+            "disconnected_volume_fraction": isl_final["loose_voxels"] / vox_final if vox_final > 0 else 0.0,
+            "total": float(final_score),
+        }
+        record_step(
+            db_path,
+            state,
+            dummy_res,
+            float(raw_val_final),
+            pa_final,
+            pr_final,
+            island_analysis=isl_final,
+            compliance_fem=comp_final,
+            max_displacement=max_disp_final,
+            island_penalty=isl_pen_final,
+            volume_fraction=vol_final,
+            reward_components=rc_final,
+            executed_actions=[],
+            connected_load_fraction=conn_frac_final,
+            value_target=fem_reward_final if fem_reward_final is not None else -1.0,
+            fem_reward=fem_reward_final,
+            displacement_map=disp_map_final,
+            executed_action_stats=None,
+            sed_map=sed_map_final,
         )
 
-        if state.phase == Phase.REFINEMENT and len(state.compliance_history) >= 20:
-            window = state.compliance_history[-20:]
-            min_c, max_c = min(window), max(window)
-            if max_c > 1e-9 and (max_c - min_c) / max_c < 1e-3:
-                print("\n>>> Convergence Detected! Compliance stable over 20 steps <<<")
-                break
-
+    total_recorded_steps = state.current_step + 1
     total_time = time.time() - start_time
-    vol_frac = float(np.mean(state.density > 0.5))
-    print(f"\n{'='*60}")
-    print(
-        f"Episode Complete! Steps={state.current_step}, Phase={state.phase.value}, "
-        f"Score={final_score:.4f}, Vol={vol_frac:.3f}, Time={total_time:.1f}s"
-    )
-    print(f"{'='*60}")
+    if config.verbose:
+        print(f"\n{'='*60}")
+        print(
+            f"Episode Complete ({end_reason}, T{tier}:{family})! Steps={total_recorded_steps}, Phase={state.phase.value}, "
+            f"Score={final_score:.4f}, Vol={vol_final:.3f}, C={comp_final}, Time={total_time:.1f}s"
+        )
+        print(f"{'='*60}")
 
     update_game_final(
         db_path=db_path,
         game_id=state.game_id,
         final_score=final_score,
         final_compliance=last_valid_compliance,
-        final_volume=vol_frac,
-        total_steps=state.current_step,
+        final_volume=vol_final,
+        total_steps=total_recorded_steps,
     )
     backpropagate_value_targets(db_path, state.game_id)
-    return state.game_id, final_score, state.current_step
+
+    stats = {
+        "game_id": state.game_id,
+        "tier": int(tier),
+        "family": str(family),
+        "resolution": list(state.density.shape),
+        "bc_type": bc_type,
+        "load_config": dict(state.load_config),
+        "end_reason": end_reason,
+        "connected_final": bool(isl_final["is_connected"]),
+        "reached_phase2": bool(phase1_steps_to_connect is not None or state.phase == Phase.REFINEMENT),
+        "phase1_steps": phase1_steps_to_connect,
+        "phase2_steps": phase2_steps_run,
+        "total_steps": total_recorded_steps,
+        "final_score": float(final_score),
+        "final_compliance": comp_final,
+        "final_volume": float(vol_final),
+        "p2_add_actions": p2_add_actions,
+        "p2_rem_actions": p2_rem_actions,
+        "probes_run": probes_run,
+        "probes_adopted": probes_adopted,
+        "elapsed_sec": round(total_time, 2),
+    }
+    return state.game_id, float(final_score), total_recorded_steps, stats
 
 
-def run_episode(
+def run_episode_with_stats(
     model: AlphaBuilderInference,
     db_path: Path,
     config: EpisodeConfig,
-) -> Tuple[str, float, int]:
-    """Run a fresh self-play episode."""
-    load_config = generate_random_load_config(config.resolution)
+    load_config: Optional[Dict[str, Any]] = None,
+    scenario: Optional[SelfPlayScenario] = None,
+) -> Tuple[str, float, int, Dict[str, Any]]:
+    """Run a fresh self-play episode with optional `SelfPlayScenario` or `load_config` and return telemetry."""
+    rng = random.Random(config.seed) if config.seed is not None else None
+    if scenario is not None:
+        res = scenario.resolution
+        cfg = dict(scenario.load_config)
+        resolved_bc = scenario.bc_type
+        bc_masks = scenario.bc_masks
+        forces = scenario.forces
+        domain_mask = scenario.domain_mask
+        tier = scenario.tier
+        family = scenario.family
+    else:
+        res = config.resolution
+        cfg = dict(load_config) if load_config is not None else None
+        if cfg is None:
+            scen = sample_curriculum_scenario(
+                generation=config.generation,
+                tier_weights=config.tier_weights,
+                rng=rng,
+            )
+            res = scen.resolution
+            cfg = dict(scen.load_config)
+            resolved_bc = scen.bc_type
+            bc_masks = scen.bc_masks
+            forces = scen.forces
+            domain_mask = scen.domain_mask
+            tier = scen.tier
+            family = scen.family
+        else:
+            resolved_bc = str(cfg.get("bc_type", config.bc_type)).upper()
+            cfg["bc_type"] = resolved_bc
+            bc_masks = None
+            forces = None
+            domain_mask = None
+            tier = 0
+            family = "custom"
+
     state = create_empty_state(
-        resolution=config.resolution,
-        load_config=load_config,
-        bc_type=config.bc_type,
+        resolution=res,
+        load_config=cfg,
+        bc_type=resolved_bc,
+        bc_masks=bc_masks,
+        forces=forces,
+        domain_mask=domain_mask,
     )
     engine_name = getattr(
         model,
@@ -475,20 +1007,35 @@ def run_episode(
     game_info = GameInfo(
         game_id=state.game_id,
         neural_engine=engine_name,
-        checkpoint_version=f"selfplay-gen{config.generation}",
+        checkpoint_version=f"selfplay-gen{config.generation}-T{tier}",
         bc_masks=state.bc_masks,
         forces=state.forces,
         load_config=state.load_config,
-        bc_type=config.bc_type,
-        resolution=config.resolution,
+        bc_type=resolved_bc,
+        resolution=res,
         final_compliance=None,
         final_volume=None,
         total_steps=0,
         initial_cantilever_problem_real_scale_factor=500000.0,
         stiffness_E=200e9,
+        domain_mask=state.domain_mask,
     )
     save_game(db_path, game_info)
-    return _run_episode_loop(state, model, db_path, config)
+    return _run_episode_loop(state, model, db_path, config, tier=tier, family=family)
+
+
+def run_episode(
+    model: AlphaBuilderInference,
+    db_path: Path,
+    config: EpisodeConfig,
+    load_config: Optional[Dict[str, Any]] = None,
+    scenario: Optional[SelfPlayScenario] = None,
+) -> Tuple[str, float, int]:
+    """Run a fresh self-play episode."""
+    game_id, score, steps, _ = run_episode_with_stats(
+        model, db_path, config, load_config=load_config, scenario=scenario
+    )
+    return game_id, score, steps
 
 
 def resume_episode(
@@ -523,6 +1070,7 @@ def resume_episode(
         is_connected=last_game_step.is_connected,
         game_id=game_id,
         compliance_history=[],
+        domain_mask=game_info.domain_mask.copy() if game_info.domain_mask is not None else None,
     )
 
     if last_game_step.selected_actions:
@@ -534,4 +1082,5 @@ def resume_episode(
     if state.phase == Phase.GROWTH and state.current_step >= config.max_phase1_steps:
         state.phase = Phase.REFINEMENT
 
-    return _run_episode_loop(state, model, db_path, config)
+    gid, score, steps, _ = _run_episode_loop(state, model, db_path, config)
+    return gid, score, steps

@@ -170,6 +170,29 @@ def connectivity_loss(
     return loss_vec.mean()
 
 
+def sed_loss(
+    pred_sed_u: torch.Tensor,
+    target_sed: torch.Tensor,
+    sed_mask: Optional[torch.Tensor] = None,
+    beta: float = 0.5,
+) -> torch.Tensor:
+    """
+    Masked SmoothL1 loss on dense Strain Energy Density field (`log1p(SED)` predicted
+    on channel 0 of `sed_head` output `(B, 4, D, H, W)`).
+    """
+    pred_s = pred_sed_u[:, :1].float()
+    target_s = target_sed.float()
+    if target_s.ndim == 4:
+        target_s = target_s.unsqueeze(1)
+    per_sample = F.smooth_l1_loss(pred_s, target_s, reduction="none", beta=beta).mean(dim=(1, 2, 3, 4))
+    if sed_mask is not None:
+        valid = sed_mask.reshape(-1) > 0.5
+        if not valid.any():
+            return pred_sed_u.sum() * 0.0
+        return per_sample[valid].mean()
+    return per_sample.mean()
+
+
 def compute_log_c_mae(
     pred_log_c: torch.Tensor,
     target_log_c: torch.Tensor,
@@ -271,18 +294,22 @@ def compute_total_loss(
     pred_conn_logit: Optional[torch.Tensor] = None,
     target_conn: Optional[torch.Tensor] = None,
     conn_mask: Optional[torch.Tensor] = None,
+    pred_sed_u: Optional[torch.Tensor] = None,
+    target_sed: Optional[torch.Tensor] = None,
+    sed_mask: Optional[torch.Tensor] = None,
     lambda_policy: float = LAMBDA_POLICY,
     lambda_value: float = LAMBDA_VALUE,
     lambda_bp: float = LAMBDA_BLUEPRINT_WARMUP,
     lambda_log_c: float = 0.0,
     lambda_conn: float = 0.0,
+    lambda_sed: float = 0.0,
     w_neg: float = W_NEG,
     huber_beta: float = HUBER_BETA,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute multi-head loss:
         L_total = lambda_policy * L_pol + lambda_value * L_val + lambda_bp * L_bp
-                  + lambda_log_c * L_logC + lambda_conn * L_conn
+                  + lambda_log_c * L_logC + lambda_conn * L_conn + lambda_sed * L_sed
     """
     p_loss = policy_loss(
         pred_policy,
@@ -315,6 +342,12 @@ def compute_total_loss(
         total = total + lambda_conn * c_loss_tensor
         conn_val = float(c_loss_tensor.detach().item())
 
+    sed_val = 0.0
+    if pred_sed_u is not None and target_sed is not None and lambda_sed > 0.0:
+        s_loss_tensor = sed_loss(pred_sed_u, target_sed, sed_mask=sed_mask)
+        total = total + lambda_sed * s_loss_tensor
+        sed_val = float(s_loss_tensor.detach().item())
+
     return total, {
         "loss": float(total.detach().item()),
         "core_loss": core_val,
@@ -323,6 +356,7 @@ def compute_total_loss(
         "blueprint_loss": bp_val,
         "log_c_loss": log_c_val,
         "conn_loss": conn_val,
+        "sed_loss": sed_val,
     }
 
 

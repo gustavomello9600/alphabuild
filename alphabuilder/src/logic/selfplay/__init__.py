@@ -25,6 +25,8 @@ from .storage import (
     get_incomplete_games,
     generate_game_id,
     backpropagate_value_targets,
+    record_fem_probe,
+    merge_selfplay_dbs,
 )
 
 from .reward import (
@@ -78,6 +80,8 @@ __all__ = [
     'get_incomplete_games',
     'generate_game_id',
     'backpropagate_value_targets',
+    'record_fem_probe',
+    'merge_selfplay_dbs',
     'calculate_connectivity_reward',
     'calculate_displacement_penalty',
     'calculate_pbrs_potential',

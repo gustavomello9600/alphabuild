@@ -39,6 +39,7 @@ def get_legal_add_moves(
     threshold: float = 0.5,
     include_supports: bool = True,
     bc_masks: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+    domain_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Get valid positions for adding material.
@@ -66,6 +67,9 @@ def get_legal_add_moves(
 
         support_valid = support_mask * (1.0 - solid.astype(np.float32))
         valid_add = np.maximum(valid_add, support_valid)
+
+    if domain_mask is not None:
+        valid_add = valid_add * (domain_mask > 0.5).astype(np.float32)
 
     return valid_add
 
@@ -102,9 +106,10 @@ def get_legal_moves(
     threshold: float = 0.5,
     bc_masks: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
     forces: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+    domain_mask: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Get all legal moves `(valid_add, valid_remove)` for current state."""
-    valid_add = get_legal_add_moves(density, threshold, bc_masks=bc_masks)
+    valid_add = get_legal_add_moves(density, threshold, bc_masks=bc_masks, domain_mask=domain_mask)
     valid_remove = get_legal_remove_moves(density, threshold, bc_masks=bc_masks, forces=forces)
     return valid_add, valid_remove
 
@@ -176,6 +181,7 @@ def is_terminal_state(
     threshold: float = 0.5,
     bc_masks: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
     forces: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+    domain_mask: Optional[np.ndarray] = None,
 ) -> Tuple[bool, str]:
     """Check if MCTS simulation leaf state is terminal."""
     solid = density > threshold
@@ -187,7 +193,9 @@ def is_terminal_state(
     if vol_fraction < min_volume_fraction:
         return True, "structure_too_small"
 
-    valid_add, valid_remove = get_legal_moves(density, threshold, bc_masks=bc_masks, forces=forces)
+    valid_add, valid_remove = get_legal_moves(
+        density, threshold, bc_masks=bc_masks, forces=forces, domain_mask=domain_mask
+    )
     if valid_add.sum() == 0 and valid_remove.sum() == 0:
         return True, "no_legal_moves"
 

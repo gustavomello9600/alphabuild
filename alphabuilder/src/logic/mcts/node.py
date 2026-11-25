@@ -119,10 +119,12 @@ class MCTSNode:
         top_k: Optional[int] = None,
         min_prior_threshold: float = 1e-6,
         temperature: float = 1.0,
+        min_remove_candidates: int = 0,
+        remove_prior_floor: float = 0.0,
     ) -> None:
         """
         Expand leaf node using masked joint softmax over legal actions.
-        Priors are strictly renormalized after top_k / threshold pruning so sum == 1.0.
+        Priors are strictly renormalized after top_k / threshold / remove-quota pruning so sum == 1.0.
         """
         if self.is_expanded:
             return
@@ -164,9 +166,61 @@ class MCTSNode:
                 add_priors, remove_priors, valid_add, valid_remove, -1.0
             )
 
-        if top_k is not None and len(candidates_list) > top_k:
+        if min_remove_candidates > 0:
+            # Ensure top legal REMOVE candidates are gathered even if raw joint prior < min_prior_threshold
+            rem_coords = np.argwhere(valid_remove > 0)
+            rem_cands = [
+                ((1, int(c[0]), int(c[1]), int(c[2])), float(remove_priors[c[0], c[1], c[2]]))
+                for c in rem_coords
+            ]
+            rem_cands.sort(key=lambda x: x[1], reverse=True)
+            add_cands = [item for item in candidates_list if item[0][0] == 0]
+            add_cands.sort(key=lambda x: x[1], reverse=True)
+
+            if top_k is not None:
+                n_rem = min(len(rem_cands), int(min_remove_candidates), int(top_k))
+                n_add = min(len(add_cands), int(top_k) - n_rem)
+                kept = add_cands[:n_add] + rem_cands[:n_rem]
+                # Backfill extra REMOVE slots if fewer ADD candidates were available
+                if len(kept) < int(top_k) and len(rem_cands) > n_rem:
+                    extra = min(len(rem_cands) - n_rem, int(top_k) - len(kept))
+                    kept.extend(rem_cands[n_rem : n_rem + extra])
+                candidates_list = kept
+            else:
+                kept_rem_set = {a for a, _ in candidates_list if a[0] == 1}
+                for act, pr in rem_cands[: int(min_remove_candidates)]:
+                    if act not in kept_rem_set:
+                        candidates_list.append((act, pr))
+        elif top_k is not None and len(candidates_list) > top_k:
             candidates_list.sort(key=lambda x: x[1], reverse=True)
             candidates_list = candidates_list[:top_k]
+
+        if not candidates_list:
+            self.is_expanded = True
+            return
+
+        if remove_prior_floor > 0.0:
+            add_items = [(a, float(p)) for a, p in candidates_list if a[0] == 0]
+            rem_items = [(a, float(p)) for a, p in candidates_list if a[0] == 1]
+            if add_items and rem_items:
+                sum_add = sum(p for _, p in add_items)
+                sum_rem = sum(p for _, p in rem_items)
+                tot = sum_add + sum_rem
+                rem_frac = (sum_rem / tot) if tot > 0.0 else 0.0
+                floor = float(min(max(remove_prior_floor, 0.0), 0.95))
+                if rem_frac < floor:
+                    if sum_rem > 0.0:
+                        rem_scaled = [(a, floor * (p / sum_rem)) for a, p in rem_items]
+                    else:
+                        u_r = floor / len(rem_items)
+                        rem_scaled = [(a, u_r) for a, _ in rem_items]
+                    add_target = 1.0 - floor
+                    if sum_add > 0.0:
+                        add_scaled = [(a, add_target * (p / sum_add)) for a, p in add_items]
+                    else:
+                        u_a = add_target / len(add_items)
+                        add_scaled = [(a, u_a) for a, _ in add_items]
+                    candidates_list = add_scaled + rem_scaled
 
         # Mandatory post-pruning prior renormalization before Dirichlet noise
         kept_sum = float(sum(float(p) for _, p in candidates_list))

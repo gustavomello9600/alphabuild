@@ -32,6 +32,8 @@ class MCTSConfig(NamedTuple):
     root_exploration_fraction: float = 0.25
     policy_temperature: float = 1.0
     mixmax_beta: float = 1.0
+    min_remove_candidates: int = 0
+    remove_prior_floor: float = 0.0
 
 
 # Phase 1 (Growth): allow empty initial grid (min_volume_fraction = 0.0) and MixMax backup
@@ -246,6 +248,8 @@ def expand_node(
         top_k=config.top_k_expansion,
         min_prior_threshold=config.min_prior_threshold,
         temperature=config.policy_temperature,
+        min_remove_candidates=config.min_remove_candidates,
+        remove_prior_floor=config.remove_prior_floor,
     )
 
 
@@ -266,6 +270,7 @@ def run_mcts_search(
     predict_batch_fn: Optional[
         Callable[[List[np.ndarray]], Tuple[List[float], List[np.ndarray], List[np.ndarray]]]
     ] = None,
+    domain_mask: Optional[np.ndarray] = None,
 ) -> SearchResult:
     """Run batch or sequential MCTS simulations from root state."""
     if eval_cache is None:
@@ -288,14 +293,14 @@ def run_mcts_search(
         if not root.is_expanded:
             value, p_add, p_remove = _eval_single(root_density)
             valid_add, valid_remove = get_legal_moves(
-                root_density, config.density_threshold, bc_masks=bc_masks, forces=forces
+                root_density, config.density_threshold, bc_masks=bc_masks, forces=forces, domain_mask=domain_mask
             )
             expand_node(root, p_add, p_remove, valid_add, valid_remove, config)
             root.update(value)
     else:
         root_value, policy_add, policy_remove = _eval_single(root_density)
         valid_add, valid_remove = get_legal_moves(
-            root_density, config.density_threshold, bc_masks=bc_masks, forces=forces
+            root_density, config.density_threshold, bc_masks=bc_masks, forces=forces, domain_mask=domain_mask
         )
         root = MCTSNode(prior=1.0)
         expand_node(root, policy_add, policy_remove, valid_add, valid_remove, config)
@@ -341,6 +346,7 @@ def run_mcts_search(
                     threshold=config.density_threshold,
                     bc_masks=bc_masks,
                     forces=forces,
+                    domain_mask=domain_mask,
                 )
 
                 if is_terminal:
@@ -358,7 +364,11 @@ def run_mcts_search(
                     value, p_add, p_remove = eval_cache[state_hash]
                     if not leaf.is_expanded:
                         valid_add, valid_remove = get_legal_moves(
-                            leaf_density, config.density_threshold, bc_masks=bc_masks, forces=forces
+                            leaf_density,
+                            config.density_threshold,
+                            bc_masks=bc_masks,
+                            forces=forces,
+                            domain_mask=domain_mask,
                         )
                         expand_node(leaf, p_add, p_remove, valid_add, valid_remove, config)
                     ready_to_backup.append((path, value))
@@ -384,7 +394,11 @@ def run_mcts_search(
                     eval_cache[sha] = (val, p_a, p_r)
                     if not leaf.is_expanded:
                         valid_add, valid_remove = get_legal_moves(
-                            leaf_density, config.density_threshold, bc_masks=bc_masks, forces=forces
+                            leaf_density,
+                            config.density_threshold,
+                            bc_masks=bc_masks,
+                            forces=forces,
+                            domain_mask=domain_mask,
                         )
                         expand_node(leaf, p_a, p_r, valid_add, valid_remove, config)
                     ready_to_backup.append((path, val))
@@ -405,6 +419,7 @@ def run_mcts_search(
                 threshold=config.density_threshold,
                 bc_masks=bc_masks,
                 forces=forces,
+                domain_mask=domain_mask,
             )
 
             if is_terminal:
@@ -417,7 +432,11 @@ def run_mcts_search(
             else:
                 value, policy_add, policy_remove = _eval_single(leaf_density)
                 valid_add, valid_remove = get_legal_moves(
-                    leaf_density, config.density_threshold, bc_masks=bc_masks, forces=forces
+                    leaf_density,
+                    config.density_threshold,
+                    bc_masks=bc_masks,
+                    forces=forces,
+                    domain_mask=domain_mask,
                 )
                 expand_node(leaf, policy_add, policy_remove, valid_add, valid_remove, config)
 
@@ -477,6 +496,7 @@ class AlphaBuilderMCTS:
         density: np.ndarray,
         bc_masks: Tuple[np.ndarray, np.ndarray, np.ndarray],
         forces: Tuple[np.ndarray, np.ndarray, np.ndarray],
+        domain_mask: Optional[np.ndarray] = None,
     ) -> SearchResult:
         result = run_mcts_search(
             root_density=density,
@@ -487,6 +507,7 @@ class AlphaBuilderMCTS:
             root_node=self.root,
             eval_cache=self.eval_cache,
             predict_batch_fn=self.predict_batch_fn,
+            domain_mask=domain_mask,
         )
         self.root = result.root
         return result
@@ -505,6 +526,7 @@ class AlphaBuilderMCTS:
         density: np.ndarray,
         bc_masks: Tuple[np.ndarray, np.ndarray, np.ndarray],
         forces: Tuple[np.ndarray, np.ndarray, np.ndarray],
+        domain_mask: Optional[np.ndarray] = None,
     ) -> SearchResult:
         """Run MCTS search, forwarding batch predictor and persisting root."""
         result = run_mcts_search(
@@ -516,6 +538,7 @@ class AlphaBuilderMCTS:
             root_node=self.root,
             eval_cache=self.eval_cache,
             predict_batch_fn=self.predict_batch_fn,
+            domain_mask=domain_mask,
         )
         self.root = result.root
         return result

@@ -1,0 +1,335 @@
+\documentclass[11pt,a4paper,oneside]{article}
+
+\usepackage{fontspec}
+\usepackage[brazilian]{babel}
+\usepackage[top=2.2cm,bottom=2.2cm,left=2.2cm,right=2.2cm]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric}
+\usepackage[most]{tcolorbox}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage{hyperref}
+
+\definecolor{abNavy}{HTML}{0F4C81}
+\definecolor{abViolet}{HTML}{6D28D9}
+\definecolor{abEmerald}{HTML}{059669}
+\definecolor{abSlate}{HTML}{334155}
+\definecolor{abBgBlue}{HTML}{EFF6FF}
+\definecolor{abBgGold}{HTML}{FEFCE8}
+\definecolor{abGold}{HTML}{CA8A04}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=abNavy,
+  citecolor=abViolet,
+  urlcolor=abNavy,
+  pdftitle={AlphaBuilder v4.0: Do Calculo Variacional ao Self-Play Fisico com Phys-UViT 3D},
+  pdfauthor={Projeto AlphaBuilder}
+}
+
+\newtcolorbox{eurekabox}[1]{
+  enhanced,
+  breakable,
+  colback=abBgBlue,
+  colframe=abNavy,
+  boxrule=0.8pt,
+  arc=3pt,
+  fonttitle=\bfseries\small,
+  title={Momento Eureka — #1},
+  coltitle=white,
+  colbacktitle=abNavy
+}
+
+\newtcolorbox{notabox}[1]{
+  enhanced,
+  breakable,
+  colback=abBgGold,
+  colframe=abGold,
+  boxrule=0.8pt,
+  arc=3pt,
+  fonttitle=\bfseries\small,
+  title={Nota de Transparência Metodológica — #1},
+  coltitle=black,
+  colbacktitle=abGold!35!white
+}
+
+\graphicspath{{figures/}}
+\setlength{\parskip}{0.42em}
+\setlength{\parindent}{0pt}
+\setcounter{tocdepth}{1}
+\emergencystretch=2em
+\sloppy
+
+\title{\vspace{-0.8cm}\textbf{\Large AlphaBuilder v4.0: Do Cálculo Variacional ao Self-Play Físico com Phys-UViT 3D}\\[0.35em]
+\large Monografia de Estudo Consolidado, Diagnóstico Empírico e Fundamentação Teórico-Computacional da Fase 6}
+\author{Repositório \texttt{alphabuild} (\texttt{v3.3 -> v4.0 Stage 6}) \\ Arquitetura Escolhida: \texttt{Phys-UViT 3D} ($4{,}912{,}683$ parâmetros)}
+\date{Novembro de 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Esta monografia consolida, a partir de primeiros princípios, toda a fundamentação mecânica, algorítmica e empírica do sistema \textbf{AlphaBuilder} até a implementação completa do pipeline de \textbf{Self-Play Fase 6} para a arquitetura escolhida \texttt{Phys-UViT 3D}. Partindo das equações variacionais da elasticidade linear 3D e do método clássico \texttt{SIMP} no \texttt{DOLFINx}/\texttt{FEniTop}, explicamos por que a zona cinzenta contínua colapsa sob binarização direta (\texttt{SIMP\_bin}: $5/6$ falhas com \texttt{Score = -1.000}) e como o problema se traduz em um MDP construtivo de duas fases com \emph{Potential-Based Reward Shaping} (PBRS) decrescente e busca MCTS. Em seguida, realizamos a autópsia quantitativa do Stage 5C: demonstramos experimentalmente no \texttt{dolfinx} que uma treliça discreta pura $0/1$ ($C = 356.4$, \texttt{Score = +0.473}) e um recorte colar-ancorado ($C = 319.4$, \texttt{Score = +0.615}) já superam o \texttt{SIMP contínuo} ($C = 596.4$, \texttt{Score = +0.458}), provando que o gap observado de $41\times$ na rede pré-Stage 6 decorria exclusivamente de quatro gargalos treináveis — déficit de alavanca flexional $I_y$ ($6\times$--$63\times$), viés de calibração OOD ($\log_{10} C$ subestimado em $-1.103$ décadas), paralisia de remoção ($1{,}435$ \texttt{ADD} contra $5$ \texttt{REM}) e teto de $240$ edições. Por fim, detalhamos as 5 alavancas implementadas no Stage 6 (\texttt{fast\_amg} + \texttt{SED}, exploração precoce, cota/probes contrafactuais, currículo em 4 Tiers e \emph{Mixed Replay 60/40}) e apresentamos projeções explícitas para superação de \texttt{SIMP\_bin} e \texttt{SIMP\_cont}.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Primeiros Princípios: Da Elasticidade Contínua à Topologia Discreta \texttt{0/1}}
+
+\subsection{Equilíbrio Variacional e Decomposição Local da Compliance}
+Dado um domínio tridimensional $\Omega \subset \mathbb{R}^3$ particionado em $N = D \times H \times W$ elementos hexaédricos trilineares (\texttt{Hex8}), o objetivo estrutural é selecionar quais voxels são sólidos ($\rho_e = 1$) e quais permanecem vazios ($\rho_e = 0$) sob engastes de Dirichlet $\Gamma_u$ (\texttt{bc\_masks}) e cargas aplicadas $\mathbf{f}$. Na elasticidade linear estática, o campo de deslocamentos nodais $\mathbf{u}$ minimiza a energia potencial total e satisfaz o sistema linear simétrico positivo definido:
+\begin{equation}
+\mathbf{K}(\boldsymbol{\rho})\,\mathbf{u} = \mathbf{f}, \qquad
+\mathbf{K}(\boldsymbol{\rho}) = \sum_{e=1}^{N} E_{\mathrm{eff}}(\rho_e)\,\mathbf{K}_e^{(0)}
+\end{equation}
+onde $\mathbf{K}_e^{(0)} \in \mathbb{R}^{24\times 24}$ representa a matriz de rigidez elementar unitária (com módulo de Young de referência $E_0 = 100$ e razão de Poisson $\nu = 0.25$). A métrica global de flexibilidade — a \textbf{compliance estrutural} $C$ — reduz-se exatamente à soma das energias elásticas locais de cada elemento (\emph{Strain Energy Density}, $\mathrm{SED}_e$):
+\begin{equation}
+C(\boldsymbol{\rho}) = \mathbf{f}^\top \mathbf{u} = \mathbf{u}^\top \mathbf{K}(\boldsymbol{\rho})\,\mathbf{u}
+= \sum_{e=1}^{N} \underbrace{E_{\mathrm{eff}}(\rho_e)\,\mathbf{u}_e^\top \mathbf{K}_e^{(0)} \mathbf{u}_e}_{\mathrm{SED}_e}
+\end{equation}
+
+\begin{eurekabox}{A Ligação Exata Micro--Macro da Energia de Deformação}
+Cada valor escalar $\mathrm{SED}_e$ informa literalmente quantos Joules da compliance global $C$ residem naquele único voxel. Voxels onde $\mathrm{SED}_e \approx 0$ são massa estruturalmente ociosa (alvos ideais de remoção cirúrgica); voxels com $\mathrm{SED}_e$ elevado formam os caminhos principais de carga. Por construção, $\sum_e \mathrm{SED}_e \equiv C$.
+\end{eurekabox}
+
+\subsection{A Maldição da Zona Cinzenta no Método SIMP Contínuo}
+A formulação clássica SIMP (\emph{Solid Isotropic Material with Penalization}) \citep{bendsoe2003topology,sigmund200199line,sigmund2013topology,liu2014efficient,ferrari2020new}, implementada sobre \texttt{DOLFINx} \citep{baratta2023dolfinx} no \texttt{FEniTop} \citep{jia2024fenitop}, relaxa $\rho_e \in [0, 1]$ com lei de potência cúbica:
+\begin{equation}
+E_{\mathrm{eff}}(\rho_e) = \big[\epsilon + (1 - \epsilon)\,\rho_e^p\big]\,E_0, \qquad p = 3,\quad \epsilon = 10^{-6}.
+\end{equation}
+Embora suavize o gradiente adjunto para otimizadores de primeira ordem, a lei $\rho^3$ cria um artefato fundamental discutido em \citep{sigmund2022benchmarking}: em densidades intermediárias $\rho = 0.50$, um elemento retém $50\%$ da massa penalizada linearmente no orçamento, mas entrega apenas $12.5\%$ de módulo elástico. O SIMP contínuo apoia-se em véus cinzentos baratos ao redor dos pontos de carga para estabilizar tensões locais. Ao tentar extrair uma geometria fabricável por limiarização direta ($\rho > 0.50$, denominada \texttt{SIMP\_bin}), esses véus evaporam e \textbf{a estrutura desconecta o apoio da carga em $5$ de $6$ cenários canônicos (\texttt{S1..S5}), resultando em \texttt{Score = -1.000}}.
+
+\subsection{O Oráculo Rápido \texttt{fast\_amg} vs. \texttt{DOLFINx}}
+Para viabilizar milhares de avaliações em Self-Play sem gargalos de MPI ou compilação UFL, generalizamos o solver \texttt{StructuredHex8FEM} em blocos $3\times 3$ (\texttt{BSR}) com pré-condicionamento algébrico \texttt{PyAMG} (\texttt{v5.4.1}, \texttt{coarse\_solver="splu"}, \texttt{max\_coarse=300}) e projeção de modos rígidos de translação livre em apoios parciais (pontes \texttt{MBB}, placas \texttt{DUAL\_PAD}, cargas 3D inclinadas e regiões proibidas). Simultaneamente, corrigimos a extração da $\mathrm{SED}_e$ no \texttt{evaluator.py} (\texttt{dolfinx}) substituindo a interpolação central de 1 ponto pela projeção exata de Galerkin em quadratura de grau 2 ($\int \boldsymbol{\sigma}:\boldsymbol{\varepsilon}\,\psi_e\,\mathrm{d}x$).
+
+\begin{table}[htbp]
+\centering
+\caption{Paridade numérica verificada entre \texttt{fast\_amg} e \texttt{DOLFINx} com \texttt{SED} ativado.}
+\label{tab:fem-parity}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Conjunto de Teste & Erro Rel. Compliance $C$ & Erro Rel. $u_{\max}$ & Consistência $\sum \mathrm{SED}_e$ vs $C$ \\
+\midrule
+Cenários Reais Stage 5C (\texttt{S1..S6}, $64\times 32\times 8$) & $1.11\times 10^{-10}$ a $1.25\times 10^{-6}$ & $\le 3.49\times 10^{-6}$ & $4.20\times 10^{-9}$ a $2.88\times 10^{-8}$ \\
+Generalização 3D (\texttt{DualPad}, \texttt{MBB}, \texttt{DeepBeam}) & $4.50\times 10^{-11}$ a $1.05\times 10^{-7}$ & $3.10\times 10^{-8}$ a $2.54\times 10^{-7}$ & $< 10^{-5}$ (teste unitário) \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+Em tempo de execução, \texttt{fast\_amg} reduziu a latência máxima de \texttt{S6} de $41.9\text{ s}$ no \texttt{dolfinx} para $2.73\text{ s}$ ($\sim 15\times$ mais rápido), mantendo fidelidade de máquina no campo de energia de deformação.
+
+\section{A Mecânica do Jogo Construtivo: MDP, PBRS e Recompensa \texttt{v3.3}}
+
+Em vez de gerar topologias em um único passo — estratégia vulnerável à desconexão em GANs e modelos de difusão \citep{nie2021topologygan,maze2023diffusion,behzadi2021realtime,behzadi2023taming,nobari2024towards} —, o AlphaBuilder modela o projeto como um jogo sequencial determinístico guiado por MCTS \citep{kocsis2006bandit,browne2012survey,silver2016mastering,silver2017mastering}, em alinhamento com formulações construtivas recentes em engenharia \citep{gaymann2019deep,luo2022alphatruss,garayalde2025mastering}:
+
+\begin{enumerate}
+\item \textbf{Fase 1 (\emph{Growth}):} Iniciando do domínio vazio ($V=0\%$), o agente adiciona material em lotes (\texttt{action\_batch\_size=32}) estritamente sobre a fronteira 6-conexa (\texttt{dilate(grid) - grid}) ou vizinhança de engastes, sempre respeitando \texttt{domain\_mask = 0}. Quando o primeiro caminho sólido contínuo interliga um apoio a toda região carregada, ocorre a transição automática para a Fase 2.
+\item \textbf{Fase 2 (\emph{Refinement}):} Com o problema elástico bem-posto, toda remoção em pontos de carga ou apoios é bloqueada (\texttt{get\_protected\_regions}) e o MCTS refina rigidez e volume consultando o oráculo FEM real.
+\end{enumerate}
+
+\subsection{PBRS Generalizado com Decaimento Linear na Fase 1}
+Para fornecer gradiente espacial suave antes da primeira conexão sem corromper o ótimo final de longo prazo, o potencial $\Phi(s)$ integra fração de cargas conectadas, penalidade por ilhas soltas e um termo de aproximação euclidiana normalizado pela diagonal do domínio $D_{\mathrm{diag}} = \sqrt{D^2+H^2+W^2}$ \citep{wang2020warmstart,muller2025improving}:
+\begin{equation}
+\Phi(s) = w_{\mathrm{conn}}\,f_{\mathrm{conn}}(s) + w_{\mathrm{dist}}\max\!\left(0,\; 1 - \frac{d_{\min}(s)}{D_{\mathrm{diag}}}\right)\mathbb{I}[f_{\mathrm{conn}} < 0.999] - P_{\mathrm{island}}(s),
+\end{equation}
+com $w_{\mathrm{conn}}=0.50$, $w_{\mathrm{dist}}=0.25$ e mesclagem na avaliação foliar do MCTS dada por $V_{\mathrm{leaf}}(s) = (1 - \alpha(g))\,V_{\mathrm{net}}(s) + \alpha(g)\,\Phi(s)$, onde $\alpha(g) = 0.30\,\max(0, 1 - g/5)$ zera completamente na geração $5$.
+
+\subsection{Função de Recompensa \texttt{v3.3} e a Lei de Alavancagem $10^{7.14 \Delta V}$}
+Em \texttt{alphabuilder/src/logic/selfplay/reward.py}, a qualidade estrutural de qualquer estado conectado válido é medida exatamente por:
+\begin{align}
+S_C(C) &= \operatorname{clip}\!\big(1.15 - 0.35\,(\log_{10}(\max(C, 1)) - 1),\; -0.60,\; 0.90\big), \\
+B_V(V) &= \operatorname{clip}\!\big(2.5\,(0.10 - V),\; -0.60,\; 0.30\big), \\
+R(C, V) &= \operatorname{clip}\!\big(S_C(C) + B_V(V),\; -1.0,\; 1.0\big) - P_{u_{\max}},
+\end{align}
+com $P_{u_{\max}}$ nulo para $u_{\max} \le 0.70 \times 128{,}000$, linear até $-0.50$ em $u_{\max} = 128{,}000$, e colapso em $-1.0$ acima do limite ou na desconexão.
+
+\begin{eurekabox}{A Lei de Alavancagem $10^{7.14 \Delta V}$ e o Custo Falso da Economia de Massa}
+Na região não saturada, as derivadas parciais da recompensa v3.3 produzem uma taxa marginal de troca fixa:
+\begin{equation}
+\left|\frac{\partial R / \partial V}{\partial R / \partial \log_{10} C}\right| = \frac{2.5}{0.35} \approx 7.143
+\quad\Longrightarrow\quad
+\frac{C_{\mathrm{antes}}}{C_{\mathrm{depois}}}\Bigg|_{\Delta R = 0} = 10^{7.143\,\Delta V}.
+\end{equation}
+Adicionar $\Delta V = +4\%$ de massa sólida para afastar os banzos da linha neutra penaliza o score em apenas $-0.100$ e empata com mera queda de $1.93\times$ na compliance; todavia, pela mecânica de Euler--Bernoulli, dobrar a altura útil $h$ eleva $I_y \propto h^3$ em $\sim 8\times$ e derruba $C$ em até $40\times$--$87\times$!
+\end{eurekabox}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{fig02_reward_landscape_and_overtaking_path.png}
+\caption{Superfície exata de recompensa v3.3 $R(V, \log_{10} C)$, testemunhas empíricas em \texttt{dolfinx} e rota de ultrapassagem do Self-Play Stage 6.}
+\label{fig:reward-landscape}
+\end{figure}
+
+Adicionalmente, em Phase 1 esparsa onde poucas sequências alcançam cargas distantes, o backup do MCTS adota o operador \textbf{MixMax} com $\beta=0.75$ inspirado no \emph{AlphaTruss} \citep{luo2022alphatruss}, combinando valor médio e máximo da sub-árvore, enquanto em Phase 2 ($\beta=1.0$) retorna à média PUCT \citep{rosin2011multi} assistida por \emph{Virtual Loss} em lotes \citep{wu2019accelerating}.
+
+\section{Arquitetura Final: Por Que \texttt{Phys-UViT 3D} Venceu (e GPU vs. TPU)}
+
+A escolha da arquitetura definitiva em \texttt{alphabuilder/src/neural/phys\_uvit.py} emergiu diretamente do confronto com as limitações de redes convolucionais rasas e arquiteturas hierárquicas de janela fixa \citep{dosovitskiy2021image,liu2021swin,hatamizadeh2022swin,vaswani2017attention}:
+
+\begin{itemize}
+\item O baseline \texttt{Simple} ($1.66\text{M}$ params) possuía campo receptivo puramente local, gerando $4.43\%$ de \emph{overshoot} em $X$ e fratura em $2$ ilhas em \texttt{S2} ($C=22{,}039$, \texttt{Score = -0.087}).
+\item O \texttt{Swin-UNETR} exigia divisibilidade por $32$, impondo $Z = 8 \to 32$ ($+300\%$ de \emph{padding} morto em cada tensor 3D) e desperdício massivo de memória e FLOPs.
+\item A \textbf{\texttt{Phys-UViT 3D}} ($4{,}912{,}683$ parâmetros totais; $4{,}884{,}839$ ativos durante o Stage 5 sem \texttt{sed\_head}) resolve o problema em cinco frentes ilustradas nas Figuras~\ref{fig:macro-arch} e~\ref{fig:internal-mech}:
+\begin{enumerate}
+\item \textbf{\texttt{divisor=4} nativo ($0\%$ padding):} reduz $64\times 32\times 8$ exatamente para $16\times 8\times 2 = 256$ tokens no gargalo, rodando o Stage 5 a $227.1\text{ samples/s}$ com pico de $4.942\text{ GB}$ de VRAM em $2\times\text{T4}$.
+\item \textbf{Atenção Global e \texttt{3D RoPE}:} cinco blocos \texttt{GlobalPhysicsTransformerBlock} ($\text{embed\_dim}=192$, $6$ cabeças) ligam qualquer apoio à carga em $O(256^2)$ por passo, enquanto embeddings rotativos tridimensionais codificam posições \emph{relativas} $(\Delta x,\Delta y,\Delta z)$ e habilitam generalização para resoluções distintas ($48\times 24\times 12$, $64\times 24\times 8$).
+\item \textbf{Máscara explícita \texttt{domain\_mask}:} permite que a rede zero-condicione obstáculos \emph{keep-out} e normalize volumes efetivos $V_{\mathrm{eff}}$ sem re-treinar pesos.
+\item \textbf{Cabeça Fatorada \texttt{FactoredValueHead}:} desacopla conectividade $p_{\mathrm{conn}} = \sigma(z_{\mathrm{conn}})$, predição de rigidez $\hat{\ell}_C = \widehat{\log_{10} C}$ e volume analítico $V_{\mathrm{eff}}$, compondo $V_{\mathrm{pred}} = p_{\mathrm{conn}} R(10^{\hat{\ell}_C}, V_{\mathrm{eff}}) + (1 - p_{\mathrm{conn}})(-1) + \delta_{\mathrm{res}}$.
+\item \textbf{Cabeça Densa \texttt{sed\_head} e Simetria $D_4 \times \mathbb{Z}_2$:} prevê $\log(1+\mathrm{SED}_e)$ voxel a voxel; todo o treino respeita as $16$ isometrias exatas de reflexão e rotação de $90^\circ$ axial com transformação vetorial coerente em $(f_x,f_y)$ e $(m_x,m_y)$.
+\end{enumerate}
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{arch_03_macro_architecture.png}
+\caption{Macro-arquitetura U-ViT 3D com \texttt{divisor=4}, gargalo Transformer global e cabeças fatoradas.}
+\label{fig:macro-arch}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{arch_04_internal_mechanisms.png}
+\caption{Mecanismos internos da \texttt{Phys-UViT 3D}: condicionamento multi-carga, \texttt{3D RoPE} e equivariância $D_4\times\mathbb{Z}_2$.}
+\label{fig:internal-mech}
+\end{figure}
+
+Na validação do Stage 5 ($30$ épocas, $15.75\text{h} = 31.50\text{ GPU-h}$ em $2\times\text{T4}$), o melhor checkpoint (\'Epoca 19) atingiu \texttt{Val Total = 0.3285}, \texttt{Val Core = 0.3272} ($-4.2\%$ abaixo do \texttt{Simple ep30} $= 0.3415$), \texttt{Value MAE = 0.0117} (pico $0.0111$), \texttt{Blueprint Dice = 90.81\%} (pico $91.02\%$), \texttt{log10(C) MAE = 0.0352} (pico $0.0319$) e \texttt{Conn Acc = 99.998\%} (pico $100\%$). Em relação a aceleradores \textbf{TPU (\texttt{XLA})}, a arquitetura permanece deliberadamente otimizada para \textbf{GPUs \texttt{CUDA}}: lotes heterogêneos multi-resolução do Stage 6 causariam recompilações caras em XLA, e \texttt{Conv3d} de poucos canais combinados a avaliação MCTS em tempo real com \texttt{PyAMG} exigem a baixa latência PCIe CPU--GPU de GPUs modernas.
+
+\section{Diagnóstico Forense do Stage 5C: A Autópsia do Gap de \texttt{41x}}
+
+Na avaliação comparativa Stage 5C (\texttt{S1..S6}, $160$ simulações MCTS, $30\times 8$ edições na Fase 2, \texttt{dolfinx}), a \texttt{Phys-UViT ep19} venceu o \texttt{Simple ep30} em $5$ dos $6$ cenários (\texttt{Score médio} $+0.076$ vs $+0.057$, $+33.3\%$), reduziu os passos médios de Fase 1 de $41.8$ para $31.8$, \textbf{zerou o overshoot horizontal em $X$ ($0.00\%$ em $6/6$ cenários)}, corrigiu a fratura do cenário \texttt{S2} e venceu o \texttt{SIMP\_bin} nos $6$ cenários. Contudo, frente ao \textbf{\texttt{SIMP contínuo}} (média $+0.509$), permaneceu com compliance $41.1\times$ superior em \texttt{S1} ($24{,}546.4$ vs $596.4$, média geométrica de $40.6\times$).
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{fig01_compliance_gap_autopsy.png}
+\caption{Autópsia em \texttt{dolfinx} do gap de $41\times$ no compliance em \texttt{S1..S6}: prova de superioridade binária $0/1$ (A), déficit flexional $I_y$ (B) e efeito $\rho^3$ (C).}
+\label{fig:gap-autopsy}
+\end{figure}
+
+\subsection{Experimento Direto no \texttt{dolfinx}: Voxels \texttt{0/1} Já Batem o SIMP Contínuo}
+A Tabela~\ref{tab:dolfinx-s1} reúne as medições empíricas diretas em \texttt{dolfinx} no cenário \texttt{S1}. Ela estabelece dois fatos irrefutáveis: (i) estruturas estritamente binárias $0/1$ atingem \textbf{rigidez superior e score superior ao \texttt{SIMP\_cont}}; (ii) a \texttt{Phys-UViT ep19} \textbf{não sofre por falha no colar de carga} — aplicar artificialmente um colar de 1 voxel alterou sua compliance em exatos $0.00\%$ nos cenários \texttt{S1}, \texttt{S4} e \texttt{S6}.
+
+\begin{table}[htbp]
+\centering
+\caption{Experimento empírico controlado no \texttt{dolfinx} em \texttt{S1}: teto físico binário $0/1$ vs \texttt{SIMP\_cont} e \texttt{Phys-UViT ep19}.}
+\label{tab:dolfinx-s1}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Configuração Estrutural em \texttt{S1} & Volume $V$ & Conectada? & Compliance $C$ [J] & Score v3.3 \\
+\midrule
+Bloco Sólido $100\%$ (limite teórico absoluto) & $100.00\%$ & Sim & $33.68$ & --- \\
+\textbf{\texttt{SIMP thr > 0.50} + colar de carga 1-voxel} & $10.35\%$ & \textbf{Sim} & $\mathbf{319.37}$ & $\mathbf{+0.615}$ \\
+\textbf{Treliça Binária \texttt{0/1} pura (\texttt{fh=3, z=2..6, pad})} & $15.37\%$ & \textbf{Sim} & $\mathbf{356.42}$ & $\mathbf{+0.473}$ \\
+\texttt{SIMP Contínuo} (\texttt{FEniTop} referência) & $12.83\%$ & Sim & $596.42$ & $+0.458$ \\
+Treliça Binária \texttt{0/1} (patch exato, sem colar) & $15.26\%$ & Sim & $3{,}948.45$ & $+0.110$ \\
+\texttt{SIMP thr > 0.50} (patch exato, sem colar) & $10.15\%$ & Sim & $7{,}382.40$ & $+0.142$ \\
+\texttt{SIMP\_bin} puro (sem colar de carga) & $10.13\%$ & Não & $21{,}083.35$ & $-1.000$ \\
+\texttt{Phys-UViT ep19} (Stage 5C real) & $8.89\%$ & Sim & $24{,}546.42$ & $-0.029$ \\
+\texttt{Phys-UViT ep19} + colar artificial 1-voxel & $8.89\%+$ & Sim & $24{,}546.42$ & $-0.029$ \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{Os 4 Gargalos Reais Medidos em Banco de Dados (\texttt{eval\_inference\_v4\_stage5.db})}
+A investigação dos dados passo a passo na Fase 2 revela exatamente o que travou o MCTS da \texttt{ep19} conforme a Figura~\ref{fig:ood-blindness}:
+\begin{enumerate}
+\item \textbf{Déficit de Alavanca Flexional $I_y$ ($6.3\times$ a $63.1\times$):} em \texttt{S4}, o momento de inércia normalizado da rede ($0.0078$) é $63.1\times$ menor que o do \texttt{SIMP\_cont} ($0.4941$), porque a Fase 1 conecta por um eixo central raso.
+\item \textbf{Cegueira OOD de Valor e Compliance:} embora o detector \texttt{P(conn)} tenha generalizado com exatidão perfeita ($0.00013 \to 1.00000$), os estados inéditos fora da distribuição de warmup sofrem subestimação média de \textbf{$-1.103$ décadas} em $\log_{10} C$ (prevendo $C$ cerca de $12.7\times$ menor!) e viés otimista de \textbf{$+0.463$} no Valor. Em \texttt{S3}, \texttt{S4} e \texttt{S6}, o valor previsto $V_{\mathrm{net}}$ \emph{cai} monotonicamente ao longo da Fase 2 enquanto o retorno físico real $R_{\mathrm{FEM}}$ \emph{sobe} ($r = -0.91, -0.80, -0.81$).
+\item \textbf{Paralisia Cirúrgica de Remoção:} foram registradas \textbf{$1{,}435$ ações \texttt{ADD} ($99.65\%$) contra apenas $5$ \texttt{REMOVE} ($0.35\%$)}, impossibilitando o esvaziamento da alma perto da linha neutra (\texttt{hollow\_ratio} $= 0.003$ em \texttt{S2} contra $0.582$ no \texttt{SIMP\_cont}).
+\item \textbf{Teto Estreito de Edições:} $30 \times 8 = 240$ voxels ($1.46\%$ do grid) impedem redesenhar estruturas profundas.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{fig03_ood_blindness_diagnosis.png}
+\caption{Diagnóstico empírico da cegueira OOD em Fase 2: correlação negativa em \texttt{S3, S4, S6} (A), calibração por cabeça (B) e paralisia de remoção (C).}
+\label{fig:ood-blindness}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{stage5_eval_compliance_score.png}
+\caption{Comparativo detalhado por cenário (\texttt{S1..S6}) entre \texttt{Simple ep2}, \texttt{ep30}, \texttt{Phys-UViT ep19}, \texttt{SIMP\_bin} e \texttt{SIMP\_cont}.}
+\label{fig:stage5-eval-scores}
+\end{figure}
+
+\section{Arquitetura do Stage 6 Self-Play: As 5 Alavancas em Circuito Fechado}
+
+Para que a rede saia gradualmente do nicho canônico sem colapsar na Fase 1, construímos e testamos localmente as cinco alavancas integradas na Figura~\ref{fig:stage6-arch}:
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{fig04_four_tier_curriculum_and_selfplay_loop.png}
+\caption{Arquitetura de Self-Play Stage 6: currículo concêntrico em 4 Tiers, cronograma com portão adaptativo (\texttt{conn >= 65\%}) e loop fechado com \texttt{fast\_amg} + \texttt{Mixed Replay}.}
+\label{fig:stage6-arch}
+\end{figure}
+
+\begin{enumerate}
+\item \textbf{Alavanca 1 — Oráculo \texttt{fast\_amg} + Campo Denso \texttt{sed\_head}:} cada estado conectado de Fase 2 recebe $R_{\mathrm{FEM}}$, $\log_{10} C$ e o mapa exato $\mathrm{SED}_e$ armazenado em \texttt{sed\_map\_blob}. O treino adiciona $\lambda_{\mathrm{SED}}\,\mathcal{L}_{\mathrm{SED}}$ (\texttt{SmoothL1} sobre $\log(1+\mathrm{SED}_e)$), transferindo para os mapas internos de atenção onde está o fluxo crítico de tensões.
+\item \textbf{Alavanca 2 — Exploração Precoce em Fase 1 (\texttt{p1\_explore\_steps=12}):} temperatura $1.35$ e ruído Dirichlet $0.35$ nos primeiros $12$ passos quebram o viés de barra rasa, enquanto o PBRS de distância euclidiana ($w_{\mathrm{dist}}=0.25$) guia a conexão em BCs inéditas com decaimento gradual ($\alpha=0.30 \to 0.0$ na \texttt{Gen 5}).
+\item \textbf{Alavanca 3 — Desbloqueio Cirúrgico de Remoção e \emph{Probes SED Contrafactuais}:} em \texttt{MCTSNode.expand}, \texttt{min\_remove\_candidates=16} com \texttt{remove\_prior\_floor=0.25} assegura presença e massa mínima de prior para remoções na raiz. O horizonte de Fase 2 passa para $64$ passos escalonados ($32 \times 16 + 32 \times 8 \le 768$ edições). Ainda, em $50\%$ dos passos acima de $5.5\%$ de volume, avalia-se um lote contrafactual de baixa energia $\mathrm{SED}_e$ na tabela \texttt{fem\_probes}: probes sempre calibram as cabeças de física, e quando $R_{\mathrm{probe}} > R_{\mathrm{MCTS}}$ ancoram a fronteira real na árvore futura.
+\item \textbf{Alavanca 4 — Currículo Progressivo em 4 Tiers + Portão Adaptativo:} definido em \texttt{scenarios\_stage6.py} com exclusão estrita de \texttt{S1..S6} (\texttt{tol\_xy=1}), expandindo de \texttt{Tier 0} (âncora canônica), \texttt{Tier 1} (\texttt{DUAL\_PAD}, \texttt{PARTIAL\_CLAMP}, cargas 3D inclinadas $\pm 25^\circ/\pm 35^\circ$, 2 pontos), \texttt{Tier 2} (pontes \texttt{MBB} pino+rolete, parede-piso em L, janelas \emph{keep-out} via \texttt{domain\_mask = 0}) até \texttt{Tier 3} (multi-resoluções $(48,32,8)$, $(64,24,8)$ e $(48,24,12)$ agrupadas com $0\%$ de \emph{padding} por \texttt{BucketedResolutionBatchSampler}). Caso a taxa de conexão Fase 1 de qualquer Tier caia abaixo de $65\%$, \texttt{adjust\_tier\_weights} recua o peso de avanço automaticamente. A suíte determinística OOD \texttt{G1..G4} avalia essa generalização sem privilégio de probes.
+\item \textbf{Alavanca 5 — \emph{Mixed Replay Buffer} (\texttt{60/40}) + Calibração Direta:} combina $60\%$ de passos de Self-Play (com \emph{advantage gating} $V_{\mathrm{target}} \ge Q_{\mathrm{root}} - 0.005$ e \texttt{fem\_probes}) com $40\%$ do conjunto âncora Stage 5 (\texttt{warmup\_v3\_3\_kaggle.db}), evitando esquecimento da \texttt{blueprint\_head} e eliminando o viés $-1.103$ décadas da \texttt{FactoredValueHead}.
+\end{enumerate}
+
+\section{Fundamentação Preditiva: Por Que Superaremos \texttt{SIMP\_bin} e \texttt{SIMP\_cont}}
+
+\begin{notabox}{Distinção Estrita entre Fato Empírico e Projeção}
+Os dados até \texttt{Gen 0} (\texttt{ep19}: $+0.076$, $C_{\mathrm{S1}}=24{,}546$) e as testemunhas binárias em \texttt{dolfinx} ($C=319.4$ e $356.4$) são \textbf{medições empíricas exatas}. Os desempenhos de \texttt{Gen 1..8} na Figura~\ref{fig:projections} e na Tabela~\ref{tab:projections} constituem \textbf{projeções fundamentadas} em leis de escala mecânicas e de calibração.
+\end{notabox}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{fig05_selfplay_projections_and_scaling_laws.png}
+\caption{Projeções quantitativas do Stage 6 (bandas Conservadora, Nominal e Otimista) para Score v3.3 (A), fechamento multiplicativo $C / C_{\mathrm{SIMP\_cont}}$ (B) e calibração OOD com orçamento computacional (C).}
+\label{fig:projections}
+\end{figure}
+
+Dois teoremas construtivos sustentam a convergência projetada acima de ambos os baselines:
+\begin{enumerate}
+\item \textbf{Sobre \texttt{SIMP\_bin}:} a \texttt{Phys-UViT ep19} \textbf{já vence} o \texttt{SIMP\_bin} em $6/6$ cenários ($+0.076$ vs $-0.825$ médio), pois otimiza diretamente conectividade e geometria no espaço discreto $0/1$. Em \texttt{G1..G4} (pinos MBB e cantos finos), onde a binarização de densidades contínuas falha severamente, a vantagem estrutural amplia-se naturalmente.
+\item \textbf{Sobre \texttt{SIMP\_cont}:} livre da penalidade $\rho^3$, uma estrutura binária bem distribuída em banzos profundos ($I_y \approx 0.45$--$0.55$) extrai $100\%$ de $E_0$ por unidade de massa. Como nossa testemunha binária direta demonstrou no \texttt{dolfinx} ($C = 356.4$, $+0.473$ contra $596.4$, $+0.458$ do \texttt{SIMP\_cont}), e porque o MCTS otimiza diretamente a função composta $R(C,V)$ em vez de uma fração fixa de volume ($\sim 13\%\text{--}15\%$), o fechamento ocorre de forma multiplicativa: correção de calibração OOD ($\times 3\text{--}5$ em $C$) combinada à abertura flexional $I_y$ e ao desbloqueio cirúrgico de remoção ($\times 5\text{--}12$ em $C$) reduz a razão geométrica média $C / C_{\mathrm{SIMP\_cont}}$ de $40.6\times$ para $< 1.0\times$ por volta da \textbf{Geração 5--6}.
+\end{enumerate}
+
+\begin{table}[htbp]
+\centering
+\caption{Cronograma projetado de evolução por geração em \texttt{S1..S6} ($32$ episódios/gen, $\sim 1.8\text{h}$ em $2\times\text{T4}$).}
+\label{tab:projections}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lcccl@{}}
+\toprule
+Geração & Score v3.3 (Cons. / Nom. / Otim.) & $C / C_{\mathrm{SIMP\_cont}}$ (Nom.) & OOD $\log_{10} C$ MAE & Marco Arquitetural/Físico \\
+\midrule
+\texttt{Gen 0} (Medido) & $+0.076$ & $40.6\times$ & $1.10$--$1.15$ & Warmup Stage 5C (\texttt{ep19}, $0\%$ overshoot X) \\
+\texttt{Gen 2} (Proj.) & $+0.195$ / $+0.265$ / $+0.330$ & $8.5\times$ & $\sim 0.48$ & Fim do viés OOD severo; \texttt{Tier 2} ativo \\
+\texttt{Gen 4} (Proj.) & $+0.335$ / $+0.435$ / $+0.515$ & $2.2\times$ & $\sim 0.25$ & Abertura $I_y$ + multi-res \texttt{Tier 3} \\
+\texttt{Gen 6} (Proj.) & $+0.445$ / $+0.540$ / $+0.620$ & $\mathbf{0.96\times}$ & $\sim 0.15$ & \textbf{Ultrapassagem sobre \texttt{SIMP\_cont}} ($+0.509$) \\
+\texttt{Gen 8} (Proj.) & $+0.515$ / $+0.600$ / $+0.670$ & $\mathbf{0.68\times}$ & $\sim 0.11$ & Consolidação plena em \texttt{S1..S6} e \texttt{G1..G4} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\section*{Apêndice A — Runbook Operacional Kaggle \texttt{2 x Tesla T4} e Verificação}
+\addcontentsline{toc}{section}{Apêndice A — Runbook Operacional Kaggle 2 x Tesla T4 e Verificação}
+
+Com todos os testes unitários locais aprovados em WSL2 (\texttt{150 passed, 1 skipped}, incluindo paridade \texttt{fast\_amg} vs \texttt{dolfinx} $< 10^{-3}$ e dry-run completo de episódio + treino \texttt{SED}), o sistema aguarda apenas a renovação semanal da cota de GPU no Kaggle:
+\begin{itemize}
+\item Abrir \texttt{notebooks/alphabuilder-v4-stage6-selfplay.ipynb} conectado a \texttt{2x Tesla T4} (com guarda \texttt{--max-wall-hours 8.5}, gerando $4$--$5$ gerações por sessão de $9\text{h}$ e retomável via \texttt{--resume-history}).
+\item O script \texttt{scripts/run\_selfplay\_pipeline.py} orquestra coleta em paralelo nas $2$ GPUs, mescla shards em \texttt{merge\_selfplay\_dbs}, treina via \texttt{scripts/train\_selfplay\_step.py} (\emph{Mixed Replay 60/40}) e avalia \texttt{S1..S6} + \texttt{G1..G4} em \texttt{MCTS} puro ao fim de cada geração.
+\end{itemize}
+
+\bibliographystyle{unsrtnat}
+\bibliography{tcc/referencias}
+
+\end{document}

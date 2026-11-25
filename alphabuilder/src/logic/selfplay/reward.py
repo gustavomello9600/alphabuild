@@ -248,97 +248,69 @@ def get_phase1_reward(
 def check_structure_connectivity(
     density: np.ndarray,
     load_config: Dict[str, Any],
-    threshold: float = 0.5
+    threshold: float = 0.5,
+    bc_masks: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+    forces: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
 ) -> Tuple[bool, bool]:
     """
-    Check if structure connects support to load region.
-    
-    This is used for Phase 1 -> Phase 2 transition detection.
-    
-    Args:
-        density: Density grid (D, H, W)
-        load_config: Dictionary with 'x', 'y', 'z_start', 'z_end' keys
-        threshold: Binarization threshold
-        
-    Returns:
-        Tuple of (connected_to_support, reached_load)
+    Check if structure connects support (`bc_masks` or X=0) to the load region/patches.
+    Supports both legacy single-load cantilevers and arbitrary 3D multi-support/multi-load domains.
     """
-    nx, ny, nz = density.shape
-    
-    # Binarize
     binary = density > threshold
-    
-    # Label connected components
     labeled, n_components = ndimage.label(binary)
-    
     if n_components == 0:
         return False, False
-    
-    # Check support connection (X=0 plane)
-    support_labels = np.unique(labeled[0, :, :])
+
+    if bc_masks is not None:
+        support_mask = (bc_masks[0] > 0.5) | (bc_masks[1] > 0.5) | (bc_masks[2] > 0.5)
+        support_labels = (
+            np.unique(labeled[support_mask]) if np.any(support_mask) else np.unique(labeled[0, :, :])
+        )
+    else:
+        support_labels = np.unique(labeled[0, :, :])
     support_labels = support_labels[support_labels > 0]
-    
+
     if len(support_labels) == 0:
         return False, False
-    
+
     connected_to_support = True
-    
-    # Check load region connection using canonical bounds matching generators/optimization
+
+    if forces is not None:
+        force_mag = np.abs(forces[0]) + np.abs(forces[1]) + np.abs(forces[2])
+        load_mask = force_mag > 1e-6
+        if not np.any(load_mask):
+            return connected_to_support, False
+        if not np.all(binary[load_mask]):
+            return connected_to_support, False
+        present_labels = np.unique(labeled[load_mask])
+        present_labels = present_labels[present_labels > 0]
+        if len(present_labels) == 0:
+            return connected_to_support, False
+        reached_load = bool(np.all(np.isin(present_labels, support_labels)))
+        return connected_to_support, reached_load
+
     x_idx, y_min, y_max, z_min, z_max = get_load_region_bounds(density.shape, load_config)
-    
-    # Get labels exactly at load voxels
     load_slice_labels = labeled[x_idx, y_min:y_max, z_min:z_max]
-    
-    # Get unique labels in load region that are not background (0)
     present_labels = np.unique(load_slice_labels)
     present_labels = present_labels[present_labels > 0]
-    
+
     if len(present_labels) == 0:
         return connected_to_support, False
 
-    # Stricter Check:
-    # 1. All loaded voxels must be occupied (no gaps under load) -> IMPLICIT via present_labels?
-    # No, effectively we check if 'forces' are applied to material.
-    # But here we just check if the "load region" has material and is connected.
-    
-    # 2. All occupied load voxels must belong to a support-connected component
-    # Find labels that touch support
     valid_support_labels = np.intersect1d(support_labels, present_labels)
-    
     if len(valid_support_labels) == 0:
         return connected_to_support, False
-    
-    # Check if ALL present load voxels belong to valid support labels
-    # i.e., are there any islands in load region NOT connected to support?
-    # Ideally should be a SINGLE component.
-    
-    # Requirement: "all points of application are connected to supports by the SAME island"
-    # So we should find ONE label that covers ALL occupied load points? 
-    # Or just that all occupied load points are connected labels?
-    # "By A SAME island" implies 1 component.
-    
+
     if len(present_labels) > 1:
-        # Multiple disjoint islands in load region - fail
         return connected_to_support, False
-        
-    # Only 1 label in load region. Is it connected to support?
+
     label = present_labels[0]
     reached_load = label in support_labels
-    
-    # Also verify coverage? 
-    # If load implies 9 voxels, but we only have 1 voxel filled, is that "reached load"?
-    # The prompt says "all points of application ... connected".
-    # This implies all points where force is applied MUST have material AND be connected.
-    # So we check if load region is fully filled?
-    
-    # Count expected voxels volume
     expected_vol = (y_max - y_min) * (z_max - z_min)
     filled_vol = np.sum(load_slice_labels > 0)
-    
     if filled_vol < expected_vol:
-        # Not fully filled under load
         return connected_to_support, False
-    
+
     return connected_to_support, reached_load
 
 
@@ -440,26 +412,18 @@ def calculate_connectivity_reward(
 def get_phase2_terminal_reward(
     density: np.ndarray,
     load_config: Dict[str, Any],
-    threshold: float = 0.5
+    threshold: float = 0.5,
+    bc_masks: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+    forces: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
 ) -> Optional[float]:
     """
     Quick terminal check for Phase 2 (no FEM involved).
     
     Returns a terminal reward if the state is obviously bad (disconnected),
     otherwise returns None to indicate continuation.
-    
-    This is used INSIDE MCTS simulations where running FEM is too expensive.
-    
-    Args:
-        density: Density grid (D, H, W)
-        load_config: Load configuration
-        threshold: Binarization threshold
-        
-    Returns:
-        -1.0 if disconnected (terminal), None otherwise (continue)
     """
     connected_to_support, reached_load = check_structure_connectivity(
-        density, load_config, threshold
+        density, load_config, threshold, bc_masks=bc_masks, forces=forces
     )
     
     # If removed a critical connection, game over
@@ -530,12 +494,14 @@ def analyze_structure_islands(
     load_config: Dict[str, Any],
     threshold: float = 0.5,
     bc_masks: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+    forces: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
 ) -> Dict[str, Any]:
     """
     Analyze connected components (islands) in a structure.
 
     In Phase 1 (before reaching load), only voxels NOT anchored to support count
-    as `loose_voxels` so clean growth attached to X=0/supports is not penalized.
+    as `loose_voxels` so clean growth attached to supports is not penalized.
+    Supports both legacy single-load cantilevers and arbitrary multi-support/multi-load `forces`.
     """
     binary = density > threshold
 
@@ -568,10 +534,47 @@ def analyze_structure_islands(
             'is_connected': False,
         }
 
-    # Anchored voxels connected to supports (must not be counted as floating during growth)
     anchored_mask = np.isin(labeled, list(support_labels))
     anchored_voxels = int(anchored_mask.sum())
     unanchored_voxels = total_voxels - anchored_voxels
+
+    if forces is not None:
+        force_mag = np.abs(forces[0]) + np.abs(forces[1]) + np.abs(forces[2])
+        load_mask = force_mag > 1e-6
+        if not np.any(load_mask):
+            return {
+                'n_islands': n_islands,
+                'main_island_label': 0,
+                'main_island_mask': anchored_mask,
+                'main_island_voxels': anchored_voxels,
+                'loose_voxels': unanchored_voxels,
+                'is_connected': False,
+            }
+        filled_all_load = bool(np.all(binary[load_mask]))
+        labels_at_load = set(np.unique(labeled[load_mask])) - {0}
+        valid_islands = labels_at_load & support_labels
+        if not valid_islands:
+            return {
+                'n_islands': n_islands,
+                'main_island_label': 0,
+                'main_island_mask': anchored_mask,
+                'main_island_voxels': anchored_voxels,
+                'loose_voxels': unanchored_voxels,
+                'is_connected': False,
+            }
+        main_label = max(valid_islands, key=lambda lbl: int((labeled == lbl).sum()))
+        main_mask = np.isin(labeled, list(valid_islands))
+        main_voxels = int(main_mask.sum())
+        loose_voxels = total_voxels - main_voxels
+        is_conn = bool(filled_all_load and labels_at_load.issubset(support_labels))
+        return {
+            'n_islands': n_islands,
+            'main_island_label': int(main_label),
+            'main_island_mask': main_mask,
+            'main_island_voxels': main_voxels,
+            'loose_voxels': loose_voxels,
+            'is_connected': is_conn,
+        }
 
     x_idx, y_min, y_max, z_min, z_max = get_load_region_bounds(density.shape, load_config)
     load_slice_labels = labeled[x_idx, y_min:y_max, z_min:z_max]
@@ -736,22 +739,53 @@ def calculate_pbrs_potential(
     forces: Tuple[np.ndarray, np.ndarray, np.ndarray],
     load_config: Dict[str, Any],
     w_conn: float = 0.50,
+    w_dist: float = 0.25,
     threshold: float = 0.5,
 ) -> Tuple[float, Dict[str, Any]]:
     """
-    Compute state potential Phi(s) = w_conn * connected_load_fraction - island_penalty
+    Compute state potential Phi(s) = w_conn * conn_frac + dist_guidance - island_penalty
     for Potential-Based Reward Shaping (Muller & Kudenko, 2025).
+    `dist_guidance` softly rewards shortening the Euclidean gap from anchored material
+    to any disconnected load patch during Phase 1, and vanishes cleanly once connected.
     """
     _, conn_frac = calculate_connectivity_reward(density, bc_masks, forces, threshold=threshold)
-    analysis = analyze_structure_islands(density, load_config, threshold=threshold, bc_masks=bc_masks)
+    analysis = analyze_structure_islands(
+        density, load_config, threshold=threshold, bc_masks=bc_masks, forces=forces
+    )
     total_voxels = int((density > threshold).sum())
     island_pen = calculate_island_penalty(
         analysis['n_islands'],
         analysis['loose_voxels'],
         total_voxels,
     )
-    phi = float(w_conn * conn_frac - island_pen)
+
+    dist_bonus = 0.0
+    if w_dist > 0.0 and conn_frac < 0.999 and total_voxels > 0:
+        binary = density > threshold
+        labeled, n_comp = ndimage.label(binary)
+        if n_comp > 0:
+            support_mask = (bc_masks[0] > 0.5) | (bc_masks[1] > 0.5) | (bc_masks[2] > 0.5)
+            sup_lbls = set(np.unique(labeled[support_mask])) - {0} if np.any(support_mask) else set()
+            if sup_lbls:
+                anchored = np.isin(labeled, list(sup_lbls))
+                force_mag = np.abs(forces[0]) + np.abs(forces[1]) + np.abs(forces[2])
+                load_mask = force_mag > 1e-6
+                unconn_load = load_mask & (~anchored)
+                if np.any(unconn_load):
+                    surface = anchored ^ ndimage.binary_erosion(anchored)
+                    anc_pts = np.argwhere(surface if np.any(surface) else anchored)
+                    if len(anc_pts) > 512:
+                        step = max(1, len(anc_pts) // 512)
+                        anc_pts = anc_pts[::step]
+                    load_pts = np.argwhere(unconn_load)
+                    diff = anc_pts[:, None, :].astype(np.float32) - load_pts[None, :, :].astype(np.float32)
+                    min_dist = float(np.sqrt(np.min(np.sum(diff * diff, axis=-1))))
+                    diag = float(np.sqrt(sum(s * s for s in density.shape)))
+                    dist_bonus = float(w_dist * max(0.0, 1.0 - min_dist / max(diag, 1.0)))
+
+    phi = float(w_conn * conn_frac + dist_bonus - island_pen)
     analysis['island_penalty'] = island_pen
     analysis['connected_load_fraction'] = float(conn_frac)
+    analysis['distance_bonus'] = dist_bonus
     analysis['potential'] = phi
     return phi, analysis

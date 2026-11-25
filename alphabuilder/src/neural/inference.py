@@ -195,18 +195,41 @@ class AlphaBuilderInference:
         elif self.device.type == "cuda":
             torch.cuda.synchronize()
 
+    def _prepare_domain_mask(
+        self,
+        domain_mask: Optional[np.ndarray],
+        batch_size: int = 1,
+    ) -> Optional[torch.Tensor]:
+        if domain_mask is None:
+            return None
+        dm = np.ascontiguousarray(domain_mask, dtype=np.float32)
+        if dm.ndim == 3:
+            t = torch.from_numpy(dm).unsqueeze(0).unsqueeze(0)
+        elif dm.ndim == 4:
+            t = torch.from_numpy(dm).unsqueeze(0)
+        else:
+            t = torch.from_numpy(dm)
+        if t.shape[0] == 1 and batch_size > 1:
+            t = t.expand(batch_size, -1, -1, -1, -1)
+        return t.to(self.device)
+
     def predict(
         self,
         state: np.ndarray,
         return_raw_policy: bool = False,
+        domain_mask: Optional[np.ndarray] = None,
     ) -> Tuple[float, np.ndarray, np.ndarray]:
         """Predict (value, policy_add, policy_remove) for a single (7, D, H, W) state."""
         if self.is_npu:
             return self.backend.predict(state)
 
         tensor, original_shape = self.preprocess(state)
+        dm = self._prepare_domain_mask(domain_mask, 1) if self.architecture == "phys_uvit" else None
         with torch.no_grad():
-            pred_policy, pred_value = self.model(tensor)
+            if dm is not None:
+                pred_policy, pred_value = self.model(tensor, domain_mask=dm)
+            else:
+                pred_policy, pred_value = self.model(tensor)
         self._sync()
 
         value = float(pred_value.cpu().item())
@@ -218,6 +241,7 @@ class AlphaBuilderInference:
     def predict_with_blueprint(
         self,
         state: np.ndarray,
+        domain_mask: Optional[np.ndarray] = None,
     ) -> Tuple[float, np.ndarray, np.ndarray, np.ndarray]:
         """Predict (value, policy_add, policy_remove, blueprint_probs) for visualization/analysis."""
         if self.is_npu:
@@ -229,8 +253,12 @@ class AlphaBuilderInference:
             return float(pred_value.cpu().item()), pol[0], pol[1], bp_prob
 
         tensor, original_shape = self.preprocess(state)
+        dm = self._prepare_domain_mask(domain_mask, 1) if self.architecture == "phys_uvit" else None
         with torch.no_grad():
-            pred_policy, pred_value, pred_bp = self.model(tensor, return_blueprint=True)
+            if dm is not None:
+                pred_policy, pred_value, pred_bp = self.model(tensor, domain_mask=dm, return_blueprint=True)
+            else:
+                pred_policy, pred_value, pred_bp = self.model(tensor, return_blueprint=True)
         self._sync()
 
         value = float(pred_value.cpu().item())
@@ -242,15 +270,19 @@ class AlphaBuilderInference:
         self,
         state: np.ndarray,
         compute_sed: bool = False,
+        domain_mask: Optional[np.ndarray] = None,
     ) -> Tuple[float, np.ndarray, np.ndarray, Dict[str, object]]:
         """Predict (value, policy_add, policy_remove, aux_dict) including factored physics heads."""
         if self.architecture != "phys_uvit" or self.is_npu:
-            val, p_add, p_rem, bp_probs = self.predict_with_blueprint(state)
+            val, p_add, p_rem, bp_probs = self.predict_with_blueprint(state, domain_mask=domain_mask)
             return val, p_add, p_rem, {"blueprint_probs": bp_probs}
 
         tensor, original_shape = self.preprocess(state)
+        dm = self._prepare_domain_mask(domain_mask, 1)
         with torch.no_grad():
-            pred_policy, pred_value, aux = self.model(tensor, return_aux=True, compute_sed=compute_sed)
+            pred_policy, pred_value, aux = self.model(
+                tensor, domain_mask=dm, return_aux=True, compute_sed=compute_sed
+            )
         self._sync()
 
         value = float(pred_value.cpu().item())
@@ -267,6 +299,7 @@ class AlphaBuilderInference:
     def predict_batch(
         self,
         states: List[np.ndarray],
+        domain_mask: Optional[np.ndarray] = None,
     ) -> Tuple[List[float], List[np.ndarray], List[np.ndarray]]:
         """Predict (values, policies_add, policies_remove) for a batch of states."""
         if not states:
@@ -282,8 +315,12 @@ class AlphaBuilderInference:
             original_shapes.append(orig_shape)
 
         batch_tensor = torch.cat(tensors, dim=0)
+        dm = self._prepare_domain_mask(domain_mask, len(states)) if self.architecture == "phys_uvit" else None
         with torch.no_grad():
-            pred_policies, pred_values = self.model(batch_tensor)
+            if dm is not None:
+                pred_policies, pred_values = self.model(batch_tensor, domain_mask=dm)
+            else:
+                pred_policies, pred_values = self.model(batch_tensor)
         self._sync()
 
         values = [float(v) for v in pred_values.cpu().numpy().flatten().tolist()]
