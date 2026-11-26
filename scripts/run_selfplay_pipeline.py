@@ -67,6 +67,8 @@ def _run_worker_shard(args: argparse.Namespace) -> None:
             fem_backend=args.fem_backend,
             record_displacement_map=False,
             record_sed_map=True,
+            use_v41_mcts=not args.legacy_mcts,
+            use_best_of_episode_targets=not args.legacy_mcts,
             tier_weights=tier_weights,  # type: ignore[arg-type]
             seed=args.seed * 1000 + i,
             verbose=False,
@@ -78,8 +80,9 @@ def _run_worker_shard(args: argparse.Namespace) -> None:
             f"T{st['tier']} ({st['family']}) {st['end_reason']} | "
             f"conn={st['connected_final']} P1={st['phase1_steps']} P2={st['phase2_steps']} "
             f"V={st['final_volume']*100:.2f}% C={st['final_compliance']} "
-            f"Score={st['final_score']:+.3f} REM={st['p2_rem_actions']} probes={st['probes_adopted']}/{st['probes_run']} "
-            f"({st['elapsed_sec']:.1f}s)",
+            f"Score={st['final_score']:+.3f} Best={st.get('best_score', st['final_score']):+.3f} "
+            f"REM={st['p2_rem_actions']} reuse={st.get('tree_reuse_hits', 0)} dag={st.get('dag_transpositions', 0)} "
+            f"probes={st['probes_adopted']}/{st['probes_run']} ({st['elapsed_sec']:.1f}s)",
             flush=True,
         )
         gc.collect()
@@ -125,6 +128,10 @@ def _summarize_generation_stats(stats_list: List[Dict[str, Any]]) -> Dict[str, A
         "p2_rem_fraction": float(rems / tot_actions),
         "probes_run": p_run,
         "probes_adopted": p_adopt,
+        "mean_best_score": float(np.mean([s.get("best_score", s["final_score"]) for s in stats_list])),
+        "stop_fraction": float(np.mean([1.0 if s.get("end_reason") == "MCTS_STOP" else 0.0 for s in stats_list])),
+        "mean_tree_reuse_hits": float(np.mean([s.get("tree_reuse_hits", 0) for s in stats_list])),
+        "total_dag_transpositions": int(sum(int(s.get("dag_transpositions", 0)) for s in stats_list)),
         "mean_episode_sec": float(np.mean(elapseds)),
     }
 
@@ -194,6 +201,8 @@ def main() -> None:
     parser.add_argument("--prior-selfplay-dbs", type=str, default="")
     parser.add_argument("--eval-extended", action="store_true", default=True)
     parser.add_argument("--eval-ood", action="store_true", default=True)
+    parser.add_argument("--legacy-mcts", action="store_true", default=False, help="Disable v4.1 MCTS-DAG/macro/lifecycle upgrades")
+    parser.add_argument("--lambda-op", type=float, default=0.20)
     parser.add_argument("--max-wall-hours", type=float, default=10.5)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -299,6 +308,8 @@ def main() -> None:
                 "--device", "cuda" if n_gpus > 0 else eval_dev,
                 "--seed", str(args.seed + gen * 100 + r),
             ]
+            if args.legacy_mcts:
+                cmd.append("--legacy-mcts")
             procs.append(subprocess.Popen(cmd, env=env))
 
         for p in procs:
@@ -340,6 +351,7 @@ def main() -> None:
             "--batch-size", str(args.batch_size),
             "--lr", str(args.lr),
             "--selfplay-fraction", str(args.selfplay_fraction),
+            "--lambda-op", str(0.0 if args.legacy_mcts else args.lambda_op),
             "--seed", str(args.seed + gen),
         ])
         if args.split_json is not None:
@@ -356,72 +368,72 @@ def main() -> None:
         # 3. Deterministic Pure-MCTS Evaluation (S1-S6 canonical + extended + G1-G4 OOD)
         eval_db = eval_dir / f"eval_gen{gen}.db"
         eval_can_json = eval_dir / f"eval_gen{gen}_canonical.json"
-        subprocess.run(
-            [
-                sys.executable,
-                str(REPO_ROOT / "scripts" / "evaluate_inference_scenarios.py"),
-                "--checkpoint", str(gen_ckpt),
-                "--prefix", f"sp_gen{gen}",
-                "--checkpoint-version", f"selfplay-gen{gen}",
-                "--db-path", str(eval_db),
-                "--json-out", str(eval_can_json),
-                "--device", eval_dev,
-                "--num-simulations", str(num_sims),
-                "--max-phase1-steps", "60",
-                "--max-phase2-steps", "30",
-                "--suite", "canonical",
-                "--fem-backend", args.fem_backend,
-            ],
-            check=True,
-        )
+        can_cmd = [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "evaluate_inference_scenarios.py"),
+            "--checkpoint", str(gen_ckpt),
+            "--prefix", f"sp_gen{gen}",
+            "--checkpoint-version", f"selfplay-gen{gen}",
+            "--db-path", str(eval_db),
+            "--json-out", str(eval_can_json),
+            "--device", eval_dev,
+            "--num-simulations", str(num_sims),
+            "--max-phase1-steps", "60",
+            "--max-phase2-steps", "30",
+            "--suite", "canonical",
+            "--fem-backend", args.fem_backend,
+        ]
+        if not args.legacy_mcts:
+            can_cmd.append("--v41-mcts")
+        subprocess.run(can_cmd, check=True)
         can_summary = _summarize_eval_payload(json.loads(eval_can_json.read_text(encoding="utf-8")))
 
         ext_summary = None
         if args.eval_extended and max_p2 > 30:
             eval_ext_json = eval_dir / f"eval_gen{gen}_extended.json"
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(REPO_ROOT / "scripts" / "evaluate_inference_scenarios.py"),
-                    "--checkpoint", str(gen_ckpt),
-                    "--prefix", f"sp_gen{gen}_ext",
-                    "--checkpoint-version", f"selfplay-gen{gen}-ext",
-                    "--db-path", str(eval_db),
-                    "--json-out", str(eval_ext_json),
-                    "--device", eval_dev,
-                    "--num-simulations", str(num_sims),
-                    "--max-phase1-steps", "60",
-                    "--max-phase2-steps", str(max_p2),
-                    "--p2-stepped-batch",
-                    "--suite", "canonical",
-                    "--fem-backend", args.fem_backend,
-                ],
-                check=True,
-            )
+            ext_cmd = [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "evaluate_inference_scenarios.py"),
+                "--checkpoint", str(gen_ckpt),
+                "--prefix", f"sp_gen{gen}_ext",
+                "--checkpoint-version", f"selfplay-gen{gen}-ext",
+                "--db-path", str(eval_db),
+                "--json-out", str(eval_ext_json),
+                "--device", eval_dev,
+                "--num-simulations", str(num_sims),
+                "--max-phase1-steps", "60",
+                "--max-phase2-steps", str(max_p2),
+                "--p2-stepped-batch",
+                "--suite", "canonical",
+                "--fem-backend", args.fem_backend,
+            ]
+            if not args.legacy_mcts:
+                ext_cmd.append("--v41-mcts")
+            subprocess.run(ext_cmd, check=True)
             ext_summary = _summarize_eval_payload(json.loads(eval_ext_json.read_text(encoding="utf-8")))
 
         ood_summary = None
         if args.eval_ood:
             eval_ood_json = eval_dir / f"eval_gen{gen}_ood.json"
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(REPO_ROOT / "scripts" / "evaluate_inference_scenarios.py"),
-                    "--checkpoint", str(gen_ckpt),
-                    "--prefix", f"sp_gen{gen}_ood",
-                    "--checkpoint-version", f"selfplay-gen{gen}-ood",
-                    "--db-path", str(eval_db),
-                    "--json-out", str(eval_ood_json),
-                    "--device", eval_dev,
-                    "--num-simulations", str(num_sims),
-                    "--max-phase1-steps", "80",
-                    "--max-phase2-steps", str(max_p2),
-                    "--p2-stepped-batch",
-                    "--suite", "ood",
-                    "--fem-backend", args.fem_backend,
-                ],
-                check=True,
-            )
+            ood_cmd = [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "evaluate_inference_scenarios.py"),
+                "--checkpoint", str(gen_ckpt),
+                "--prefix", f"sp_gen{gen}_ood",
+                "--checkpoint-version", f"selfplay-gen{gen}-ood",
+                "--db-path", str(eval_db),
+                "--json-out", str(eval_ood_json),
+                "--device", eval_dev,
+                "--num-simulations", str(num_sims),
+                "--max-phase1-steps", "80",
+                "--max-phase2-steps", str(max_p2),
+                "--p2-stepped-batch",
+                "--suite", "ood",
+                "--fem-backend", args.fem_backend,
+            ]
+            if not args.legacy_mcts:
+                ood_cmd.append("--v41-mcts")
+            subprocess.run(ood_cmd, check=True)
             ood_summary = _summarize_eval_payload(json.loads(eval_ood_json.read_text(encoding="utf-8")))
 
         gen_sec = time.time() - gen_t0

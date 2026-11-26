@@ -581,6 +581,13 @@ class PhysUViT3D(nn.Module):
             nn.Conv3d(feature_size, 4, kernel_size=1),
         )
 
+        # Zero-init global operation head: [ADD, REMOVE, STOP] (Stage 6 v4.1)
+        # Zero weights/bias guarantee exact neutral prior (1/3, 1/3, 1/3) on Stage 5 checkpoints.
+        self.op_head = nn.Linear(embed_dim * 2, 3)
+        with torch.no_grad():
+            self.op_head.weight.zero_()
+            self.op_head.bias.zero_()
+
     @staticmethod
     def _extract_physics_stats(
         x: torch.Tensor,
@@ -821,11 +828,13 @@ class PhysUViT3D(nn.Module):
 
         if return_aux:
             blueprint = self.blueprint_head(dec_feat)
+            op_logits = self.op_head(torch.cat([global_tokens_mean, phys_emb], dim=1))
             aux: Dict[str, Optional[torch.Tensor]] = {
                 "blueprint": blueprint,
                 "log_compliance": log_c,
                 "conn_logit": conn_logit,
                 "sed_u": self.sed_head(dec_feat) if compute_sed else None,
+                "op_logits": op_logits,
             }
             return policy, value, aux
 

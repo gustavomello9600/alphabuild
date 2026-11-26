@@ -404,13 +404,24 @@ class SelfPlayDataset(Dataset):
             legal_mask = np.ones_like(policy, dtype=np.float32)
 
         masked_pol = np.maximum(0.0, policy) * legal_mask
-        pol_sum = float(masked_pol.sum())
+        add_mass = float(masked_pol[0].sum())
+        rem_mass = float(masked_pol[1].sum())
+        pol_sum = add_mass + rem_mass
         if pol_ok and pol_sum > 1e-6:
             policy = (masked_pol / pol_sum).astype(np.float32)
             policy_mask = 1.0
+            op_target = np.array([add_mass / pol_sum, rem_mass / pol_sum, 0.0], dtype=np.float32)
+            op_mask = 1.0
+        elif is_final and is_connected and (not bool(self._is_probe[idx])) and phase == "REFINEMENT" and value > -0.8:
+            policy = np.zeros_like(policy, dtype=np.float32)
+            policy_mask = 0.0
+            op_target = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            op_mask = 1.0
         else:
             policy = np.zeros_like(policy, dtype=np.float32)
             policy_mask = 0.0
+            op_target = np.array([0.5, 0.5, 0.0], dtype=np.float32)
+            op_mask = 0.0
 
         return {
             "state": torch.from_numpy(np.ascontiguousarray(state)).float(),
@@ -427,6 +438,8 @@ class SelfPlayDataset(Dataset):
             "conn_mask": torch.tensor(1.0 if conn_valid else 0.0, dtype=torch.float32),
             "sed_target": torch.from_numpy(np.ascontiguousarray(sed_target)).float(),
             "sed_mask": torch.tensor(1.0 if (sed_valid and is_connected) else 0.0, dtype=torch.float32),
+            "op_target": torch.from_numpy(op_target).float(),
+            "op_mask": torch.tensor(op_mask, dtype=torch.float32),
             "phase": phase,
             "is_final": is_final,
             "is_connected": is_connected,
@@ -529,6 +542,10 @@ class MixedReplayDataset(Dataset):
             sample["sed_target"] = torch.zeros((1, D, H, W), dtype=torch.float32)
         if "sed_mask" not in sample:
             sample["sed_mask"] = torch.tensor(0.0, dtype=torch.float32)
+        if "op_target" not in sample:
+            sample["op_target"] = torch.tensor([0.5, 0.5, 0.0], dtype=torch.float32)
+        if "op_mask" not in sample:
+            sample["op_mask"] = torch.tensor(0.0, dtype=torch.float32)
         return sample
 
 

@@ -1,17 +1,28 @@
 """
-MCTS Engine for AlphaBuilder v3.3.
+MCTS Engine for AlphaBuilder v3.3 / v4.1 (MCTS-DAG + Macro-Actions + SWAP + STOP).
 
-Implements batch/sequential Monte Carlo Tree Search with Virtual Loss,
-protected BC/load removal masks, post-pruning prior renormalization, MixMax backup,
-and Principal Variation branch extraction.
+Implements:
+- Batch/sequential MCTS with Virtual Loss & relative FPU (`parent_Q - fpu_reduction`)
+- Factored policy priors `P(op) * P(voxel | op)` + surface-only removals
+- Bidirectional Phase-1 seeding (support + load patches)
+- Composite macro-actions (ADD, REMOVE, mass-conserving SWAP, STOP)
+- Permutation transposition DAG (`A+B == B+A`) for genuine lookahead depth & subtree reuse
+- Root-only voxel policy targets without depth 2..4 illegal leakage
 """
 
 import hashlib
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 import numpy as np
 
 from .legal_moves import get_legal_moves, is_terminal_state
-from .node import Action, MCTSNode
+from .node import (
+    Action,
+    MCTSNode,
+    STOP_ACTION,
+    TreeAction,
+    flatten_tree_action,
+    is_stop_action,
+)
 
 
 class MCTSConfig(NamedTuple):
@@ -34,9 +45,19 @@ class MCTSConfig(NamedTuple):
     mixmax_beta: float = 1.0
     min_remove_candidates: int = 0
     remove_prior_floor: float = 0.0
+    # v4.1 surgical & structural upgrades (safe defaults preserve legacy behavior)
+    fpu_reduction: Optional[float] = None
+    surface_only_remove: bool = False
+    bidirectional_p1: bool = False
+    use_transposition_dag: bool = False
+    macro_action_mode: bool = False
+    factored_policy: bool = False
+    root_only_policy_target: bool = False
+    allow_stop_action: bool = False
+    macro_num_candidates: int = 16
 
 
-# Phase 1 (Growth): allow empty initial grid (min_volume_fraction = 0.0) and MixMax backup
+# Legacy v3.3 / Stage 5 configurations (preserved for exact regression & ablation)
 PHASE1_CONFIG = MCTSConfig(
     num_simulations=160,
     c_puct=1.2,
@@ -49,7 +70,6 @@ PHASE1_CONFIG = MCTSConfig(
     mixmax_beta=0.75,
 )
 
-# Phase 2 (Refinement): finer micro-batch (action_batch_size = 8) to avoid brittle disconnections
 PHASE2_CONFIG = MCTSConfig(
     num_simulations=160,
     c_puct=0.8,
@@ -60,6 +80,51 @@ PHASE2_CONFIG = MCTSConfig(
     max_volume_fraction=0.9,
     phase="REFINEMENT",
     mixmax_beta=1.0,
+)
+
+# Upgraded Stage 6 v4.1 configurations (100% compatible with v4_stage5 checkpoints)
+PHASE1_V41_CONFIG = MCTSConfig(
+    num_simulations=160,
+    c_puct=1.2,
+    batch_size=8,
+    action_batch_size=32,
+    top_k_expansion=64,
+    min_volume_fraction=0.0,
+    max_volume_fraction=0.9,
+    phase="GROWTH",
+    mixmax_beta=0.75,
+    fpu_reduction=0.20,
+    surface_only_remove=True,
+    bidirectional_p1=True,
+    use_transposition_dag=True,
+    macro_action_mode=True,
+    factored_policy=True,
+    root_only_policy_target=True,
+    allow_stop_action=False,
+    macro_num_candidates=14,
+)
+
+PHASE2_V41_CONFIG = MCTSConfig(
+    num_simulations=160,
+    c_puct=1.0,
+    batch_size=8,
+    action_batch_size=8,
+    top_k_expansion=64,
+    min_volume_fraction=0.01,
+    max_volume_fraction=0.9,
+    phase="REFINEMENT",
+    mixmax_beta=1.0,
+    min_remove_candidates=16,
+    remove_prior_floor=0.25,
+    fpu_reduction=0.25,
+    surface_only_remove=True,
+    bidirectional_p1=False,
+    use_transposition_dag=True,
+    macro_action_mode=True,
+    factored_policy=True,
+    root_only_policy_target=True,
+    allow_stop_action=True,
+    macro_num_candidates=16,
 )
 
 
@@ -74,7 +139,7 @@ class SearchResult(NamedTuple):
 
 
 def apply_action(density: np.ndarray, action: Action) -> np.ndarray:
-    """Pure function applying a single (channel, x, y, z) action."""
+    """Pure function applying a single `(channel, x, y, z)` action."""
     new_density = density.copy()
     channel, x, y, z = action
     new_density[x, y, z] = 1.0 if channel == 0 else 0.0
@@ -87,6 +152,11 @@ def apply_actions(density: np.ndarray, actions: List[Action]) -> np.ndarray:
     for channel, x, y, z in actions:
         new_density[x, y, z] = 1.0 if channel == 0 else 0.0
     return new_density
+
+
+def apply_tree_action(density: np.ndarray, tree_action: TreeAction) -> np.ndarray:
+    """Pure function applying a unitary, macro, or STOP tree edge."""
+    return apply_actions(density, flatten_tree_action(tree_action))
 
 
 def _compute_context_key(
@@ -117,7 +187,7 @@ def build_state_tensor(
     bc_masks: Tuple[np.ndarray, np.ndarray, np.ndarray],
     forces: Tuple[np.ndarray, np.ndarray, np.ndarray],
 ) -> np.ndarray:
-    """Build 7-channel network state tensor (7, D, H, W)."""
+    """Build 7-channel network state tensor `(7, D, H, W)`."""
     return np.stack(
         [
             density,
@@ -136,14 +206,42 @@ def select_leaf(
     root: MCTSNode,
     c_puct: float,
     mixmax_beta: float = 1.0,
+    fpu_reduction: Optional[float] = None,
 ) -> Tuple[MCTSNode, List[MCTSNode]]:
-    """Select an unexpanded leaf by traversing children via PUCT."""
+    """Select an unexpanded leaf by traversing children via PUCT (legacy 2-tuple signature)."""
+    leaf, path, _ = select_leaf_with_actions(
+        root, c_puct, mixmax_beta=mixmax_beta, fpu_reduction=fpu_reduction
+    )
+    return leaf, path
+
+
+def select_leaf_with_actions(
+    root: MCTSNode,
+    c_puct: float,
+    mixmax_beta: float = 1.0,
+    fpu_reduction: Optional[float] = None,
+) -> Tuple[MCTSNode, List[MCTSNode], List[TreeAction]]:
+    """
+    DAG-safe leaf selection tracking exact traversed edges `(leaf, path_nodes, path_actions)`.
+    """
     node = root
-    path = [node]
+    path_nodes = [node]
+    path_actions: List[TreeAction] = []
+    seen_ids: Set[int] = {id(node)}
     while node.is_expanded and node.children:
-        _, node = node.select_child(c_puct, mixmax_beta=mixmax_beta)
-        path.append(node)
-    return node, path
+        act, next_node = node.select_child(
+            c_puct,
+            mixmax_beta=mixmax_beta,
+            fpu_reduction=fpu_reduction,
+            exclude_ids=seen_ids,
+        )
+        if id(next_node) in seen_ids:
+            break
+        seen_ids.add(id(next_node))
+        path_actions.append(act)
+        path_nodes.append(next_node)
+        node = next_node
+    return node, path_nodes, path_actions
 
 
 def select_pv_branches(
@@ -154,8 +252,9 @@ def select_pv_branches(
     """
     Extract Principal Variation branches with spatial voxel locking.
 
-    Returns a list of branches; each branch is a list of
-    `(action, visit_count, mean_value)` read directly from the corresponding tree nodes.
+    For macro-action trees (`macro_action_mode=True`), selects the highest-visit
+    macro child cleanly; for legacy 1-voxel trees, stitches up to `max_actions`
+    across top root branches.
     """
     if not getattr(root, "children", None):
         return []
@@ -166,6 +265,17 @@ def select_pv_branches(
         reverse=True,
     )
 
+    top_tree_act, top_child = root_children_sorted[0]
+    if is_stop_action(top_tree_act):
+        return []
+    flat_top = flatten_tree_action(top_tree_act)
+    if len(flat_top) > 1 or not isinstance(top_tree_act[0], (int, np.integer)):
+        branch = [
+            (a, int(top_child.visit_count), float(top_child.mean_value))
+            for a in flat_top[:max_actions]
+        ]
+        return [branch] if branch else []
+
     branches: List[List[Tuple[Action, int, float]]] = []
     total_actions = 0
     locked_voxels = set()
@@ -173,9 +283,15 @@ def select_pv_branches(
     def is_locked(act: Action) -> bool:
         return (act[1], act[2], act[3]) in locked_voxels
 
-    for action, child in root_children_sorted:
+    for tree_action, child in root_children_sorted:
         if total_actions >= max_actions:
             break
+        if is_stop_action(tree_action):
+            continue
+        flat = flatten_tree_action(tree_action)
+        if not flat:
+            continue
+        action = flat[0]
         if is_locked(action):
             continue
 
@@ -197,7 +313,13 @@ def select_pv_branches(
 
             best_action = None
             best_child = None
-            for child_act, child_node in sorted_children:
+            for child_tree_act, child_node in sorted_children:
+                if is_stop_action(child_tree_act):
+                    continue
+                c_flat = flatten_tree_action(child_tree_act)
+                if not c_flat:
+                    continue
+                child_act = c_flat[0]
                 if not is_locked(child_act):
                     best_action = child_act
                     best_child = child_node
@@ -238,8 +360,25 @@ def expand_node(
     valid_add: np.ndarray,
     valid_remove: np.ndarray,
     config: MCTSConfig,
+    op_probs: Optional[Tuple[float, float, float]] = None,
 ) -> None:
-    """Expand a leaf node using config parameters."""
+    """Expand a leaf node using either composite macro-actions (v4.1) or unitary voxel edges."""
+    if config.macro_action_mode:
+        node.expand_macro(
+            policy_add=policy_add,
+            policy_remove=policy_remove,
+            valid_add=valid_add,
+            valid_remove=valid_remove,
+            action_batch_size=config.action_batch_size,
+            phase=config.phase,
+            temperature=config.policy_temperature,
+            remove_prior_floor=max(0.20, config.remove_prior_floor),
+            op_probs=op_probs,
+            allow_stop=bool(config.allow_stop_action and config.phase != "GROWTH"),
+            max_candidates=config.macro_num_candidates,
+        )
+        return
+
     node.expand(
         policy_add=policy_add,
         policy_remove=policy_remove,
@@ -250,11 +389,14 @@ def expand_node(
         temperature=config.policy_temperature,
         min_remove_candidates=config.min_remove_candidates,
         remove_prior_floor=config.remove_prior_floor,
+        factored_policy=config.factored_policy,
+        op_probs=op_probs,
+        allow_stop=bool(config.allow_stop_action and config.phase != "GROWTH"),
     )
 
 
 def backup(path: List[MCTSNode], value: float) -> None:
-    """Propagate leaf evaluation up the tree path."""
+    """Propagate leaf evaluation up the tree/DAG path."""
     for node in path:
         node.update(value)
 
@@ -271,12 +413,20 @@ def run_mcts_search(
         Callable[[List[np.ndarray]], Tuple[List[float], List[np.ndarray], List[np.ndarray]]]
     ] = None,
     domain_mask: Optional[np.ndarray] = None,
+    stop_value: Optional[float] = None,
+    root_op_probs: Optional[Tuple[float, float, float]] = None,
+    dag_nodes: Optional[Dict[str, MCTSNode]] = None,
+    dag_stats: Optional[Dict[str, int]] = None,
 ) -> SearchResult:
     """Run batch or sequential MCTS simulations from root state."""
     if eval_cache is None:
         eval_cache = {}
+    if dag_nodes is None and config.use_transposition_dag:
+        dag_nodes = {}
 
     context_key = _compute_context_key(bc_masks, forces)
+    inc_load = bool(config.bidirectional_p1 and config.phase == "GROWTH")
+    surf_rem = bool(config.surface_only_remove and config.phase != "GROWTH")
 
     def _eval_single(density: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
         sha = compute_state_hash(density, phase=config.phase, context_key=context_key)
@@ -288,23 +438,36 @@ def run_mcts_search(
         eval_cache[sha] = (val, p_a, p_r)
         return val, p_a, p_r
 
+    def _legal(density: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        return get_legal_moves(
+            density,
+            config.density_threshold,
+            bc_masks=bc_masks,
+            forces=forces,
+            domain_mask=domain_mask,
+            surface_only_remove=surf_rem,
+            include_load_seeds=inc_load,
+        )
+
+    root_hash = compute_state_hash(root_density, phase=config.phase, context_key=context_key)
     if root_node is not None:
         root = root_node
         if not root.is_expanded:
             value, p_add, p_remove = _eval_single(root_density)
-            valid_add, valid_remove = get_legal_moves(
-                root_density, config.density_threshold, bc_masks=bc_masks, forces=forces, domain_mask=domain_mask
-            )
-            expand_node(root, p_add, p_remove, valid_add, valid_remove, config)
+            valid_add, valid_remove = _legal(root_density)
+            expand_node(root, p_add, p_remove, valid_add, valid_remove, config, op_probs=root_op_probs)
             root.update(value)
     else:
         root_value, policy_add, policy_remove = _eval_single(root_density)
-        valid_add, valid_remove = get_legal_moves(
-            root_density, config.density_threshold, bc_masks=bc_masks, forces=forces, domain_mask=domain_mask
-        )
+        valid_add, valid_remove = _legal(root_density)
         root = MCTSNode(prior=1.0)
-        expand_node(root, policy_add, policy_remove, valid_add, valid_remove, config)
+        expand_node(root, policy_add, policy_remove, valid_add, valid_remove, config, op_probs=root_op_probs)
         root.update(root_value)
+
+    if config.use_transposition_dag and dag_nodes is not None:
+        dag_nodes.setdefault(root_hash, root)
+
+    eff_stop_val = float(stop_value) if stop_value is not None else float(root.mean_value)
 
     if config.add_root_noise and root.is_expanded:
         children = list(root.children.values())
@@ -323,6 +486,41 @@ def run_mcts_search(
             for child, n in zip(children, noise):
                 child.prior = child.prior * (1.0 - frac) + float(n) * frac
 
+    def _handle_stop_leaf(leaf: MCTSNode, path_actions: List[TreeAction], path_nodes: List[MCTSNode]) -> float:
+        leaf.is_expanded = True
+        if len(path_actions) <= 1:
+            return eff_stop_val
+        parent_actions = path_actions[:-1]
+        parent_flat = [a for ta in parent_actions for a in flatten_tree_action(ta)]
+        st_dens = apply_actions(root_density, parent_flat)
+        val, _, _ = _eval_single(st_dens)
+        return float(val)
+
+    def _maybe_dag_merge(
+        leaf: MCTSNode,
+        path_nodes: List[MCTSNode],
+        path_actions: List[TreeAction],
+        state_hash: str,
+        with_virtual_loss: bool,
+    ) -> Tuple[MCTSNode, bool]:
+        if not (config.use_transposition_dag and dag_nodes is not None and len(path_nodes) >= 2):
+            return leaf, False
+        existing = dag_nodes.get(state_hash)
+        ancestor_ids = {id(n) for n in path_nodes[:-1]}
+        if existing is not None and existing is not leaf and id(existing) not in ancestor_ids:
+            parent_node = path_nodes[-2]
+            last_act = path_actions[-1]
+            if with_virtual_loss:
+                leaf.revert_virtual_loss()
+                existing.apply_virtual_loss()
+            parent_node.children[last_act] = existing
+            path_nodes[-1] = existing
+            if dag_stats is not None:
+                dag_stats["hits"] = dag_stats.get("hits", 0) + 1
+            return existing, True
+        dag_nodes[state_hash] = leaf
+        return leaf, False
+
     if predict_batch_fn is not None and config.batch_size > 1:
         num_batches = (config.num_simulations + config.batch_size - 1) // config.batch_size
         for _ in range(num_batches):
@@ -334,11 +532,23 @@ def run_mcts_search(
             ready_to_backup: List[Tuple[List[MCTSNode], float]] = []
 
             for _ in range(config.batch_size):
-                leaf, path = select_leaf(root, config.c_puct, mixmax_beta=config.mixmax_beta)
+                leaf, path, path_actions = select_leaf_with_actions(
+                    root,
+                    config.c_puct,
+                    mixmax_beta=config.mixmax_beta,
+                    fpu_reduction=config.fpu_reduction,
+                )
                 for node in path:
                     node.apply_virtual_loss()
 
-                leaf_density = apply_actions(root_density, leaf.actions_from_root())
+                if path_actions and is_stop_action(path_actions[-1]):
+                    val = _handle_stop_leaf(leaf, path_actions, path)
+                    ready_to_backup.append((path, val))
+                    continue
+
+                flat_actions = [a for ta in path_actions for a in flatten_tree_action(ta)]
+                leaf_density = apply_actions(root_density, flat_actions)
+
                 is_terminal, reason = is_terminal_state(
                     leaf_density,
                     max_volume_fraction=config.max_volume_fraction,
@@ -360,16 +570,17 @@ def run_mcts_search(
                     continue
 
                 state_hash = compute_state_hash(leaf_density, phase=config.phase, context_key=context_key)
+                leaf, merged = _maybe_dag_merge(leaf, path, path_actions, state_hash, with_virtual_loss=True)
+                if merged:
+                    if state_hash in eval_cache:
+                        val = leaf.mean_value if leaf.visit_count > 0 else float(eval_cache[state_hash][0])
+                        ready_to_backup.append((path, val))
+                        continue
+
                 if state_hash in eval_cache:
                     value, p_add, p_remove = eval_cache[state_hash]
                     if not leaf.is_expanded:
-                        valid_add, valid_remove = get_legal_moves(
-                            leaf_density,
-                            config.density_threshold,
-                            bc_masks=bc_masks,
-                            forces=forces,
-                            domain_mask=domain_mask,
-                        )
+                        valid_add, valid_remove = _legal(leaf_density)
                         expand_node(leaf, p_add, p_remove, valid_add, valid_remove, config)
                     ready_to_backup.append((path, value))
                 else:
@@ -393,13 +604,7 @@ def run_mcts_search(
                 ):
                     eval_cache[sha] = (val, p_a, p_r)
                     if not leaf.is_expanded:
-                        valid_add, valid_remove = get_legal_moves(
-                            leaf_density,
-                            config.density_threshold,
-                            bc_masks=bc_masks,
-                            forces=forces,
-                            domain_mask=domain_mask,
-                        )
+                        valid_add, valid_remove = _legal(leaf_density)
                         expand_node(leaf, p_a, p_r, valid_add, valid_remove, config)
                     ready_to_backup.append((path, val))
 
@@ -409,8 +614,20 @@ def run_mcts_search(
                 backup(path, value)
     else:
         for _ in range(config.num_simulations):
-            leaf, path = select_leaf(root, config.c_puct, mixmax_beta=config.mixmax_beta)
-            leaf_density = apply_actions(root_density, leaf.actions_from_root())
+            leaf, path, path_actions = select_leaf_with_actions(
+                root,
+                config.c_puct,
+                mixmax_beta=config.mixmax_beta,
+                fpu_reduction=config.fpu_reduction,
+            )
+
+            if path_actions and is_stop_action(path_actions[-1]):
+                value = _handle_stop_leaf(leaf, path_actions, path)
+                backup(path, value)
+                continue
+
+            flat_actions = [a for ta in path_actions for a in flatten_tree_action(ta)]
+            leaf_density = apply_actions(root_density, flat_actions)
 
             is_terminal, reason = is_terminal_state(
                 leaf_density,
@@ -430,19 +647,21 @@ def run_mcts_search(
                 else:
                     value = 0.0
             else:
-                value, policy_add, policy_remove = _eval_single(leaf_density)
-                valid_add, valid_remove = get_legal_moves(
-                    leaf_density,
-                    config.density_threshold,
-                    bc_masks=bc_masks,
-                    forces=forces,
-                    domain_mask=domain_mask,
-                )
-                expand_node(leaf, policy_add, policy_remove, valid_add, valid_remove, config)
+                state_hash = compute_state_hash(leaf_density, phase=config.phase, context_key=context_key)
+                leaf, merged = _maybe_dag_merge(leaf, path, path_actions, state_hash, with_virtual_loss=False)
+                if merged and leaf.is_expanded:
+                    value = leaf.mean_value if leaf.visit_count > 0 else float(eval_cache[state_hash][0])
+                else:
+                    value, policy_add, policy_remove = _eval_single(leaf_density)
+                    valid_add, valid_remove = _legal(leaf_density)
+                    expand_node(leaf, policy_add, policy_remove, valid_add, valid_remove, config)
 
             backup(path, value)
 
-    visit_dist = root.collect_subtree_visits()
+    if config.root_only_policy_target or config.macro_action_mode:
+        visit_dist = root.get_root_voxel_visits()
+    else:
+        visit_dist = root.collect_subtree_visits()
     top_actions = root.get_top_k_actions(config.action_batch_size)
 
     return SearchResult(
@@ -455,7 +674,7 @@ def run_mcts_search(
 
 
 class AlphaBuilderMCTS:
-    """Convenience stateful MCTS wrapper preserving root tree & phase-scoped eval cache."""
+    """Convenience stateful MCTS wrapper preserving root tree/DAG & phase-scoped eval cache."""
 
     def __init__(
         self,
@@ -481,15 +700,21 @@ class AlphaBuilderMCTS:
         )
         self.root: Optional[MCTSNode] = None
         self.eval_cache: Dict[str, Tuple[float, np.ndarray, np.ndarray]] = {}
+        self.dag_nodes: Dict[str, MCTSNode] = {}
+        self.last_dag_hits: int = 0
+        self.total_dag_hits: int = 0
 
     def reset(self) -> None:
-        """Clear search tree and evaluation cache."""
+        """Clear search tree/DAG and evaluation cache."""
         self.root = None
         self.eval_cache = {}
+        self.dag_nodes = {}
+        self.last_dag_hits = 0
 
     def clear_tree(self) -> None:
-        """Drop current search tree while retaining evaluation cache."""
+        """Drop current search tree/DAG while retaining evaluation cache."""
         self.root = None
+        self.dag_nodes = {}
 
     def get_action_batch(
         self,
@@ -497,7 +722,10 @@ class AlphaBuilderMCTS:
         bc_masks: Tuple[np.ndarray, np.ndarray, np.ndarray],
         forces: Tuple[np.ndarray, np.ndarray, np.ndarray],
         domain_mask: Optional[np.ndarray] = None,
+        stop_value: Optional[float] = None,
+        root_op_probs: Optional[Tuple[float, float, float]] = None,
     ) -> SearchResult:
+        dag_stats = {"hits": 0}
         result = run_mcts_search(
             root_density=density,
             bc_masks=bc_masks,
@@ -508,18 +736,26 @@ class AlphaBuilderMCTS:
             eval_cache=self.eval_cache,
             predict_batch_fn=self.predict_batch_fn,
             domain_mask=domain_mask,
+            stop_value=stop_value,
+            root_op_probs=root_op_probs,
+            dag_nodes=self.dag_nodes if self.config.use_transposition_dag else None,
+            dag_stats=dag_stats,
         )
         self.root = result.root
+        self.last_dag_hits = int(dag_stats["hits"])
+        self.total_dag_hits += self.last_dag_hits
         return result
 
-    def step(self, action: Action) -> None:
-        """Advance tree root to selected child if present."""
+    def step(self, action: TreeAction) -> bool:
+        """Advance tree root to selected child if present; return True if subtree reused."""
         if self.root is not None and action in self.root.children:
             new_root = self.root.children[action]
             new_root.detach_parent()
             self.root = new_root
-        else:
-            self.root = None
+            return True
+        self.root = None
+        self.dag_nodes = {}
+        return False
 
     def search(
         self,
@@ -527,21 +763,18 @@ class AlphaBuilderMCTS:
         bc_masks: Tuple[np.ndarray, np.ndarray, np.ndarray],
         forces: Tuple[np.ndarray, np.ndarray, np.ndarray],
         domain_mask: Optional[np.ndarray] = None,
+        stop_value: Optional[float] = None,
+        root_op_probs: Optional[Tuple[float, float, float]] = None,
     ) -> SearchResult:
         """Run MCTS search, forwarding batch predictor and persisting root."""
-        result = run_mcts_search(
-            root_density=density,
+        return self.get_action_batch(
+            density=density,
             bc_masks=bc_masks,
             forces=forces,
-            predict_fn=self.predict_fn,
-            config=self.config,
-            root_node=self.root,
-            eval_cache=self.eval_cache,
-            predict_batch_fn=self.predict_batch_fn,
             domain_mask=domain_mask,
+            stop_value=stop_value,
+            root_op_probs=root_op_probs,
         )
-        self.root = result.root
-        return result
 
 
 def analyze_search_quality(

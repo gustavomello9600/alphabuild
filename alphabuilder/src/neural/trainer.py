@@ -193,6 +193,30 @@ def sed_loss(
     return per_sample.mean()
 
 
+def op_policy_loss(
+    pred_op_logits: torch.Tensor,
+    target_op: torch.Tensor,
+    op_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Masked KL-divergence loss over global operation logits [ADD, REMOVE, STOP]."""
+    logits_f = pred_op_logits.float()
+    t_f = target_op.float().clamp(min=0.0)
+    t_sum = t_f.sum(dim=-1, keepdim=True)
+    t_dist = t_f / t_sum.clamp(min=1e-8)
+    log_probs = F.log_softmax(logits_f, dim=-1)
+    kl = torch.where(
+        t_dist > 0.0,
+        t_dist * (torch.log(t_dist.clamp(min=1e-12)) - log_probs),
+        torch.zeros_like(t_dist),
+    ).sum(dim=-1)
+    valid = t_sum.squeeze(-1) > 1e-6
+    if op_mask is not None:
+        valid = valid & (op_mask.reshape(-1) > 0.5)
+    if not valid.any():
+        return pred_op_logits.sum() * 0.0
+    return kl[valid].mean()
+
+
 def compute_log_c_mae(
     pred_log_c: torch.Tensor,
     target_log_c: torch.Tensor,
@@ -297,12 +321,16 @@ def compute_total_loss(
     pred_sed_u: Optional[torch.Tensor] = None,
     target_sed: Optional[torch.Tensor] = None,
     sed_mask: Optional[torch.Tensor] = None,
+    pred_op_logits: Optional[torch.Tensor] = None,
+    target_op: Optional[torch.Tensor] = None,
+    op_mask: Optional[torch.Tensor] = None,
     lambda_policy: float = LAMBDA_POLICY,
     lambda_value: float = LAMBDA_VALUE,
     lambda_bp: float = LAMBDA_BLUEPRINT_WARMUP,
     lambda_log_c: float = 0.0,
     lambda_conn: float = 0.0,
     lambda_sed: float = 0.0,
+    lambda_op: float = 0.0,
     w_neg: float = W_NEG,
     huber_beta: float = HUBER_BETA,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -348,6 +376,12 @@ def compute_total_loss(
         total = total + lambda_sed * s_loss_tensor
         sed_val = float(s_loss_tensor.detach().item())
 
+    op_val = 0.0
+    if pred_op_logits is not None and target_op is not None and lambda_op > 0.0:
+        op_loss_tensor = op_policy_loss(pred_op_logits, target_op, op_mask=op_mask)
+        total = total + lambda_op * op_loss_tensor
+        op_val = float(op_loss_tensor.detach().item())
+
     return total, {
         "loss": float(total.detach().item()),
         "core_loss": core_val,
@@ -357,6 +391,7 @@ def compute_total_loss(
         "log_c_loss": log_c_val,
         "conn_loss": conn_val,
         "sed_loss": sed_val,
+        "op_loss": op_val,
     }
 
 

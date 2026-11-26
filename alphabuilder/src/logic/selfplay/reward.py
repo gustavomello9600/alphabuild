@@ -206,6 +206,21 @@ def calculate_reward(
     return score
 
 
+def calculate_grace_displacement_reward(
+    max_displacement: Optional[float],
+    displacement_limit: float = DISPLACEMENT_LIMIT_RAW,
+) -> float:
+    """
+    Smooth penalty returned during post-connection Phase-2 grace period when a thin
+    bridge connects support to load (`u_max > u_lim`) so MCTS gets gradient signal to thicken it.
+    """
+    if max_displacement is None or displacement_limit <= 0.0:
+        return -0.90
+    ratio = max(1.0, float(max_displacement) / float(displacement_limit))
+    overshoot = min(1.0, float(np.log10(ratio)) / 2.0)
+    return float(np.clip(-0.85 - 0.13 * overshoot, -0.98, -0.85))
+
+
 # =============================================================================
 # Phase-Specific Reward Functions
 # =============================================================================
@@ -415,29 +430,29 @@ def get_phase2_terminal_reward(
     threshold: float = 0.5,
     bc_masks: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
     forces: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+    max_vol_frac: float = 0.65,
 ) -> Optional[float]:
     """
     Quick terminal check for Phase 2 (no FEM involved).
-    
-    Returns a terminal reward if the state is obviously bad (disconnected),
-    otherwise returns None to indicate continuation.
+
+    Returns a terminal reward only for true structural failure (disconnection,
+    vanishing material < 1%, or extreme solid fill > 65%), allowing normal
+    continuous volume carving from >40% downward.
     """
     connected_to_support, reached_load = check_structure_connectivity(
         density, load_config, threshold, bc_masks=bc_masks, forces=forces
     )
-    
-    # If removed a critical connection, game over
+
     if not connected_to_support or not reached_load:
         return -1.0
-    
-    # Volume fraction check
+
     vol_frac = np.mean(density > threshold)
-    if vol_frac < 0.01:  # Structure too small
+    if vol_frac < 0.01:
         return -1.0
-    if vol_frac > 0.4:   # Structure too large
-        return -0.5      # Penalty but not terminal
-    
-    return None  # Continue, not terminal
+    if vol_frac > max_vol_frac:
+        return -0.5
+
+    return None
 
 
 # =============================================================================
@@ -495,13 +510,14 @@ def analyze_structure_islands(
     threshold: float = 0.5,
     bc_masks: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
     forces: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+    bidirectional: bool = False,
 ) -> Dict[str, Any]:
     """
     Analyze connected components (islands) in a structure.
 
-    In Phase 1 (before reaching load), only voxels NOT anchored to support count
-    as `loose_voxels` so clean growth attached to supports is not penalized.
-    Supports both legacy single-load cantilevers and arbitrary multi-support/multi-load `forces`.
+    In Phase 1 (before reaching load), voxels anchored to support do not count as
+    `loose_voxels`; when `bidirectional=True`, voxels anchored to the load front also
+    count as valid construction fronts rather than loose debris.
     """
     binary = density > threshold
 
@@ -524,7 +540,25 @@ def analyze_structure_islands(
     else:
         support_labels = set(np.unique(labeled[0, :, :])) - {0}
 
+    load_labels_pre: set = set()
+    if forces is not None:
+        fmag_pre = np.abs(forces[0]) + np.abs(forces[1]) + np.abs(forces[2])
+        lmask_pre = fmag_pre > 1e-6
+        if np.any(lmask_pre):
+            load_labels_pre = set(np.unique(labeled[lmask_pre])) - {0}
+
     if not support_labels:
+        if bidirectional and load_labels_pre:
+            front_mask = np.isin(labeled, list(load_labels_pre))
+            front_vox = int(front_mask.sum())
+            return {
+                'n_islands': n_islands,
+                'main_island_label': 0,
+                'main_island_mask': front_mask,
+                'main_island_voxels': front_vox,
+                'loose_voxels': total_voxels - front_vox,
+                'is_connected': False,
+            }
         return {
             'n_islands': n_islands,
             'main_island_label': 0,
@@ -534,7 +568,8 @@ def analyze_structure_islands(
             'is_connected': False,
         }
 
-    anchored_mask = np.isin(labeled, list(support_labels))
+    valid_front_labels = support_labels | load_labels_pre if bidirectional else support_labels
+    anchored_mask = np.isin(labeled, list(valid_front_labels))
     anchored_voxels = int(anchored_mask.sum())
     unanchored_voxels = total_voxels - anchored_voxels
 
@@ -567,6 +602,8 @@ def analyze_structure_islands(
         main_voxels = int(main_mask.sum())
         loose_voxels = total_voxels - main_voxels
         is_conn = bool(filled_all_load and labels_at_load.issubset(support_labels))
+        if not is_conn and bidirectional:
+            loose_voxels = unanchored_voxels
         return {
             'n_islands': n_islands,
             'main_island_label': int(main_label),
@@ -741,20 +778,26 @@ def calculate_pbrs_potential(
     w_conn: float = 0.50,
     w_dist: float = 0.25,
     threshold: float = 0.5,
+    bidirectional: bool = False,
 ) -> Tuple[float, Dict[str, Any]]:
     """
     Compute state potential Phi(s) = w_conn * conn_frac + dist_guidance - island_penalty
     for Potential-Based Reward Shaping (Muller & Kudenko, 2025).
-    `dist_guidance` softly rewards shortening the Euclidean gap from anchored material
-    to any disconnected load patch during Phase 1, and vanishes cleanly once connected.
+    `dist_guidance` smoothly rewards shortening the Euclidean gap from anchored support
+    material to the load front (load patch or load-anchored frontier when `bidirectional=True`).
     """
     _, conn_frac = calculate_connectivity_reward(density, bc_masks, forces, threshold=threshold)
     analysis = analyze_structure_islands(
-        density, load_config, threshold=threshold, bc_masks=bc_masks, forces=forces
+        density, load_config, threshold=threshold, bc_masks=bc_masks, forces=forces, bidirectional=bidirectional
     )
     total_voxels = int((density > threshold).sum())
+    eff_islands = (
+        1
+        if (bidirectional and not analysis['is_connected'] and analysis['loose_voxels'] == 0)
+        else analysis['n_islands']
+    )
     island_pen = calculate_island_penalty(
-        analysis['n_islands'],
+        eff_islands,
         analysis['loose_voxels'],
         total_voxels,
     )
@@ -766,19 +809,30 @@ def calculate_pbrs_potential(
         if n_comp > 0:
             support_mask = (bc_masks[0] > 0.5) | (bc_masks[1] > 0.5) | (bc_masks[2] > 0.5)
             sup_lbls = set(np.unique(labeled[support_mask])) - {0} if np.any(support_mask) else set()
-            if sup_lbls:
-                anchored = np.isin(labeled, list(sup_lbls))
-                force_mag = np.abs(forces[0]) + np.abs(forces[1]) + np.abs(forces[2])
-                load_mask = force_mag > 1e-6
-                unconn_load = load_mask & (~anchored)
-                if np.any(unconn_load):
-                    surface = anchored ^ ndimage.binary_erosion(anchored)
-                    anc_pts = np.argwhere(surface if np.any(surface) else anchored)
+            force_mag = np.abs(forces[0]) + np.abs(forces[1]) + np.abs(forces[2])
+            load_mask = force_mag > 1e-6
+            if sup_lbls and np.any(load_mask):
+                anchored_sup = np.isin(labeled, list(sup_lbls))
+                unconn_load = load_mask & (~anchored_sup)
+                target_front = unconn_load
+                if bidirectional:
+                    load_lbls = set(np.unique(labeled[load_mask])) - {0} - sup_lbls
+                    if load_lbls:
+                        anchored_load = np.isin(labeled, list(load_lbls))
+                        target_front = anchored_load ^ ndimage.binary_erosion(anchored_load)
+                        if not np.any(target_front):
+                            target_front = anchored_load
+                if np.any(target_front):
+                    surface = anchored_sup ^ ndimage.binary_erosion(anchored_sup)
+                    anc_pts = np.argwhere(surface if np.any(surface) else anchored_sup)
                     if len(anc_pts) > 512:
                         step = max(1, len(anc_pts) // 512)
                         anc_pts = anc_pts[::step]
-                    load_pts = np.argwhere(unconn_load)
-                    diff = anc_pts[:, None, :].astype(np.float32) - load_pts[None, :, :].astype(np.float32)
+                    tgt_pts = np.argwhere(target_front)
+                    if len(tgt_pts) > 512:
+                        step_t = max(1, len(tgt_pts) // 512)
+                        tgt_pts = tgt_pts[::step_t]
+                    diff = anc_pts[:, None, :].astype(np.float32) - tgt_pts[None, :, :].astype(np.float32)
                     min_dist = float(np.sqrt(np.min(np.sum(diff * diff, axis=-1))))
                     diag = float(np.sqrt(sum(s * s for s in density.shape)))
                     dist_bonus = float(w_dist * max(0.0, 1.0 - min_dist / max(diag, 1.0)))

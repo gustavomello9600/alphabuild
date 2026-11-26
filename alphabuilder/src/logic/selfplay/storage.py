@@ -388,22 +388,25 @@ def record_step(
     p_add_blob = serialize_sparse(idx_add, val_add)
     p_rem_blob = serialize_sparse(idx_rem, val_rem)
     
-    # Serialize MCTS data - FULL TREE AGGREGATION
+    # Serialize MCTS policy visit distribution (respecting root-only target when populated)
     resolution = state.density.shape
     v_add = np.zeros(resolution, dtype=np.float32)
     v_rem = np.zeros(resolution, dtype=np.float32)
     
-    if hasattr(result, 'root') and result.root is not None:
+    if result.visit_distribution:
+        full_tree_visits = result.visit_distribution
+    elif hasattr(result, 'root') and result.root is not None:
         full_tree_visits = result.root.collect_subtree_visits()
     else:
-        full_tree_visits = result.visit_distribution or {}
+        full_tree_visits = {}
     
     for action, visits in full_tree_visits.items():
-        channel, x, y, z = action
-        if channel == 0:
-            v_add[x, y, z] += visits
-        else:
-            v_rem[x, y, z] += visits
+        if isinstance(action, tuple) and len(action) == 4:
+            channel, x, y, z = action
+            if channel == 0:
+                v_add[x, y, z] += visits
+            else:
+                v_rem[x, y, z] += visits
             
     idx_v_add, val_v_add = sparse_encode(v_add)
     idx_v_rem, val_v_rem = sparse_encode(v_rem)
@@ -424,7 +427,7 @@ def record_step(
                 "q_value": float(q_val),
             })
     else:
-        actions_to_record = executed_actions if executed_actions is not None else (result.actions or [])
+        actions_to_record = executed_actions if executed_actions is not None else (getattr(result, "actions", None) or [])
         current_node = result.root if hasattr(result, 'root') else None
         for a in actions_to_record:
             channel, x, y, z = a
@@ -555,12 +558,15 @@ def backpropagate_value_targets(
     db_path: Path, 
     game_id: str,
     gamma: float = 0.99,
+    use_best_of_episode: bool = False,
 ) -> None:
     """
     Backpropagate episode outcome to set `value_target` consistently for every step:
-    - Phase 1 (GROWTH): discounted return `gamma^(t_P2 - t) * R_final`
-    - Phase 2 (REFINEMENT): `(1 - lambda_t) * R_FEM(t) + lambda_t * R_final`,
-      respecting structural disconnection and displacement collapse (-1.0).
+    - Phase 1 (GROWTH): discounted return `gamma^(t_P2 - t) * R_ref`
+    - Phase 2 (REFINEMENT): `(1 - lambda_t) * R_net(t) + lambda_t * R_ref`,
+      where `use_best_of_episode=True` sets `R_ref(t)` to the best discounted net
+      reward achieved at or after step `t` (`max_{tau >= t} gamma^(tau-t) * R_net(tau)`)
+      while keeping disconnected/collapsed steps strictly anchored at `-1.0`.
     """
     from .reward import calculate_reward
 
@@ -570,7 +576,7 @@ def backpropagate_value_targets(
     try:
         cursor.execute(
             """
-            SELECT step, phase, compliance_fem, volume_fraction, max_displacement, is_connected, fem_reward
+            SELECT step, phase, compliance_fem, volume_fraction, max_displacement, is_connected, fem_reward, island_penalty
             FROM game_steps
             WHERE game_id = ?
             ORDER BY step ASC
@@ -581,47 +587,68 @@ def backpropagate_value_targets(
         if not steps:
             return
 
-        last_step_idx, last_phase, last_comp, last_vol, last_disp, last_conn, last_fem_r = steps[-1]
-        if last_fem_r is not None:
-            final_reward = float(last_fem_r)
-        elif last_comp is not None and last_vol is not None:
-            final_reward = calculate_reward(
-                compliance=float(last_comp),
-                vol_frac=float(last_vol),
-                is_valid=bool(last_conn),
-                max_displacement=last_disp,
-            )
-        else:
-            final_reward = -1.0
+        def _net_step_reward(row: tuple) -> float:
+            _, _, comp, vol, max_disp, is_conn, fem_r, isl_pen = row
+            if not is_conn:
+                return -1.0
+            if fem_r is not None:
+                base_r = float(fem_r)
+            elif comp is not None and vol is not None:
+                base_r = calculate_reward(
+                    compliance=float(comp),
+                    vol_frac=float(vol),
+                    is_valid=True,
+                    max_displacement=max_disp,
+                )
+            else:
+                return -1.0
+            if base_r <= -0.999:
+                return -1.0
+            pen = float(isl_pen) if (use_best_of_episode and isl_pen is not None) else 0.0
+            return float(max(-1.0, min(1.0, base_r - pen)))
 
-        phase2_starts = [s[0] for s in steps if s[1] == "REFINEMENT"]
-        phase2_start_step = phase2_starts[0] if phase2_starts else last_step_idx
+        step_net_rewards = [_net_step_reward(r) for r in steps]
+        final_reward = step_net_rewards[-1]
+
+        phase2_indices = [i for i, s in enumerate(steps) if s[1] == "REFINEMENT"]
+        phase2_start_step = steps[phase2_indices[0]][0] if phase2_indices else steps[-1][0]
+        last_step_idx = steps[-1][0]
         p2_span = max(1, last_step_idx - phase2_start_step)
 
+        if use_best_of_episode and phase2_indices:
+            healthy_p2 = [step_net_rewards[i] for i in phase2_indices if step_net_rewards[i] > -0.999]
+            episode_peak = max(healthy_p2) if healthy_p2 else final_reward
+        else:
+            episode_peak = final_reward
+
         updates = []
-        for step_idx, phase_val, comp, vol, max_disp, is_conn, fem_r in steps:
+        for idx, row in enumerate(steps):
+            step_idx, phase_val, _, _, _, is_conn, _, _ = row
             if phase_val == "GROWTH":
                 steps_to_p2 = max(0, int(phase2_start_step) - int(step_idx))
-                target = (float(gamma) ** steps_to_p2) * final_reward
+                target = (float(gamma) ** steps_to_p2) * episode_peak
             else:
                 lam = min(1.0, max(0.0, float(step_idx - phase2_start_step) / float(p2_span)))
-                if not is_conn:
-                    cur_r = -1.0
-                elif fem_r is not None:
-                    cur_r = float(fem_r)
-                elif comp is not None and vol is not None:
-                    cur_r = calculate_reward(
-                        compliance=float(comp),
-                        vol_frac=float(vol),
-                        is_valid=True,
-                        max_displacement=max_disp,
-                    )
+                cur_r = step_net_rewards[idx]
+                if not is_conn or cur_r <= -0.999:
+                    target = -1.0
+                elif use_best_of_episode:
+                    best_future = cur_r
+                    for j in range(idx, len(steps)):
+                        if steps[j][1] != "REFINEMENT":
+                            continue
+                        rj = step_net_rewards[j]
+                        if rj > -0.999:
+                            dt = max(0, int(steps[j][0]) - int(step_idx))
+                            cand = (float(gamma) ** dt) * rj
+                            if cand > best_future:
+                                best_future = cand
+                    target = (1.0 - lam) * cur_r + lam * best_future
                 else:
-                    cur_r = final_reward
-                target = (1.0 - lam) * cur_r + lam * final_reward
+                    target = (1.0 - lam) * cur_r + lam * final_reward
 
             target = max(-1.0, min(1.0, float(target)))
-            updates.append((target, final_reward, game_id, step_idx))
+            updates.append((target, episode_peak if use_best_of_episode else final_reward, game_id, step_idx))
 
         cursor.executemany(
             """

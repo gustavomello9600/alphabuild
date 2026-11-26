@@ -46,6 +46,7 @@ from .reward import (
     # Core functions
     calculate_raw_score,
     calculate_reward,
+    calculate_grace_displacement_reward,
     # Phase-specific
     get_phase1_reward,
     get_phase2_terminal_reward,

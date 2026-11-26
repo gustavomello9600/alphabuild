@@ -142,7 +142,12 @@ class AlphaBuilderInference:
             (k[7:] if k.startswith("module.") else k): v
             for k, v in raw_sd.items()
         }
-        self.model.load_state_dict(state_dict)
+        incompat = self.model.load_state_dict(state_dict, strict=False)
+        if incompat.unexpected_keys:
+            raise RuntimeError(f"Unexpected checkpoint keys: {incompat.unexpected_keys}")
+        disallowed_missing = [k for k in incompat.missing_keys if not k.startswith("op_head.")]
+        if disallowed_missing:
+            raise RuntimeError(f"Missing checkpoint keys: {disallowed_missing}")
         self.model = self.model.to(self.device)
         self.model.eval()
 
@@ -292,6 +297,9 @@ class AlphaBuilderInference:
             "log_compliance": float(aux["log_compliance"][0, 0].cpu().item()),
             "conn_prob": float(torch.sigmoid(aux["conn_logit"])[0, 0].cpu().item()),
         }
+        if aux.get("op_logits") is not None:
+            op_p = torch.softmax(aux["op_logits"].float(), dim=-1)[0].cpu().numpy()
+            out_aux["op_probs"] = (float(op_p[0]), float(op_p[1]), float(op_p[2]))
         if aux.get("sed_u") is not None:
             out_aux["sed_u"] = aux["sed_u"][0].cpu().numpy()
         return value, policy[0], policy[1], out_aux

@@ -109,6 +109,10 @@ def _normalize_eval_batch(batch: dict) -> dict:
         batch["sed_target"] = torch.zeros((B, 1, D, H, W), dtype=torch.float32)
     if "sed_mask" not in batch:
         batch["sed_mask"] = torch.zeros((B,), dtype=torch.float32)
+    if "op_target" not in batch:
+        batch["op_target"] = torch.tensor([[0.5, 0.5, 0.0]], dtype=torch.float32).expand(B, -1).clone()
+    if "op_mask" not in batch:
+        batch["op_mask"] = torch.zeros((B,), dtype=torch.float32)
     return batch
 
 
@@ -127,6 +131,7 @@ def _run_epoch(
     lambda_log_c: float,
     lambda_conn: float,
     lambda_sed: float,
+    lambda_op: float,
     grad_clip_norm: float,
     tag: str,
 ) -> Dict[str, float]:
@@ -170,6 +175,8 @@ def _run_epoch(
             conn_mask = batch["conn_mask"].to(device, non_blocking=True)
             t_sed = batch["sed_target"].to(device, non_blocking=True)
             sed_mask = batch["sed_mask"].to(device, non_blocking=True)
+            t_op = batch["op_target"].to(device, non_blocking=True)
+            op_mask = batch["op_mask"].to(device, non_blocking=True)
 
             bs = float(state.shape[0])
             if is_train and optimizer is not None:
@@ -201,12 +208,16 @@ def _run_epoch(
                     pred_sed_u=aux.get("sed_u") if want_sed else None,
                     target_sed=t_sed,
                     sed_mask=sed_mask,
+                    pred_op_logits=aux.get("op_logits"),
+                    target_op=t_op,
+                    op_mask=op_mask,
                     lambda_policy=lambda_policy,
                     lambda_value=lambda_value,
                     lambda_bp=lambda_bp,
                     lambda_log_c=lambda_log_c,
                     lambda_conn=lambda_conn,
                     lambda_sed=lambda_sed,
+                    lambda_op=lambda_op,
                 )
 
             if is_train and optimizer is not None:
@@ -312,6 +323,7 @@ def main() -> None:
     parser.add_argument("--lambda-log-c", type=float, default=0.35)
     parser.add_argument("--lambda-conn", type=float, default=0.25)
     parser.add_argument("--lambda-sed", type=float, default=0.15)
+    parser.add_argument("--lambda-op", type=float, default=0.20)
     parser.add_argument("--num-workers", type=int, default=-1)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
@@ -402,7 +414,12 @@ def main() -> None:
     )
     raw_sd = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
     clean_sd = {(k[7:] if k.startswith("module.") else k): v for k, v in raw_sd.items()}
-    model.load_state_dict(clean_sd, strict=True)
+    incompat = model.load_state_dict(clean_sd, strict=False)
+    if incompat.unexpected_keys:
+        raise RuntimeError(f"Unexpected checkpoint keys: {incompat.unexpected_keys}")
+    disallowed_missing = [k for k in incompat.missing_keys if not k.startswith("op_head.")]
+    if disallowed_missing:
+        raise RuntimeError(f"Missing checkpoint keys: {disallowed_missing}")
     if args.lambda_sed > 0.0 and hasattr(model, "sed_head"):
         for p in model.sed_head.parameters():
             p.requires_grad_(True)
@@ -471,6 +488,7 @@ def main() -> None:
                 "lambda_log_c": args.lambda_log_c,
                 "lambda_conn": args.lambda_conn,
                 "lambda_sed": args.lambda_sed,
+                "lambda_op": args.lambda_op,
             },
         }
         torch.save(payload, path)
@@ -489,13 +507,13 @@ def main() -> None:
             )
             tr_m = _run_epoch(
                 model, train_loader, optimizer, scaler, device, is_distributed, is_main, use_amp,
-                args.lambda_policy, args.lambda_value, args.lambda_bp, args.lambda_log_c, args.lambda_conn, args.lambda_sed,
+                args.lambda_policy, args.lambda_value, args.lambda_bp, args.lambda_log_c, args.lambda_conn, args.lambda_sed, args.lambda_op,
                 1.0, f"SP-Train {epoch+1}/{args.epochs}",
             )
             val_sp_m = (
                 _run_epoch(
                     model, val_sp_loader, None, None, device, is_distributed, is_main, use_amp,
-                    args.lambda_policy, args.lambda_value, 0.0, args.lambda_log_c, args.lambda_conn, args.lambda_sed,
+                    args.lambda_policy, args.lambda_value, 0.0, args.lambda_log_c, args.lambda_conn, args.lambda_sed, args.lambda_op,
                     0.0, "Val-SP",
                 )
                 if val_sp_loader is not None
@@ -504,7 +522,7 @@ def main() -> None:
             val_wu_m = (
                 _run_epoch(
                     model, val_wu_loader, None, None, device, is_distributed, is_main, use_amp,
-                    args.lambda_policy, args.lambda_value, args.lambda_bp, args.lambda_log_c, args.lambda_conn, 0.0,
+                    args.lambda_policy, args.lambda_value, args.lambda_bp, args.lambda_log_c, args.lambda_conn, 0.0, 0.0,
                     0.0, "Val-WU",
                 )
                 if val_wu_loader is not None
