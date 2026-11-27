@@ -32,7 +32,7 @@ from alphabuilder.src.logic.selfplay import (
     save_game,
     update_game_final,
 )
-from alphabuilder.src.logic.selfplay.evaluator import evaluate_fem
+from alphabuilder.src.logic.selfplay.evaluator import HAS_FENICS, evaluate_fem
 from alphabuilder.src.logic.selfplay.fast_fem import evaluate_fem_fast
 from alphabuilder.src.logic.selfplay.reward import calculate_pbrs_potential, check_structure_connectivity
 from alphabuilder.src.logic.selfplay.runner import EpisodeConfig, run_episode_with_stats
@@ -64,9 +64,9 @@ def _make_cantilever_bar(resolution=(24, 12, 4), hole: bool = False) -> np.ndarr
     return density
 
 
+@pytest.mark.skipif(not HAS_FENICS, reason="FEniCSx not available")
 def test_fast_fem_vs_dolfinx_parity_and_sed():
     """Verify fast_amg matches dolfinx compliance, max displacement, and sum(SED) == C across general BCs."""
-    pytest.importorskip("dolfinx")
     res = (24, 12, 4)
     nx, ny, nz = res
     density = _make_cantilever_bar(res, hole=True)
