@@ -12,6 +12,7 @@ Where:
 Reference: Calibrated on v3.3 100-episode Pilot (Nov 2026)
 """
 
+from collections import deque
 import numpy as np
 from typing import Optional, Tuple, Dict, Any
 from scipy import ndimage
@@ -754,10 +755,47 @@ def get_reward_with_island_penalty(
 # =============================================================================
 
 
+def compute_geodesic_load_distance(
+    shape: Tuple[int, int, int],
+    forces: Tuple[np.ndarray, np.ndarray, np.ndarray],
+    domain_mask: Optional[np.ndarray] = None,
+) -> Optional[np.ndarray]:
+    """
+    Precompute per-voxel distance to the load region once per episode (`O(1)` lookup
+    during Phase-1 PBRS leaf evaluation). Uses Euclidean distance when `domain_mask` is
+    unobstructed, and 6-connected geodesic BFS around keep-out obstacles otherwise.
+    """
+    force_mag = np.abs(forces[0]) + np.abs(forces[1]) + np.abs(forces[2])
+    load_mask = force_mag > 1e-6
+    if not np.any(load_mask):
+        return None
+    if domain_mask is None or bool(np.all(domain_mask > 0.5)):
+        return ndimage.distance_transform_edt(~load_mask).astype(np.float32)
+
+    nx, ny, nz = shape
+    passable = (np.asarray(domain_mask) > 0.5) | load_mask
+    dist = np.full(shape, np.inf, dtype=np.float32)
+    q = deque()
+    for sx, sy, sz in np.argwhere(load_mask):
+        ix, iy, iz = int(sx), int(sy), int(sz)
+        dist[ix, iy, iz] = 0.0
+        q.append((ix, iy, iz))
+    nbrs = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
+    while q:
+        x, y, z = q.popleft()
+        nd = dist[x, y, z] + 1.0
+        for dx, dy, dz in nbrs:
+            xx, yy, zz = x + dx, y + dy, z + dz
+            if 0 <= xx < nx and 0 <= yy < ny and 0 <= zz < nz and passable[xx, yy, zz] and dist[xx, yy, zz] > nd:
+                dist[xx, yy, zz] = nd
+                q.append((xx, yy, zz))
+    return dist
+
+
 def get_guidance_alpha(
     generation: int = 0,
     decay_generations: int = 5,
-    initial_alpha: float = 0.30,
+    initial_alpha: float = 0.45,
 ) -> float:
     """
     Linearly decay heuristic MCTS shaping weight across self-play generations
@@ -776,15 +814,16 @@ def calculate_pbrs_potential(
     forces: Tuple[np.ndarray, np.ndarray, np.ndarray],
     load_config: Dict[str, Any],
     w_conn: float = 0.50,
-    w_dist: float = 0.25,
+    w_dist: float = 0.60,
     threshold: float = 0.5,
     bidirectional: bool = False,
+    dist_field: Optional[np.ndarray] = None,
 ) -> Tuple[float, Dict[str, Any]]:
     """
     Compute state potential Phi(s) = w_conn * conn_frac + dist_guidance - island_penalty
     for Potential-Based Reward Shaping (Muller & Kudenko, 2025).
-    `dist_guidance` smoothly rewards shortening the Euclidean gap from anchored support
-    material to the load front (load patch or load-anchored frontier when `bidirectional=True`).
+    `dist_guidance` smoothly rewards shortening the geodesic/Euclidean gap from anchored
+    support material to the load front (`dist_field` gives O(1) geodesic obstacle routing).
     """
     _, conn_frac = calculate_connectivity_reward(density, bc_masks, forces, threshold=threshold)
     analysis = analyze_structure_islands(
@@ -813,29 +852,38 @@ def calculate_pbrs_potential(
             load_mask = force_mag > 1e-6
             if sup_lbls and np.any(load_mask):
                 anchored_sup = np.isin(labeled, list(sup_lbls))
-                unconn_load = load_mask & (~anchored_sup)
-                target_front = unconn_load
-                if bidirectional:
-                    load_lbls = set(np.unique(labeled[load_mask])) - {0} - sup_lbls
-                    if load_lbls:
-                        anchored_load = np.isin(labeled, list(load_lbls))
-                        target_front = anchored_load ^ ndimage.binary_erosion(anchored_load)
-                        if not np.any(target_front):
-                            target_front = anchored_load
-                if np.any(target_front):
-                    surface = anchored_sup ^ ndimage.binary_erosion(anchored_sup)
-                    anc_pts = np.argwhere(surface if np.any(surface) else anchored_sup)
-                    if len(anc_pts) > 512:
-                        step = max(1, len(anc_pts) // 512)
-                        anc_pts = anc_pts[::step]
-                    tgt_pts = np.argwhere(target_front)
-                    if len(tgt_pts) > 512:
-                        step_t = max(1, len(tgt_pts) // 512)
-                        tgt_pts = tgt_pts[::step_t]
-                    diff = anc_pts[:, None, :].astype(np.float32) - tgt_pts[None, :, :].astype(np.float32)
-                    min_dist = float(np.sqrt(np.min(np.sum(diff * diff, axis=-1))))
-                    diag = float(np.sqrt(sum(s * s for s in density.shape)))
-                    dist_bonus = float(w_dist * max(0.0, 1.0 - min_dist / max(diag, 1.0)))
+                if dist_field is not None and not bidirectional:
+                    min_dist = float(dist_field[anchored_sup].min())
+                    if np.isfinite(min_dist):
+                        finite_mask = np.isfinite(dist_field)
+                        finite_max = float(np.max(dist_field[finite_mask])) if np.any(finite_mask) else 0.0
+                        diag = float(np.sqrt(sum(s * s for s in density.shape)))
+                        norm_scale = max(diag, finite_max, 1.0)
+                        dist_bonus = float(w_dist * max(0.0, 1.0 - min_dist / norm_scale))
+                else:
+                    unconn_load = load_mask & (~anchored_sup)
+                    target_front = unconn_load
+                    if bidirectional:
+                        load_lbls = set(np.unique(labeled[load_mask])) - {0} - sup_lbls
+                        if load_lbls:
+                            anchored_load = np.isin(labeled, list(load_lbls))
+                            target_front = anchored_load ^ ndimage.binary_erosion(anchored_load)
+                            if not np.any(target_front):
+                                target_front = anchored_load
+                    if np.any(target_front):
+                        surface = anchored_sup ^ ndimage.binary_erosion(anchored_sup)
+                        anc_pts = np.argwhere(surface if np.any(surface) else anchored_sup)
+                        if len(anc_pts) > 512:
+                            step = max(1, len(anc_pts) // 512)
+                            anc_pts = anc_pts[::step]
+                        tgt_pts = np.argwhere(target_front)
+                        if len(tgt_pts) > 512:
+                            step_t = max(1, len(tgt_pts) // 512)
+                            tgt_pts = tgt_pts[::step_t]
+                        diff = anc_pts[:, None, :].astype(np.float32) - tgt_pts[None, :, :].astype(np.float32)
+                        min_dist = float(np.sqrt(np.min(np.sum(diff * diff, axis=-1))))
+                        diag = float(np.sqrt(sum(s * s for s in density.shape)))
+                        dist_bonus = float(w_dist * max(0.0, 1.0 - min_dist / max(diag, 1.0)))
 
     phi = float(w_conn * conn_frac + dist_bonus - island_pen)
     analysis['island_penalty'] = island_pen

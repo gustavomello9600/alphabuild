@@ -95,13 +95,12 @@ PHASE1_V41_CONFIG = MCTSConfig(
     mixmax_beta=0.75,
     fpu_reduction=0.20,
     surface_only_remove=True,
-    bidirectional_p1=True,
+    bidirectional_p1=False,
     use_transposition_dag=True,
-    macro_action_mode=True,
-    factored_policy=True,
+    macro_action_mode=False,
+    factored_policy=False,
     root_only_policy_target=True,
     allow_stop_action=False,
-    macro_num_candidates=14,
 )
 
 PHASE2_V41_CONFIG = MCTSConfig(

@@ -420,15 +420,16 @@ class MCTSNode:
             idx_top = np.arange(ka)
             _add_macro("ADD", [add_pool[i] for i in idx_top], _score_logmean(add_p, idx_top) + 0.25)
 
-            # Structural flange-directed variants (top chord y >= ny/2, bottom chord y < ny/2)
-            ys = np.array([a[2] for a in add_pool], dtype=np.float64)
-            y_mid = float(ny - 1) * 0.5
-            top_bias = np.log(np.clip(add_p, 1e-8, 1.0)) + 1.6 * np.maximum(0.0, (ys - y_mid) / max(1.0, y_mid))
-            bot_bias = np.log(np.clip(add_p, 1e-8, 1.0)) + 1.6 * np.maximum(0.0, (y_mid - ys) / max(1.0, y_mid))
-            outer_bias = np.log(np.clip(add_p, 1e-8, 1.0)) + 1.4 * np.abs(ys - y_mid) / max(1.0, y_mid)
-            for bias_arr, bonus in ((top_bias, 0.05), (bot_bias, 0.05), (outer_bias, 0.15)):
-                idx_b = np.argsort(bias_arr)[::-1][:ka]
-                _add_macro("ADD", [add_pool[int(i)] for i in idx_b], _score_logmean(add_p, idx_b) + bonus)
+            # Structural flange-directed ADD variants only in Phase 2 (never push Phase-1 away from mid-height loads)
+            if phase != "GROWTH":
+                ys = np.array([a[2] for a in add_pool], dtype=np.float64)
+                y_mid = float(ny - 1) * 0.5
+                top_bias = np.log(np.clip(add_p, 1e-8, 1.0)) + 1.6 * np.maximum(0.0, (ys - y_mid) / max(1.0, y_mid))
+                bot_bias = np.log(np.clip(add_p, 1e-8, 1.0)) + 1.6 * np.maximum(0.0, (y_mid - ys) / max(1.0, y_mid))
+                outer_bias = np.log(np.clip(add_p, 1e-8, 1.0)) + 1.4 * np.abs(ys - y_mid) / max(1.0, y_mid)
+                for bias_arr, bonus in ((top_bias, 0.05), (bot_bias, 0.05), (outer_bias, 0.15)):
+                    idx_b = np.argsort(bias_arr)[::-1][:ka]
+                    _add_macro("ADD", [add_pool[int(i)] for i in idx_b], _score_logmean(add_p, idx_b) + bonus)
 
             # Gumbel-Top-K diverse ADD variants
             n_g_add = 4 if phase == "GROWTH" else 2

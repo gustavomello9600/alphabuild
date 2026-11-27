@@ -63,6 +63,7 @@ from alphabuilder.src.logic.selfplay.reward import (
     calculate_island_penalty,
     calculate_pbrs_potential,
     calculate_reward,
+    compute_geodesic_load_distance,
     get_guidance_alpha,
     get_phase2_terminal_reward,
 )
@@ -674,7 +675,10 @@ def run_neural_mcts_episode(
 
     alpha_guide = get_guidance_alpha(generation=0, decay_generations=5)
     phi_root = [0.0]
-    bidirectional_p1 = bool(v41_mcts)
+    p1_base = PHASE1_V41_CONFIG if v41_mcts else PHASE1_CONFIG
+    p2_base = PHASE2_V41_CONFIG if v41_mcts else PHASE2_CONFIG
+    bidirectional_p1 = bool(p1_base.bidirectional_p1)
+    geodesic_dist = compute_geodesic_load_distance(res, force_tuple, domain_mask=dm_arr)
 
     def _shape_value(
         net_val: float,
@@ -686,7 +690,7 @@ def run_neural_mcts_episode(
             density_grid,
             load_cfg,
             bc_masks=masks,
-            forces=force_vecs if has_custom_fields else None,
+            forces=force_vecs,
             bidirectional=(bidirectional_p1 and state.phase == Phase.GROWTH),
         )
         total_vox = int((density_grid > 0.5).sum())
@@ -702,7 +706,12 @@ def run_neural_mcts_episode(
             return float(np.clip(float(net_val) - isl_pen, -1.0, 1.0))
         if alpha_guide > 0.0:
             phi_leaf, _ = calculate_pbrs_potential(
-                density_grid, masks, force_vecs, load_cfg, bidirectional=bidirectional_p1
+                density_grid,
+                masks,
+                force_vecs,
+                load_cfg,
+                bidirectional=bidirectional_p1,
+                dist_field=geodesic_dist,
             )
             return float(np.clip(float(net_val) + alpha_guide * (phi_leaf - phi_root[0]), -1.0, 1.0))
         return float(np.clip(float(net_val), -1.0, 1.0))
@@ -723,8 +732,6 @@ def run_neural_mcts_episode(
         ]
         return shaped, pas, prs
 
-    p1_base = PHASE1_V41_CONFIG if v41_mcts else PHASE1_CONFIG
-    p2_base = PHASE2_V41_CONFIG if v41_mcts else PHASE2_CONFIG
     p1_cfg = p1_base._replace(num_simulations=num_simulations, add_root_noise=False)
     p2_cfg = p2_base._replace(num_simulations=num_simulations, add_root_noise=False)
 
@@ -819,7 +826,12 @@ def run_neural_mcts_episode(
         mcts.config = cfg
 
         phi_root[0], _ = calculate_pbrs_potential(
-            state.density, bc_tuple, force_tuple, load_cfg, bidirectional=bidirectional_p1
+            state.density,
+            bc_tuple,
+            force_tuple,
+            load_cfg,
+            bidirectional=bidirectional_p1,
+            dist_field=geodesic_dist,
         )
         if cur_phase == Phase.GROWTH:
             if phi_root[0] > best_p1_phi + 1e-3:
@@ -863,7 +875,7 @@ def run_neural_mcts_episode(
             state.density,
             load_cfg,
             bc_masks=bc_tuple,
-            forces=force_tuple if has_custom_fields else None,
+            forces=force_tuple,
             bidirectional=(bidirectional_p1 and cur_phase == Phase.GROWTH),
         )
         total_vox = int((state.density > 0.5).sum())
@@ -997,7 +1009,7 @@ def run_neural_mcts_episode(
                     executed_actions,
                     load_cfg,
                     bc_masks=bc_tuple,
-                    forces=force_tuple if has_custom_fields else None,
+                    forces=force_tuple,
                 )
                 if safe_acts != executed_actions:
                     batch_filtered = True
@@ -1102,7 +1114,7 @@ def run_neural_mcts_episode(
                 state.density,
                 load_cfg,
                 bc_masks=bc_tuple,
-                forces=force_tuple if has_custom_fields else None,
+                forces=force_tuple,
                 max_vol_frac=0.65 if v41_mcts else 0.4,
             )
             if term_r is not None:
@@ -1148,11 +1160,14 @@ def run_neural_mcts_episode(
             if cur_phase == Phase.GROWTH:
                 mcts.eval_cache = {}
         else:
-            mcts.clear_tree() if v41_mcts else mcts.reset()
+            if cur_phase == Phase.GROWTH:
+                mcts.reset()
+            else:
+                mcts.clear_tree() if v41_mcts else mcts.reset()
 
         if cur_phase == Phase.GROWTH:
             post_isl = analyze_structure_islands(
-                state.density, load_cfg, bc_masks=bc_tuple, forces=force_tuple if has_custom_fields else None
+                state.density, load_cfg, bc_masks=bc_tuple, forces=force_tuple
             )
             if post_isl["is_connected"]:
                 phase1_steps_to_connect = state.current_step + 1
@@ -1189,7 +1204,7 @@ def run_neural_mcts_episode(
     else:
         raw_val_final, pa_final, pr_final, bp_final = model.predict_with_blueprint(state_tensor_final, domain_mask=dm_arr)
     isl_final = analyze_structure_islands(
-        state.density, load_cfg, bc_masks=bc_tuple, forces=force_tuple if has_custom_fields else None
+        state.density, load_cfg, bc_masks=bc_tuple, forces=force_tuple
     )
     vol_final = float(np.mean(state.density > 0.5))
     vox_final = int((state.density > 0.5).sum())

@@ -507,3 +507,48 @@ def test_evaluate_inference_scenarios_v41_mcts_end_to_end(tmp_path: Path):
         assert r["total_recorded_steps"] >= 1
 
 
+def test_option3_v41_hybrid_configs_and_geodesic_pbrs_routes_around_keepout_obstacle():
+    """Verify Option 3 keeps Phase-1 fast/unitary + geodesic keep-out PBRS and Phase-2 v4.1 intact."""
+    from alphabuilder.src.logic.mcts.engine import PHASE1_V41_CONFIG, PHASE2_V41_CONFIG
+    from alphabuilder.src.logic.selfplay.reward import compute_geodesic_load_distance
+
+    assert PHASE1_V41_CONFIG.macro_action_mode is False
+    assert PHASE1_V41_CONFIG.bidirectional_p1 is False
+    assert PHASE1_V41_CONFIG.factored_policy is False
+    assert PHASE1_V41_CONFIG.use_transposition_dag is True
+    assert PHASE1_V41_CONFIG.root_only_policy_target is True
+
+    assert PHASE2_V41_CONFIG.macro_action_mode is True
+    assert PHASE2_V41_CONFIG.factored_policy is True
+    assert PHASE2_V41_CONFIG.allow_stop_action is True
+    assert PHASE2_V41_CONFIG.surface_only_remove is True
+
+    shape = (16, 10, 4)
+    mx, my, mz = generate_bc_masks(shape, "FULL_CLAMP")
+    bc = (mx, my, mz)
+    forces = (np.zeros(shape, dtype=np.float32), np.zeros(shape, dtype=np.float32), np.zeros(shape, dtype=np.float32))
+    forces[1][14, 4:6, 1:3] = -1.0
+    lcfg = {"x": 14, "y": 5, "z_start": 1, "z_end": 3, "bc_type": "FULL_CLAMP"}
+
+    dm = np.ones(shape, dtype=np.float32)
+    dm[6:9, 2:8, :] = 0.0  # Keep-out wall forcing detour via y<2 or y>=8
+
+    gdist = compute_geodesic_load_distance(shape, forces, domain_mask=dm)
+    assert gdist is not None
+    assert np.isinf(gdist[7, 5, 1])
+    # Euclidean from (4, 5, 1) to (14, 4, 1) is ~10.05; geodesic detour via y=1 or y=8 is strictly longer
+    assert float(gdist[4, 5, 1]) > 12.0
+
+    d_straight = np.zeros(shape, dtype=np.float32)
+    d_straight[0:6, 5, 1:3] = 1.0  # Stops right in front of barrier
+
+    d_detour = d_straight.copy()
+    d_detour[5, 5:9, 1:3] = 1.0
+    d_detour[5:11, 8, 1:3] = 1.0  # Wraps cleanly above barrier toward load
+
+    phi_straight, _ = calculate_pbrs_potential(d_straight, bc, forces, lcfg, bidirectional=False, dist_field=gdist)
+    phi_detour, _ = calculate_pbrs_potential(d_detour, bc, forces, lcfg, bidirectional=False, dist_field=gdist)
+    assert phi_detour > phi_straight
+
+
+

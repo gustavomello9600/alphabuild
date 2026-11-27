@@ -53,6 +53,7 @@ from .reward import (
     calculate_pbrs_potential,
     calculate_reward,
     check_structure_connectivity,
+    compute_geodesic_load_distance,
     get_guidance_alpha,
     get_phase2_terminal_reward,
 )
@@ -451,7 +452,14 @@ def _run_episode_loop(
         else 0.0
     )
 
-    bidirectional_p1 = bool(config.use_v41_mcts)
+    p1_template = PHASE1_V41_CONFIG if config.use_v41_mcts else PHASE1_CONFIG
+    p2_template = PHASE2_V41_CONFIG if config.use_v41_mcts else PHASE2_CONFIG
+    bidirectional_p1 = bool(p1_template.bidirectional_p1)
+    geodesic_dist = compute_geodesic_load_distance(
+        state.density.shape,
+        (state.forces[0], state.forces[1], state.forces[2]),
+        domain_mask=state.domain_mask,
+    )
     current_phi_root = [0.0]
 
     def _shape_value(net_val: float, density_grid: np.ndarray, masks, force_vecs) -> float:
@@ -484,6 +492,7 @@ def _run_episode_loop(
                 force_vecs,
                 load_config,
                 bidirectional=bidirectional_p1,
+                dist_field=geodesic_dist,
             )
             shaping = alpha_guide * (phi_leaf - current_phi_root[0])
             return max(-1.0, min(1.0, float(net_val) + shaping))
@@ -515,9 +524,6 @@ def _run_episode_loop(
             for nv, st in zip(net_vals, state_tensors)
         ]
         return final_vals, ps_add, ps_remove
-
-    p1_template = PHASE1_V41_CONFIG if config.use_v41_mcts else PHASE1_CONFIG
-    p2_template = PHASE2_V41_CONFIG if config.use_v41_mcts else PHASE2_CONFIG
 
     # Resolution-scaled P1 batch & budget (canonical 64x32x8 keeps exact baseline values)
     domain_scale = (float(state.density.size) / 16384.0) ** (1.0 / 3.0)
@@ -709,6 +715,7 @@ def _run_episode_loop(
             force_tuple,
             state.load_config,
             bidirectional=bidirectional_p1,
+            dist_field=geodesic_dist,
         )
         if cur_phase == Phase.GROWTH:
             if current_phi_root[0] > best_p1_phi + 1e-3:
@@ -1027,9 +1034,15 @@ def _run_episode_loop(
                 if cur_phase == Phase.GROWTH:
                     mcts_wrapper.eval_cache = {}
             else:
-                mcts_wrapper.clear_tree()
+                if cur_phase == Phase.GROWTH:
+                    mcts_wrapper.reset()
+                else:
+                    mcts_wrapper.clear_tree()
         else:
-            mcts_wrapper.clear_tree()
+            if cur_phase == Phase.GROWTH:
+                mcts_wrapper.reset()
+            else:
+                mcts_wrapper.clear_tree()
 
         if cur_phase == Phase.GROWTH:
             if check_phase_transition(state):

@@ -58,6 +58,7 @@ from .reward import (
     get_reward_with_island_penalty,
     calculate_connectivity_reward,
     calculate_pbrs_potential,
+    compute_geodesic_load_distance,
     get_guidance_alpha,
     reverse_engineer_compliance,
 )
@@ -86,6 +87,7 @@ __all__ = [
     'calculate_connectivity_reward',
     'calculate_displacement_penalty',
     'calculate_pbrs_potential',
+    'compute_geodesic_load_distance',
     'get_guidance_alpha',
     'reverse_engineer_compliance',
 ]
