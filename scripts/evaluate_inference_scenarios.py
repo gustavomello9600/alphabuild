@@ -35,7 +35,6 @@ from alphabuilder.src.logic.harvest.generators import (
     generate_bc_masks,
     get_load_region_bounds,
 )
-from alphabuilder.src.logic.harvest.optimization import run_fenitop_optimization
 from alphabuilder.src.logic.mcts.engine import (
     AlphaBuilderMCTS,
     PHASE1_CONFIG,
@@ -359,6 +358,8 @@ def run_simp_baseline(
     target_vol_frac: float = 0.15,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Run FEniTop SIMP on one scenario and persist all steps to `db_path`."""
+    from alphabuilder.src.logic.harvest.optimization import run_fenitop_optimization
+
     game_id = f"simp__{scenario['id']}"
     load_cfg = dict(scenario["load_config"])
     bc_type = scenario["bc_type"]

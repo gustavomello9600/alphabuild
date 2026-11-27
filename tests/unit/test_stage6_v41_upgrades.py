@@ -335,3 +335,23 @@ def test_beso3d_smoke_and_v41_episode_stagnation_termination(tmp_path: Path):
     )
     assert steps >= 1 and np.isfinite(score)
     assert "best_score" in st and "dag_transpositions" in st
+
+
+def test_stage6_scripts_import_without_fenicsx_or_mpi(monkeypatch):
+    """Ensure Kaggle environments (PyTorch + PyAMG only, without dolfinx/mpi4py) import Stage 6 cleanly."""
+    import importlib
+    import sys
+
+    for mod_name in ("mpi4py", "mpi4py.MPI", "dolfinx", "dolfinx.fem", "dolfinx.mesh", "petsc4py", "petsc4py.PETSc", "basix", "basix.ufl", "ufl"):
+        monkeypatch.setitem(sys.modules, mod_name, None)
+
+    for target in (
+        "scripts.evaluate_inference_scenarios",
+        "scripts.run_selfplay_pipeline",
+        "scripts.train_selfplay_step",
+    ):
+        if target in sys.modules:
+            del sys.modules[target]
+        mod = importlib.import_module(target)
+        assert mod is not None
+
