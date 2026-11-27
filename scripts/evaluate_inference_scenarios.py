@@ -44,7 +44,7 @@ from alphabuilder.src.logic.mcts.engine import (
     select_pv_branches,
 )
 from alphabuilder.src.logic.mcts.legal_moves import filter_disconnect_safe_batch
-from alphabuilder.src.logic.mcts.node import is_stop_action
+from alphabuilder.src.logic.mcts.node import flatten_tree_action, is_stop_action
 from alphabuilder.src.logic.selfplay import (
     GameInfo,
     backpropagate_value_targets,
@@ -558,13 +558,31 @@ def _update_mcts_q_blobs(
 ) -> None:
     if root is None or not getattr(root, "children", None):
         return
-    q_add = np.zeros(resolution, dtype=np.float32)
-    q_rem = np.zeros(resolution, dtype=np.float32)
-    for (ch, x, y, z), child in root.children.items():
-        if ch == 0:
-            q_add[x, y, z] = float(child.mean_value)
-        else:
-            q_rem[x, y, z] = float(child.mean_value)
+    q_add_sum = np.zeros(resolution, dtype=np.float64)
+    q_add_w = np.zeros(resolution, dtype=np.float64)
+    q_rem_sum = np.zeros(resolution, dtype=np.float64)
+    q_rem_w = np.zeros(resolution, dtype=np.float64)
+    for tree_act, child in root.children.items():
+        if is_stop_action(tree_act):
+            continue
+        flat = flatten_tree_action(tree_act)
+        if not flat:
+            continue
+        q_val = float(child.mean_value)
+        w = float(max(int(child.visit_count), 1))
+        for ch, x, y, z in flat:
+            if ch == 0:
+                q_add_sum[x, y, z] += w * q_val
+                q_add_w[x, y, z] += w
+            else:
+                q_rem_sum[x, y, z] += w * q_val
+                q_rem_w[x, y, z] += w
+    q_add = np.divide(
+        q_add_sum, q_add_w, out=np.zeros(resolution, dtype=np.float64), where=q_add_w > 0.0
+    ).astype(np.float32)
+    q_rem = np.divide(
+        q_rem_sum, q_rem_w, out=np.zeros(resolution, dtype=np.float64), where=q_rem_w > 0.0
+    ).astype(np.float32)
     qa_idx, qa_val = sparse_encode(q_add)
     qr_idx, qr_val = sparse_encode(q_rem)
     qa_blob = serialize_sparse(qa_idx, qa_val) if len(qa_idx) > 0 else None

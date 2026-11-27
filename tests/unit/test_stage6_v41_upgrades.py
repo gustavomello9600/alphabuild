@@ -366,3 +366,144 @@ print("CLEAN_KAGGLE_IMPORTS_OK")
     assert res.returncode == 0, f"stderr:\n{res.stderr}\nstdout:\n{res.stdout}"
     assert "CLEAN_KAGGLE_IMPORTS_OK" in res.stdout
 
+
+def test_evaluate_inference_scenarios_v41_mcts_end_to_end(tmp_path: Path):
+    """Verify _update_mcts_q_blobs handles STOP + macro keys and run_neural_mcts_episode works E2E."""
+    import sqlite3
+
+    import scripts.evaluate_inference_scenarios as eval_mod
+    from alphabuilder.src.logic.storage import deserialize_sparse, sparse_decode
+
+    shape = (8, 6, 4)
+    db_path = tmp_path / "eval_v41_e2e.db"
+    initialize_selfplay_db(db_path)
+
+    mx, my, mz = generate_bc_masks(shape, "FULL_CLAMP")
+    bc = np.stack([mx, my, mz], axis=0).astype(np.float32)
+    forces = np.zeros((3, *shape), dtype=np.float32)
+    forces[1, 7, 2:4, 1:3] = -1.0
+    lcfg = {"x": 7, "y": 4, "z_start": 1, "z_end": 3, "bc_type": "FULL_CLAMP"}
+    save_game(db_path, GameInfo("q_macro_test", "phys_uvit", "v4.1", bc, forces, lcfg, "FULL_CLAMP", shape))
+
+    dum = np.zeros(shape, dtype=np.float32)
+    sr_empty = type("SR", (), {"actions": [], "visit_distribution": {}, "root_value": 0.0, "num_simulations": 1, "root": None})()
+    es = EpisodeState(density=dum, bc_masks=bc, forces=forces, load_config=lcfg, current_step=0, phase=Phase.GROWTH, game_id="q_macro_test")
+    record_step(db_path, es, sr_empty, 0.0, dum, dum)
+
+    root = MCTSNode(prior=1.0, is_expanded=True)
+    e1 = ((0, 1, 2, 1), (1, 2, 2, 1))
+    e2 = ((0, 1, 2, 1), (0, 3, 2, 1))
+    c1 = MCTSNode(prior=0.5, action_to_parent=e1, parent=root)
+    c1.visit_count = 3
+    c1.value_sum = 0.9  # mean 0.3
+    c2 = MCTSNode(prior=0.3, action_to_parent=e2, parent=root)
+    c2.visit_count = 1
+    c2.value_sum = 0.7  # mean 0.7
+    c_stop = MCTSNode(prior=0.2, action_to_parent=STOP_ACTION, parent=root)
+    c_stop.visit_count = 4
+    c_stop.value_sum = 3.2
+    root.children = {e1: c1, e2: c2, STOP_ACTION: c_stop}
+
+    eval_mod._update_mcts_q_blobs(db_path, "q_macro_test", 0, root, shape)
+    conn = sqlite3.connect(db_path)
+    try:
+        qa_blob, qr_blob = conn.execute(
+            "SELECT mcts_q_add_blob, mcts_q_remove_blob FROM game_steps WHERE game_id = ? AND step = 0",
+            ("q_macro_test",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert qa_blob is not None and qr_blob is not None
+    q_add_dec = sparse_decode(*deserialize_sparse(qa_blob), shape)
+    q_rem_dec = sparse_decode(*deserialize_sparse(qr_blob), shape)
+    assert q_add_dec[1, 2, 1] == pytest.approx(0.4, abs=1e-5)
+    assert q_add_dec[3, 2, 1] == pytest.approx(0.7, abs=1e-5)
+    assert q_rem_dec[2, 2, 1] == pytest.approx(0.3, abs=1e-5)
+
+    # Full end-to-end episode check with legacy Stage-5 checkpoint (no op_head.* keys)
+    model = PhysUViT3D(in_channels=7, out_channels=2, feature_size=16, embed_dim=64, transformer_depth=1, num_heads=4)
+    legacy_sd = {k: v for k, v in model.state_dict().items() if not k.startswith("op_head.")}
+    ckpt = tmp_path / "legacy_stage5_small.pt"
+    torch.save(
+        {
+            "model_state_dict": legacy_sd,
+            "config": {
+                "architecture": "phys_uvit",
+                "in_channels": 7,
+                "out_channels": 2,
+                "feature_size": 16,
+                "embed_dim": 64,
+                "transformer_depth": 1,
+                "num_heads": 4,
+            },
+            "epoch": 18,
+            "val_loss": 0.3285,
+        },
+        ckpt,
+    )
+    infer = AlphaBuilderInference(ckpt, device="cpu")
+    ep_db = tmp_path / "eval_ep_e2e.db"
+    initialize_selfplay_db(ep_db)
+
+    res_small = (16, 8, 4)
+    sc_can = {
+        "id": "S_unit_16x8x4",
+        "title": "Unit Cantilever 16x8x4",
+        "resolution": res_small,
+        "bc_type": "FULL_CLAMP",
+        "load_config": {"x": 15, "y": 4, "z_start": 1, "z_end": 3, "bc_type": "FULL_CLAMP"},
+    }
+    mx_s, my_s, mz_s = generate_bc_masks(res_small, "FULL_CLAMP")
+    bc_ko = np.stack([mx_s, my_s, mz_s], axis=0).astype(np.float32)
+    f_ko = np.zeros((3, *res_small), dtype=np.float32)
+    f_ko[1, 15, 3:5, 1:3] = -1.0
+    dm_ko = np.ones(res_small, dtype=np.float32)
+    dm_ko[5:9, 2:6, :] = 0.0
+    sc_ood = {
+        "id": "G_unit_keepout",
+        "title": "Unit Keepout 16x8x4",
+        "resolution": res_small,
+        "bc_type": "KEEPOUT_WINDOW",
+        "load_config": {"x": 15, "y": 4, "z_start": 1, "z_end": 3, "bc_type": "KEEPOUT_WINDOW"},
+        "bc_masks": bc_ko,
+        "forces": f_ko,
+        "domain_mask": dm_ko,
+    }
+
+    r1 = eval_mod.run_neural_mcts_episode(
+        model=infer,
+        db_path=ep_db,
+        scenario=sc_can,
+        prefix="u_v41",
+        checkpoint_version="unit-stage5-v41",
+        num_simulations=6,
+        max_phase1_steps=4,
+        max_phase2_steps=3,
+        simp_binary_mask=None,
+        simp_summary=None,
+        fem_backend="fast_amg",
+        v41_mcts=True,
+    )
+    r2 = eval_mod.run_neural_mcts_episode(
+        model=infer,
+        db_path=ep_db,
+        scenario=sc_ood,
+        prefix="u_v41",
+        checkpoint_version="unit-stage5-v41",
+        num_simulations=6,
+        max_phase1_steps=4,
+        max_phase2_steps=3,
+        simp_binary_mask=None,
+        simp_summary=None,
+        fem_backend="fast_amg",
+        v41_mcts=True,
+    )
+    integrity, g_count = eval_mod._finalize_sqlite(ep_db)
+    assert integrity == "ok" and g_count == 2
+    for r in (r1, r2):
+        assert np.isfinite(r["final_score"])
+        assert r["physics_aux_diagnostics"] is not None
+        assert "mcts_diagnostics" in r
+        assert r["total_recorded_steps"] >= 1
+
+
