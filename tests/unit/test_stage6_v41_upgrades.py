@@ -337,21 +337,32 @@ def test_beso3d_smoke_and_v41_episode_stagnation_termination(tmp_path: Path):
     assert "best_score" in st and "dag_transpositions" in st
 
 
-def test_stage6_scripts_import_without_fenicsx_or_mpi(monkeypatch):
-    """Ensure Kaggle environments (PyTorch + PyAMG only, without dolfinx/mpi4py) import Stage 6 cleanly."""
-    import importlib
+def test_stage6_scripts_import_without_fenicsx_or_mpi():
+    """Ensure fresh Python processes (Kaggle without dolfinx/mpi4py/monai) import & run Stage 6 scripts."""
+    import subprocess
     import sys
 
-    for mod_name in ("mpi4py", "mpi4py.MPI", "dolfinx", "dolfinx.fem", "dolfinx.mesh", "petsc4py", "petsc4py.PETSc", "basix", "basix.ufl", "ufl"):
-        monkeypatch.setitem(sys.modules, mod_name, None)
-
-    for target in (
-        "scripts.evaluate_inference_scenarios",
-        "scripts.run_selfplay_pipeline",
-        "scripts.train_selfplay_step",
-    ):
-        if target in sys.modules:
-            del sys.modules[target]
-        mod = importlib.import_module(target)
-        assert mod is not None
+    probe_code = """
+import builtins, importlib, sys
+BLOCKED = ("mpi4py", "dolfinx", "petsc4py", "basix", "ufl", "monai")
+real_import = builtins.__import__
+def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+    top = name.split(".", 1)[0]
+    if top in BLOCKED:
+        raise ModuleNotFoundError(f"Blocked optional package: {name}")
+    return real_import(name, globals, locals, fromlist, level)
+builtins.__import__ = guarded_import
+for mod in (
+    "scripts.evaluate_inference_scenarios",
+    "scripts.run_selfplay_pipeline",
+    "scripts.train_selfplay_step",
+    "alphabuilder.src.logic.benchmarks.beso3d",
+    "alphabuilder.src.logic.selfplay.runner",
+):
+    importlib.import_module(mod)
+print("CLEAN_KAGGLE_IMPORTS_OK")
+"""
+    res = subprocess.run([sys.executable, "-c", probe_code], cwd=str(REPO_ROOT), capture_output=True, text=True)
+    assert res.returncode == 0, f"stderr:\n{res.stderr}\nstdout:\n{res.stdout}"
+    assert "CLEAN_KAGGLE_IMPORTS_OK" in res.stdout
 
