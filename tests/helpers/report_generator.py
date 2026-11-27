@@ -11,8 +11,13 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Tuple
 
-from alphabuilder.src.logic.storage import deserialize_state, sparse_decode
-from alphabuilder.src.neural.dataset import deserialize_sparse, deserialize_array
+from alphabuilder.src.logic.storage import (
+    deserialize_array,
+    deserialize_sparse,
+    deserialize_state,
+    has_new_schema,
+    sparse_decode,
+)
 
 
 def generate_quality_report(db_path: Path, output_path: Path) -> str:
@@ -28,9 +33,11 @@ def generate_quality_report(db_path: Path, output_path: Path) -> str:
     """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    
+    is_v2 = has_new_schema(db_path)
+    table_name = "records" if is_v2 else "training_data"
+
     report_lines = []
-    
+
     # ==================== HEADER ====================
     report_lines.append("# 📊 Relatório de Qualidade de Dados de Treino")
     report_lines.append("")
@@ -39,23 +46,23 @@ def generate_quality_report(db_path: Path, output_path: Path) -> str:
     report_lines.append("")
     report_lines.append("---")
     report_lines.append("")
-    
+
     # ==================== RESUMO GERAL ====================
     report_lines.append("## 1. Resumo Geral")
     report_lines.append("")
-    
+
     # Total de registros
-    cursor.execute("SELECT COUNT(*) FROM training_data")
+    cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
     total_records = cursor.fetchone()[0]
-    
+
     # Episódios únicos
-    cursor.execute("SELECT COUNT(DISTINCT episode_id) FROM training_data")
+    cursor.execute(f"SELECT COUNT(DISTINCT episode_id) FROM {table_name}")
     total_episodes = cursor.fetchone()[0]
-    
+
     # Por fase
-    cursor.execute("SELECT phase, COUNT(*) FROM training_data GROUP BY phase")
+    cursor.execute(f"SELECT phase, COUNT(*) FROM {table_name} GROUP BY phase")
     phase_counts = dict(cursor.fetchall())
-    
+
     report_lines.append(f"| Métrica | Valor |")
     report_lines.append(f"|---------|-------|")
     report_lines.append(f"| Total de Registros | **{total_records}** |")
@@ -63,12 +70,12 @@ def generate_quality_report(db_path: Path, output_path: Path) -> str:
     report_lines.append(f"| Registros GROWTH (Fase 1) | {phase_counts.get('GROWTH', 0)} |")
     report_lines.append(f"| Registros REFINEMENT (Fase 2) | {phase_counts.get('REFINEMENT', 0)} |")
     report_lines.append("")
-    
+
     # ==================== ANÁLISE POR EPISÓDIO ====================
     report_lines.append("## 2. Análise por Episódio")
     report_lines.append("")
-    
-    cursor.execute("""
+
+    cursor.execute(f"""
         SELECT episode_id, 
                COUNT(*) as records,
                SUM(CASE WHEN phase = 'GROWTH' THEN 1 ELSE 0 END) as growth,
@@ -76,14 +83,14 @@ def generate_quality_report(db_path: Path, output_path: Path) -> str:
                AVG(fitness_score) as avg_fitness,
                MIN(fitness_score) as min_fitness,
                MAX(fitness_score) as max_fitness
-        FROM training_data
+        FROM {table_name}
         GROUP BY episode_id
     """)
     episodes = cursor.fetchall()
-    
+
     report_lines.append("| Episode ID | Records | GROWTH | REFINEMENT | Avg Fitness | Min | Max |")
     report_lines.append("|------------|---------|--------|------------|-------------|-----|-----|")
-    
+
     for ep in episodes:
         ep_id_short = ep[0][:8] + "..." if len(ep[0]) > 8 else ep[0]
         report_lines.append(
@@ -91,18 +98,40 @@ def generate_quality_report(db_path: Path, output_path: Path) -> str:
             f"{ep[4]:.4f} | {ep[5]:.4f} | {ep[6]:.4f} |"
         )
     report_lines.append("")
-    
+
     # ==================== ANÁLISE DE TENSORES ====================
     report_lines.append("## 3. Análise de Tensores")
     report_lines.append("")
-    
-    # Amostra alguns tensores para análise
-    cursor.execute("SELECT state_blob, policy_blob, phase FROM training_data LIMIT 10")
-    samples = cursor.fetchall()
-    
-    if samples:
-        state_sample = deserialize_state(samples[0][0])
-        policy_sample = deserialize_state(samples[0][1])
+
+    state_sample = None
+    policy_sample = None
+    if is_v2:
+        cursor.execute("""
+            SELECT r.density_blob, r.policy_add_blob, r.policy_remove_blob, r.phase,
+                   e.bc_masks_blob, e.forces_blob, e.resolution
+            FROM records r
+            JOIN episodes e ON r.episode_id = e.episode_id
+            LIMIT 10
+        """)
+        samples = cursor.fetchall()
+        if samples:
+            d_b, pa_b, pr_b, _ph, bc_b, f_b, res_j = samples[0]
+            res = tuple(json.loads(res_j))
+            dens = deserialize_array(d_b).astype(np.float32)
+            bc_m = deserialize_array(bc_b).astype(np.float32)
+            f_arr = deserialize_array(f_b).astype(np.float32)
+            state_sample = np.concatenate([dens[None], bc_m, f_arr], axis=0).astype(np.float32)
+            pa_arr = sparse_decode(*deserialize_sparse(pa_b), res) if pa_b else np.zeros(res, dtype=np.float32)
+            pr_arr = sparse_decode(*deserialize_sparse(pr_b), res) if pr_b else np.zeros(res, dtype=np.float32)
+            policy_sample = np.stack([pa_arr, pr_arr], axis=0).astype(np.float32)
+    else:
+        cursor.execute("SELECT state_blob, policy_blob, phase FROM training_data LIMIT 10")
+        samples = cursor.fetchall()
+        if samples:
+            state_sample = deserialize_state(samples[0][0])
+            policy_sample = deserialize_state(samples[0][1])
+
+    if state_sample is not None and policy_sample is not None:
         
         report_lines.append(f"### 3.1 Dimensões dos Tensores")
         report_lines.append("")
@@ -154,9 +183,6 @@ def generate_quality_report(db_path: Path, output_path: Path) -> str:
     report_lines.append("")
     
     # Detecta schema e busca scores
-    from alphabuilder.src.logic.storage import has_new_schema
-    is_v2 = has_new_schema(db_path)
-    
     if is_v2:
         cursor.execute("SELECT fitness_score FROM records")
     else:
@@ -205,13 +231,13 @@ def generate_quality_report(db_path: Path, output_path: Path) -> str:
     report_lines.append(f"### 4.3 Fitness por Fase")
     report_lines.append("")
     
-    cursor.execute("""
+    cursor.execute(f"""
         SELECT phase, 
                AVG(fitness_score), 
                MIN(fitness_score), 
                MAX(fitness_score),
                COUNT(*)
-        FROM training_data 
+        FROM {table_name} 
         GROUP BY phase
     """)
     phase_stats = cursor.fetchall()
@@ -232,9 +258,6 @@ def generate_quality_report(db_path: Path, output_path: Path) -> str:
     report_lines.append("")
     
     # Amostra mais registros (suporta schema v1 e v2)
-    from alphabuilder.src.logic.storage import has_new_schema, sparse_decode, deserialize_array
-    is_v2 = has_new_schema(db_path)
-    
     if is_v2:
         cursor.execute("""
             SELECT r.policy_add_blob, r.policy_remove_blob, r.phase, e.resolution
@@ -250,16 +273,10 @@ def generate_quality_report(db_path: Path, output_path: Path) -> str:
         refinement_add_ratios = []
         
         for policy_add_blob, policy_remove_blob, phase, resolution_json in policy_samples:
-            if policy_add_blob and policy_remove_blob:
-                # Schema v2: policy está em formato esparso
+            if policy_add_blob or policy_remove_blob:
                 resolution = tuple(json.loads(resolution_json))
-                
-                # Deserializa esparso
-                add_idx, add_val = deserialize_sparse(policy_add_blob)
-                rem_idx, rem_val = deserialize_sparse(policy_remove_blob)
-                
-                add_ch = sparse_decode(add_idx, add_val, resolution)
-                rem_ch = sparse_decode(rem_idx, rem_val, resolution)
+                add_ch = sparse_decode(*deserialize_sparse(policy_add_blob), resolution) if policy_add_blob else np.zeros(resolution, dtype=np.float32)
+                rem_ch = sparse_decode(*deserialize_sparse(policy_remove_blob), resolution) if policy_remove_blob else np.zeros(resolution, dtype=np.float32)
                 
                 add_ratio = (add_ch > 0.5).sum() / add_ch.size
                 rem_ratio = (rem_ch > 0.5).sum() / rem_ch.size
@@ -354,23 +371,32 @@ def generate_quality_report(db_path: Path, output_path: Path) -> str:
     report_lines.append("## 6. Análise de Metadados")
     report_lines.append("")
     
-    # BC Types
-    cursor.execute("SELECT metadata FROM training_data WHERE metadata IS NOT NULL")
-    metadata_rows = cursor.fetchall()
-    
+    # BC Types & Estratégias
     bc_types = {}
     strategies = {}
-    
-    for row in metadata_rows:
-        try:
-            meta = json.loads(row[0])
-            bc = meta.get('bc_type', 'unknown')
+    if is_v2:
+        cursor.execute("""
+            SELECT e.bc_type, e.strategy
+            FROM records r
+            JOIN episodes e ON r.episode_id = e.episode_id
+        """)
+        for bc_raw, strat_raw in cursor.fetchall():
+            bc = bc_raw or 'unknown'
             bc_types[bc] = bc_types.get(bc, 0) + 1
-            
-            strategy = meta.get('strategy', 'unknown')
-            strategies[strategy] = strategies.get(strategy, 0) + 1
-        except:
-            pass
+            strat = strat_raw or 'unknown'
+            strategies[strat] = strategies.get(strat, 0) + 1
+    else:
+        cursor.execute("SELECT metadata FROM training_data WHERE metadata IS NOT NULL")
+        for row in cursor.fetchall():
+            try:
+                meta = json.loads(row[0])
+                bc = meta.get('bc_type', 'unknown')
+                bc_types[bc] = bc_types.get(bc, 0) + 1
+
+                strategy = meta.get('strategy', 'unknown')
+                strategies[strategy] = strategies.get(strategy, 0) + 1
+            except Exception:
+                pass
     
     report_lines.append(f"### 6.1 Boundary Conditions (BC Types)")
     report_lines.append("")
@@ -395,62 +421,72 @@ def generate_quality_report(db_path: Path, output_path: Path) -> str:
     # ==================== AMOSTRAS ALEATÓRIAS ====================
     report_lines.append("## 7. Amostras Aleatórias")
     report_lines.append("")
-    
-    cursor.execute("""
-        SELECT episode_id, step, phase, fitness_score, metadata 
-        FROM training_data 
-        ORDER BY RANDOM() 
-        LIMIT 10
-    """)
-    random_samples = cursor.fetchall()
-    
+
     report_lines.append(f"| # | Episode | Step | Phase | Fitness | BC Type |")
     report_lines.append(f"|---|---------|------|-------|---------|---------|")
-    
-    for i, sample in enumerate(random_samples, 1):
-        ep_short = sample[0][:8] + "..."
-        try:
-            meta = json.loads(sample[4]) if sample[4] else {}
-            bc = meta.get('bc_type', 'N/A')
-        except:
-            bc = 'N/A'
-        
-        report_lines.append(
-            f"| {i} | `{ep_short}` | {sample[1]} | {sample[2]} | "
-            f"{sample[3]:.4f} | {bc} |"
-        )
+
+    if is_v2:
+        cursor.execute("""
+            SELECT r.episode_id, r.step, r.phase, r.fitness_score, e.bc_type
+            FROM records r
+            JOIN episodes e ON r.episode_id = e.episode_id
+            ORDER BY RANDOM()
+            LIMIT 10
+        """)
+        for i, sample in enumerate(cursor.fetchall(), 1):
+            ep_short = sample[0][:8] + "..."
+            report_lines.append(
+                f"| {i} | `{ep_short}` | {sample[1]} | {sample[2]} | "
+                f"{sample[3]:.4f} | {sample[4] or 'N/A'} |"
+            )
+    else:
+        cursor.execute("""
+            SELECT episode_id, step, phase, fitness_score, metadata 
+            FROM training_data 
+            ORDER BY RANDOM() 
+            LIMIT 10
+        """)
+        for i, sample in enumerate(cursor.fetchall(), 1):
+            ep_short = sample[0][:8] + "..."
+            try:
+                meta = json.loads(sample[4]) if sample[4] else {}
+                bc = meta.get('bc_type', 'N/A')
+            except Exception:
+                bc = 'N/A'
+
+            report_lines.append(
+                f"| {i} | `{ep_short}` | {sample[1]} | {sample[2]} | "
+                f"{sample[3]:.4f} | {bc} |"
+            )
     report_lines.append("")
-    
+
     # ==================== VALIDAÇÃO v3.1 ====================
     report_lines.append("## 8. Validação de Conformidade v3.1")
     report_lines.append("")
-    
+
     checks = []
-    
+
     # Check 1: 7 canais
-    if samples:
-        state = deserialize_state(samples[0][0])
-        checks.append(("State tem 7 canais", state.shape[0] == 7))
-    
+    if state_sample is not None:
+        checks.append(("State tem 7 canais", state_sample.shape[0] == 7))
+
     # Check 2: Policy tem 2 canais
-    if samples:
-        policy = deserialize_state(samples[0][1])
-        checks.append(("Policy tem 2 canais", policy.shape[0] == 2))
-    
+    if policy_sample is not None:
+        checks.append(("Policy tem 2 canais", policy_sample.shape[0] == 2))
+
     # Check 3: Ambas as fases presentes
     checks.append(("Fase GROWTH presente", phase_counts.get('GROWTH', 0) > 0))
     checks.append(("Fase REFINEMENT presente", phase_counts.get('REFINEMENT', 0) > 0))
-    
+
     # Check 4: Fitness score em [-1, 1]
     checks.append(("Fitness score em [-1, 1]", scores_array.min() >= -1 and scores_array.max() <= 1))
-    
+
     # Check 5: Metadados com bc_type
     checks.append(("Metadados bc_type presentes", len(bc_types) > 0))
-    
+
     # Check 6: dtype float32 para policy
-    if samples:
-        policy = deserialize_state(samples[0][1])
-        checks.append(("Policy dtype é float32", policy.dtype == np.float32))
+    if policy_sample is not None:
+        checks.append(("Policy dtype é float32", policy_sample.dtype == np.float32))
     
     report_lines.append(f"| Check | Status |")
     report_lines.append(f"|-------|--------|")

@@ -53,67 +53,77 @@ class TestIntegrationV31:
         self._populate_dummy_data(TEST_DB_PATH)
 
     def _populate_dummy_data(self, db_path):
-        """Populate DB with synthetic data to allow tests to run without MPI."""
-        from alphabuilder.src.logic.storage import initialize_database
+        """Populate DB with synthetic schema-v2 data so tests run without MPI."""
+        from alphabuilder.src.logic.storage import (
+            initialize_database,
+            serialize_array,
+            serialize_sparse,
+            sparse_encode,
+        )
+
         initialize_database(db_path)
-        
+
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        
-        # 1. Insert Episode
+
         episode_id = "dummy-episode-123"
-        
-        # Create dummy episode blobs
         resolution = (32, 16, 4)
         bc_masks = np.zeros((3, *resolution), dtype=np.float32)
+        bc_masks[:, 0, :, :] = 1.0  # Full clamp at x=0
+
         forces = np.zeros((3, *resolution), dtype=np.float32)
-        
-        import io
-        import zlib
-        import pickle
-        
-        def to_compressed_blob(arr):
-            out = io.BytesIO()
-            np.save(out, arr)
-            return zlib.compress(out.getvalue())
-            
-        bc_blob = to_compressed_blob(bc_masks)
-        f_blob = to_compressed_blob(forces)
-        
-        cursor.execute('''
-            INSERT INTO episodes (episode_id, created_at, strategy, resolution, bc_type, bc_masks_blob, forces_blob)
-            VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)
-        ''', (episode_id, 'DUMMY', '32x16x4', '[32, 16, 4]', 'fixed', bc_blob, f_blob))
-        
-        # 2. Insert Records (Growth)
-        # Create blobs (using numpy to bytes)
-        density = np.zeros((32, 16, 4), dtype=np.float32)
-        density[15:17, 7:9, 0:2] = 1.0 # Some material
-        
-        policy = np.ones((32, 16, 4), dtype=np.float32) * 0.1
-        
-        import io
-        d_blob = to_compressed_blob(density)
-        p_blob = to_compressed_blob(policy)
-        
-        # Growth Step
-        cursor.execute('''
+        forces[1, 31, 7:9, 1:3] = -1.0  # Tip downward load
+
+        bc_blob = serialize_array(bc_masks)
+        f_blob = serialize_array(forces)
+
+        cursor.execute(
+            """
+            INSERT INTO episodes (episode_id, created_at, strategy, resolution, bc_type, load_config, bc_masks_blob, forces_blob)
+            VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?)
+            """,
+            (episode_id, "DUMMY", "[32, 16, 4]", "FULL_CLAMP", '{"x": 31, "y": 8}', bc_blob, f_blob),
+        )
+
+        # Step 1: GROWTH (anchored to support, not yet at load)
+        dens_g = np.zeros(resolution, dtype=np.float32)
+        dens_g[0:16, 6:10, 0:4] = 1.0
+        pol_add_g = np.zeros(resolution, dtype=np.float32)
+        pol_add_g[16, 6:10, 0:4] = 1.0
+        pol_rem_g = np.zeros(resolution, dtype=np.float32)
+
+        # Step 2: REFINEMENT (connected bridge, non-final -> tests Load Multiplier & Refinement inference)
+        dens_r1 = np.zeros(resolution, dtype=np.float32)
+        dens_r1[0:32, 6:10, 0:4] = 1.0
+        pol_add_r = np.zeros(resolution, dtype=np.float32)
+        pol_add_r[8:12, 5, 0:2] = 1.0
+        pol_rem_r = np.zeros(resolution, dtype=np.float32)
+        pol_rem_r[10:14, 7:9, 0:2] = 1.0
+
+        # Step 3: REFINEMENT (connected, final -> tests Erosion Attack & metadata checks)
+        dens_r2 = np.zeros(resolution, dtype=np.float32)
+        dens_r2[0:32, 5:11, 0:4] = 1.0
+
+        def _sp_blob(arr: np.ndarray) -> bytes:
+            idx, val = sparse_encode(arr)
+            return serialize_sparse(idx, val)
+
+        steps = [
+            (episode_id, 1, "GROWTH", serialize_array(dens_g), _sp_blob(pol_add_g), _sp_blob(pol_rem_g), 0.2, 0, 0, float(dens_g.mean())),
+            (episode_id, 2, "REFINEMENT", serialize_array(dens_r1), _sp_blob(pol_add_r), _sp_blob(pol_rem_r), 0.7, 0, 1, float(dens_r1.mean())),
+            (episode_id, 3, "REFINEMENT", serialize_array(dens_r2), _sp_blob(pol_add_r), _sp_blob(pol_rem_r), 0.9, 1, 1, float(dens_r2.mean())),
+        ]
+        cursor.executemany(
+            """
             INSERT INTO records (
-                episode_id, step, phase, 
-                density_blob, policy_add_blob, policy_remove_blob, 
-                fitness_score, is_final_step, is_connected, volume_fraction
+                episode_id, step, phase,
+                density_blob, policy_add_blob, policy_remove_blob,
+                fitness_score, is_final_step, is_connected, vol_frac
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (episode_id, 1, 'GROWTH', d_blob, p_blob, p_blob, 0.5, 0, 0, 0.1))
-        
-        # Refinement Step (Connected, Final)
-        cursor.execute('''
-            INSERT INTO records (
-                episode_id, step, phase, 
-                density_blob, policy_add_blob, policy_remove_blob, 
-                fitness_score, is_final_step, is_connected, volume_fraction
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (episode_id, 2, 'REFINEMENT', d_blob, p_blob, p_blob, 0.9, 1, 1, 0.2))
-        
+            """,
+            steps,
+        )
+
         conn.commit()
         conn.close()
 
