@@ -37,10 +37,13 @@ from alphabuilder.src.logic.mcts.engine import (
     AlphaBuilderMCTS,
     PHASE1_CONFIG,
     PHASE1_V41_CONFIG,
+    PHASE1_V42_CONFIG,
     PHASE2_CONFIG,
     PHASE2_V41_CONFIG,
+    PHASE2_V42_CONFIG,
     SearchResult,
     build_state_tensor,
+    select_non_cycling_root_action,
     select_pv_branches,
 )
 from alphabuilder.src.logic.mcts.legal_moves import filter_disconnect_safe_batch
@@ -54,6 +57,10 @@ from alphabuilder.src.logic.selfplay import (
     update_game_final,
 )
 from alphabuilder.src.logic.selfplay.evaluator import evaluate_main_island
+from alphabuilder.src.logic.selfplay.p2_control import (
+    build_scaled_p2_schedule,
+    is_trust_region_accepted,
+)
 from alphabuilder.src.logic.selfplay.scenarios_stage6 import build_ood_benchmark_scenarios
 from alphabuilder.src.logic.selfplay.reward import (
     DISPLACEMENT_LIMIT_RAW,
@@ -619,8 +626,12 @@ def run_neural_mcts_episode(
     fem_backend: Optional[str] = None,
     p2_stepped_batch: bool = False,
     v41_mcts: bool = False,
+    v42_mcts: bool = False,
 ) -> Dict[str, Any]:
     """Run one deterministic MCTS + FEM episode on `scenario` and persist to `db_path`."""
+    import hashlib as _hl
+
+    eff_v41 = bool(v41_mcts or v42_mcts)
     game_id = f"{prefix}__{scenario['id']}"
     load_cfg = dict(scenario["load_config"])
     bc_type = scenario["bc_type"]
@@ -675,8 +686,8 @@ def run_neural_mcts_episode(
 
     alpha_guide = get_guidance_alpha(generation=0, decay_generations=5)
     phi_root = [0.0]
-    p1_base = PHASE1_V41_CONFIG if v41_mcts else PHASE1_CONFIG
-    p2_base = PHASE2_V41_CONFIG if v41_mcts else PHASE2_CONFIG
+    p1_base = PHASE1_V42_CONFIG if v42_mcts else (PHASE1_V41_CONFIG if v41_mcts else PHASE1_CONFIG)
+    p2_base = PHASE2_V42_CONFIG if v42_mcts else (PHASE2_V41_CONFIG if v41_mcts else PHASE2_CONFIG)
     bidirectional_p1 = bool(p1_base.bidirectional_p1)
     geodesic_dist = compute_geodesic_load_distance(res, force_tuple, domain_mask=dm_arr)
 
@@ -772,7 +783,11 @@ def run_neural_mcts_episode(
     p2_log_c_true: List[float] = []
     p1_conn_probs: List[float] = []
     p2_conn_probs: List[float] = []
-    p2_batch_schedule = [16, 8, 4, 2] if (v41_mcts or p2_stepped_batch) else [8]
+    p2_batch_schedule = (
+        build_scaled_p2_schedule((48, 32, 16, 8, 4), int(np.prod(res)))
+        if v42_mcts
+        else ([16, 8, 4, 2] if (v41_mcts or p2_stepped_batch) else [8])
+    )
     p2_batch_idx = 0
     best_p1_phi = -float("inf")
     p1_no_improve = 0
@@ -782,13 +797,19 @@ def run_neural_mcts_episode(
     p2_no_improve_streak = 0
     prev_p2_score: Optional[float] = None
     seen_p2_hashes: set = set()
+    cached_p2_eval: Optional[Tuple[str, Any, Dict[str, Any]]] = None
+    last_p2_scored_hash: Optional[str] = None
+    consecutive_rejects = 0
+    trust_rejects = 0
+    cycle_avoided = 0
+    total_p2_attempts = 0
     grace_saves = 0
     tree_reuse_hits = 0
-    p2_grace_steps = 5 if v41_mcts else 0
+    p2_grace_steps = 5 if eff_v41 else 0
     p2_patience = 12
     p2_min_stop_steps = 6
     p1_stagnation_patience = 22
-    use_best_targets = bool(v41_mcts)
+    use_best_targets = bool(eff_v41)
 
     def _compute_mcts_diagnostics(result: SearchResult, pa: np.ndarray, pr: np.ndarray) -> Tuple[float, bool, int]:
         vdist = result.visit_distribution or {}
@@ -821,9 +842,12 @@ def run_neural_mcts_episode(
             batch_sz = p2_batch_schedule[min(p2_batch_idx, len(p2_batch_schedule) - 1)]
             cfg = p2_cfg._replace(
                 action_batch_size=batch_sz,
-                allow_stop_action=bool(v41_mcts and phase2_steps_run >= p2_min_stop_steps),
+                allow_stop_action=bool(eff_v41 and phase2_steps_run >= p2_min_stop_steps),
             )
         mcts.config = cfg
+
+        cur_density_hash = _hl.md5((state.density > 0.5).astype(np.uint8).tobytes()).hexdigest() if cur_phase == Phase.REFINEMENT else ""
+        is_new_p2_state = bool(cur_phase == Phase.REFINEMENT and cur_density_hash != last_p2_scored_hash)
 
         phi_root[0], _ = calculate_pbrs_potential(
             state.density,
@@ -857,7 +881,7 @@ def run_neural_mcts_episode(
                 step0_val_raw = float(raw_net_val)
             elif cur_phase == Phase.REFINEMENT and bp_conn is None:
                 bp_conn = step_bp  # type: ignore[assignment]
-            if step_conn_prob is not None:
+            if step_conn_prob is not None and (cur_phase == Phase.GROWTH or is_new_p2_state):
                 if cur_phase == Phase.GROWTH:
                     p1_conn_probs.append(float(step_conn_prob))  # type: ignore[arg-type]
                 else:
@@ -871,13 +895,16 @@ def run_neural_mcts_episode(
             raw_net_val, policy_add, policy_remove = model.predict(state_tensor, domain_mask=dm_arr)
 
         vol_frac = float(np.mean(state.density > 0.5))
-        isl = analyze_structure_islands(
-            state.density,
-            load_cfg,
-            bc_masks=bc_tuple,
-            forces=force_tuple,
-            bidirectional=(bidirectional_p1 and cur_phase == Phase.GROWTH),
-        )
+        if cur_phase == Phase.REFINEMENT and cached_p2_eval is not None and cached_p2_eval[0] == cur_density_hash:
+            isl = cached_p2_eval[2]
+        else:
+            isl = analyze_structure_islands(
+                state.density,
+                load_cfg,
+                bc_masks=bc_tuple,
+                forces=force_tuple,
+                bidirectional=(bidirectional_p1 and cur_phase == Phase.GROWTH),
+            )
         total_vox = int((state.density > 0.5).sum())
         eff_isl = (
             1
@@ -894,24 +921,30 @@ def run_neural_mcts_episode(
         displacement_map: Optional[np.ndarray] = None
         fem_collapsed = False
         root_stop_val: Optional[float] = None
+        cur_total = -1.0
+        in_grace_cur = False
 
         if cur_phase == Phase.REFINEMENT:
-            import hashlib as _hl
-            seen_p2_hashes.add(_hl.md5((state.density > 0.5).astype(np.uint8).tobytes()).hexdigest())
+            seen_p2_hashes.add(cur_density_hash)
             if not isl["is_connected"]:
                 fem_reward = -1.0
                 fem_collapsed = True
                 root_stop_val = -1.0
             else:
-                fem_res = evaluate_main_island(
-                    state.density,
-                    load_cfg,
-                    isl["main_island_mask"],
-                    bc_type=bc_type,
-                    backend=fem_backend,
-                    bc_masks=bc_masks if has_custom_fields else None,
-                    forces=forces if has_custom_fields else None,
-                )
+                if cached_p2_eval is not None and cached_p2_eval[0] == cur_density_hash:
+                    fem_res = cached_p2_eval[1]
+                else:
+                    fem_res = evaluate_main_island(
+                        state.density,
+                        load_cfg,
+                        isl["main_island_mask"],
+                        bc_type=bc_type,
+                        backend=fem_backend,
+                        bc_masks=bc_masks if has_custom_fields else None,
+                        forces=forces if has_custom_fields else None,
+                    )
+                    if fem_res.valid:
+                        cached_p2_eval = (cur_density_hash, fem_res, isl)
                 if fem_res.valid:
                     compliance = float(fem_res.compliance)
                     max_disp = float(fem_res.max_displacement)
@@ -929,10 +962,12 @@ def run_neural_mcts_episode(
                         if max_disp is not None and max_disp > DISPLACEMENT_LIMIT_RAW and phase2_steps_run < p2_grace_steps:
                             fem_reward = calculate_grace_displacement_reward(max_disp)
                             fem_collapsed = False
-                            grace_saves += 1
+                            in_grace_cur = True
+                            if is_new_p2_state:
+                                grace_saves += 1
                         else:
                             fem_collapsed = True
-                    else:
+                    elif is_new_p2_state:
                         compliance_history.append(compliance)
                         p2_value_preds.append(float(raw_net_val))
                         p2_fem_rewards.append(float(fem_reward))
@@ -943,24 +978,33 @@ def run_neural_mcts_episode(
                     if not fem_collapsed:
                         cur_total = float(np.clip(fem_reward - isl_pen, -1.0, 1.0))
                         root_stop_val = cur_total
-                        if cur_total > best_p2_score + 1e-3:
-                            best_p2_score = cur_total
-                            best_p2_compliance = compliance
-                            best_p2_volume = vol_frac
-                            p2_no_improve_streak = 0
-                        else:
-                            p2_no_improve_streak += 1
-                            if cur_total > best_p2_score:
+                        if is_new_p2_state:
+                            last_p2_scored_hash = cur_density_hash
+                            if cur_total > best_p2_score + 1e-3:
                                 best_p2_score = cur_total
                                 best_p2_compliance = compliance
                                 best_p2_volume = vol_frac
-                        if v41_mcts and (
-                            (p2_no_improve_streak > 0 and p2_no_improve_streak % 3 == 0)
-                            or (prev_p2_score is not None and cur_total < prev_p2_score - 0.005)
-                        ):
-                            if p2_batch_idx < len(p2_batch_schedule) - 1:
-                                p2_batch_idx += 1
-                        prev_p2_score = cur_total
+                                p2_no_improve_streak = 0
+                            else:
+                                p2_no_improve_streak += 1
+                                if cur_total > best_p2_score:
+                                    best_p2_score = cur_total
+                                    best_p2_compliance = compliance
+                                    best_p2_volume = vol_frac
+                            if v42_mcts:
+                                if p2_batch_idx == 0 and vol_frac >= 0.105 and len(p2_batch_schedule) > 1:
+                                    p2_batch_idx = 1
+                                elif (p2_no_improve_streak > 0 and p2_no_improve_streak % 3 == 0) and (
+                                    p2_batch_idx < len(p2_batch_schedule) - 1
+                                ):
+                                    p2_batch_idx += 1
+                            elif v41_mcts and (
+                                (p2_no_improve_streak > 0 and p2_no_improve_streak % 3 == 0)
+                                or (prev_p2_score is not None and cur_total < prev_p2_score - 0.005)
+                            ):
+                                if p2_batch_idx < len(p2_batch_schedule) - 1:
+                                    p2_batch_idx += 1
+                            prev_p2_score = cur_total
                 else:
                     fem_reward = -1.0
                     fem_collapsed = True
@@ -978,7 +1022,7 @@ def run_neural_mcts_episode(
         best_child_pair = result.root.get_best_child() if result.root is not None else None
         chosen_tree_action = best_child_pair[0] if best_child_pair is not None else None
         stopped_by_mcts = bool(
-            v41_mcts
+            eff_v41
             and cur_phase == Phase.REFINEMENT
             and not fem_collapsed
             and chosen_tree_action is not None
@@ -987,10 +1031,29 @@ def run_neural_mcts_episode(
         )
 
         batch_filtered = False
-        if stopped_by_mcts:
+        pv_branches: List[List[Tuple[Tuple[int, int, int, int], int, float]]] = []
+        if v42_mcts and cur_phase == Phase.REFINEMENT:
+            (
+                chosen_tree_action,
+                executed_actions,
+                executed_action_stats,
+                stopped_by_mcts,
+                avoided_cycle,
+            ) = select_non_cycling_root_action(
+                result.root,
+                state.density,
+                seen_p2_hashes,
+                allow_stop=bool(phase2_steps_run >= p2_min_stop_steps and not fem_collapsed),
+                max_actions=cfg.action_batch_size,
+            )
+            if avoided_cycle:
+                cycle_avoided += 1
+            if not fem_collapsed and not stopped_by_mcts and not executed_actions:
+                end_reason = "CYCLE_DETECTED"
+                break
+        elif stopped_by_mcts:
             executed_actions = []
             executed_action_stats = None
-            pv_branches = []
         else:
             pv_branches = select_pv_branches(result.root, max_actions=cfg.action_batch_size, max_depth=4)
             if pv_branches:
@@ -1003,20 +1066,103 @@ def run_neural_mcts_episode(
                 executed_actions = []
                 executed_action_stats = None
 
-            if v41_mcts and cur_phase == Phase.REFINEMENT and not fem_collapsed and executed_actions and any(c == 1 for c, _, _, _ in executed_actions):
-                safe_acts = filter_disconnect_safe_batch(
-                    state.density,
-                    executed_actions,
+        if eff_v41 and cur_phase == Phase.REFINEMENT and not fem_collapsed and not stopped_by_mcts and executed_actions and any(c == 1 for c, _, _, _ in executed_actions):
+            safe_acts = filter_disconnect_safe_batch(
+                state.density,
+                executed_actions,
+                load_cfg,
+                bc_masks=bc_tuple,
+                forces=force_tuple,
+            )
+            if safe_acts != executed_actions:
+                batch_filtered = True
+                executed_actions = safe_acts
+                if executed_action_stats:
+                    aset = set(safe_acts)
+                    executed_action_stats = [e for e in executed_action_stats if e[0] in aset]
+
+        next_cand_fem: Optional[Any] = None
+        next_cand_isl: Optional[Dict[str, Any]] = None
+        if (
+            v42_mcts
+            and cur_phase == Phase.REFINEMENT
+            and not fem_collapsed
+            and not stopped_by_mcts
+            and executed_actions
+        ):
+            cand_density = state.density.copy()
+            for ch, ax, ay, az in executed_actions:
+                cand_density[ax, ay, az] = 1.0 if ch == 0 else 0.0
+            cand_hash = _hl.md5((cand_density > 0.5).astype(np.uint8).tobytes()).hexdigest()
+            cand_vol = float(np.mean(cand_density > 0.5))
+            cand_isl = analyze_structure_islands(
+                cand_density, load_cfg, bc_masks=bc_tuple, forces=force_tuple
+            )
+            cand_fem = (
+                evaluate_main_island(
+                    cand_density,
                     load_cfg,
-                    bc_masks=bc_tuple,
-                    forces=force_tuple,
+                    cand_isl["main_island_mask"],
+                    bc_type=bc_type,
+                    backend=fem_backend,
+                    bc_masks=bc_masks if has_custom_fields else None,
+                    forces=forces if has_custom_fields else None,
                 )
-                if safe_acts != executed_actions:
-                    batch_filtered = True
-                    executed_actions = safe_acts
-                    if executed_action_stats:
-                        aset = set(safe_acts)
-                        executed_action_stats = [e for e in executed_action_stats if e[0] in aset]
+                if cand_isl["is_connected"]
+                else None
+            )
+            cand_comp: Optional[float] = None
+            cand_disp: Optional[float] = None
+            cand_valid = bool(cand_fem is not None and cand_fem.valid)
+            cand_collapsed = not cand_isl["is_connected"] or not cand_valid
+            cand_score = -1.0
+            if not cand_collapsed and cand_fem is not None:
+                cand_comp = float(cand_fem.compliance)
+                cand_disp = float(cand_fem.max_displacement)
+                cand_fem_r = float(calculate_reward(cand_comp, cand_vol, True, cand_disp))
+                if cand_fem_r == -1.0:
+                    if (
+                        cand_disp is not None
+                        and cand_disp > DISPLACEMENT_LIMIT_RAW
+                        and (phase2_steps_run + 1) < p2_grace_steps
+                    ):
+                        cand_fem_r = calculate_grace_displacement_reward(cand_disp)
+                    else:
+                        cand_collapsed = True
+                if not cand_collapsed:
+                    cand_vox = int((cand_density > 0.5).sum())
+                    cand_isl_pen = calculate_island_penalty(
+                        cand_isl["n_islands"], cand_isl["loose_voxels"], cand_vox
+                    )
+                    cand_score = float(np.clip(cand_fem_r - cand_isl_pen, -1.0, 1.0))
+
+            if not is_trust_region_accepted(
+                cand_connected=bool(cand_isl["is_connected"]),
+                cand_valid=cand_valid,
+                cand_collapsed=cand_collapsed,
+                cand_score=cand_score,
+                cur_score=cur_total,
+                cand_compliance=cand_comp,
+                cur_compliance=compliance,
+                in_grace_cur=in_grace_cur,
+                drop_tol=0.08,
+                comp_mult=1.80,
+            ):
+                seen_p2_hashes.add(cand_hash)
+                consecutive_rejects += 1
+                trust_rejects += 1
+                total_p2_attempts += 1
+                if p2_batch_idx < len(p2_batch_schedule) - 1:
+                    p2_batch_idx += 1
+                mcts.clear_tree()
+                if consecutive_rejects >= 3 or total_p2_attempts >= max_phase2_steps * 3:
+                    end_reason = "TRUST_REGION_CONVERGENCE"
+                    break
+                continue
+            consecutive_rejects = 0
+            total_p2_attempts += 1
+            next_cand_fem = cand_fem
+            next_cand_isl = cand_isl
 
         conc, refut, max_d = _compute_mcts_diagnostics(result, policy_add, policy_remove)
         depths_all.append(max_d)
@@ -1108,6 +1254,10 @@ def run_neural_mcts_episode(
         for channel, x, y, z in executed_actions:
             state.density[x, y, z] = 1.0 if channel == 0 else 0.0
 
+        if cur_phase == Phase.REFINEMENT and next_cand_fem is not None and next_cand_fem.valid and next_cand_isl is not None:
+            next_h = _hl.md5((state.density > 0.5).astype(np.uint8).tobytes()).hexdigest()
+            cached_p2_eval = (next_h, next_cand_fem, next_cand_isl)
+
         # Convergence / Phase-2 budget checks
         if cur_phase == Phase.REFINEMENT:
             term_r = get_phase2_terminal_reward(
@@ -1115,15 +1265,14 @@ def run_neural_mcts_episode(
                 load_cfg,
                 bc_masks=bc_tuple,
                 forces=force_tuple,
-                max_vol_frac=0.65 if v41_mcts else 0.4,
+                max_vol_frac=0.65 if eff_v41 else 0.4,
             )
             if term_r is not None:
                 state.current_step += 1
                 end_reason = "TERMINAL"
                 last_final_score = float(term_r)
                 break
-            if v41_mcts:
-                import hashlib as _hl
+            if eff_v41:
                 post_h = _hl.md5((state.density > 0.5).astype(np.uint8).tobytes()).hexdigest()
                 if phase2_steps_run >= p2_min_stop_steps and post_h in seen_p2_hashes:
                     state.current_step += 1
@@ -1145,7 +1294,7 @@ def run_neural_mcts_episode(
                 break
 
         # Update tree/DAG cleanly
-        if not batch_filtered and v41_mcts and cfg.macro_action_mode and chosen_tree_action is not None and not is_stop_action(chosen_tree_action):
+        if not batch_filtered and eff_v41 and cfg.macro_action_mode and chosen_tree_action is not None and not is_stop_action(chosen_tree_action):
             if mcts.step(chosen_tree_action):
                 tree_reuse_hits += 1
             if cur_phase == Phase.GROWTH:
@@ -1163,7 +1312,7 @@ def run_neural_mcts_episode(
             if cur_phase == Phase.GROWTH:
                 mcts.reset()
             else:
-                mcts.clear_tree() if v41_mcts else mcts.reset()
+                mcts.clear_tree() if eff_v41 else mcts.reset()
 
         if cur_phase == Phase.GROWTH:
             post_isl = analyze_structure_islands(
@@ -1179,7 +1328,7 @@ def run_neural_mcts_episode(
                     f"(V={state.density.mean()*100:.2f}%) -> REFINEMENT",
                     flush=True,
                 )
-            elif v41_mcts and p1_no_improve >= p1_stagnation_patience and state.current_step + 1 >= p1_stagnation_patience:
+            elif eff_v41 and p1_no_improve >= p1_stagnation_patience and state.current_step + 1 >= p1_stagnation_patience:
                 state.current_step += 1
                 end_reason = "PHASE1_STAGNATION"
                 last_final_score = -1.0
@@ -1216,15 +1365,19 @@ def run_neural_mcts_episode(
     fem_reward_final: Optional[float] = None
     disp_map_final: Optional[np.ndarray] = None
     if isl_final["is_connected"]:
-        fem_res_f = evaluate_main_island(
-            state.density,
-            load_cfg,
-            isl_final["main_island_mask"],
-            bc_type=bc_type,
-            backend=fem_backend,
-            bc_masks=bc_masks if has_custom_fields else None,
-            forces=forces if has_custom_fields else None,
-        )
+        fin_h = _hl.md5((state.density > 0.5).astype(np.uint8).tobytes()).hexdigest()
+        if cached_p2_eval is not None and cached_p2_eval[0] == fin_h:
+            fem_res_f = cached_p2_eval[1]
+        else:
+            fem_res_f = evaluate_main_island(
+                state.density,
+                load_cfg,
+                isl_final["main_island_mask"],
+                bc_type=bc_type,
+                backend=fem_backend,
+                bc_masks=bc_masks if has_custom_fields else None,
+                forces=forces if has_custom_fields else None,
+            )
         if fem_res_f.valid:
             comp_final = float(fem_res_f.compliance)
             max_disp_final = float(fem_res_f.max_displacement)
@@ -1411,6 +1564,8 @@ def run_neural_mcts_episode(
             "tree_reuse_hits": tree_reuse_hits,
             "dag_transpositions": int(mcts.total_dag_hits),
             "grace_saves": grace_saves,
+            "trust_rejects": trust_rejects,
+            "cycle_avoided": cycle_avoided,
         },
         "best_score": float(best_p2_score) if best_p2_score > -float("inf") else float(last_final_score),
         "best_p2_compliance": best_p2_compliance,
@@ -1455,6 +1610,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fem-backend", type=str, default=None, choices=["auto", "dolfinx", "fast_amg"])
     parser.add_argument("--p2-stepped-batch", action="store_true", default=False, help="Use 16->8 stepped Phase-2 batch size")
     parser.add_argument("--v41-mcts", action="store_true", default=False, help="Enable Stage 6 v4.1 MCTS-DAG/macro/lifecycle upgrades")
+    parser.add_argument("--v42-mcts", action="store_true", default=False, help="Enable Stage 6 v4.2 volume-aware expansion + trust-region upgrades")
     return parser.parse_args()
 
 
@@ -1516,6 +1672,7 @@ def main() -> None:
             fem_backend=args.fem_backend,
             p2_stepped_batch=args.p2_stepped_batch,
             v41_mcts=args.v41_mcts,
+            v42_mcts=args.v42_mcts,
         )
         neural_results.append(res)
         gc.collect()

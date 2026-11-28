@@ -45,7 +45,7 @@ class MCTSConfig(NamedTuple):
     mixmax_beta: float = 1.0
     min_remove_candidates: int = 0
     remove_prior_floor: float = 0.0
-    # v4.1 surgical & structural upgrades (safe defaults preserve legacy behavior)
+    # v4.1 / v4.2 surgical & structural upgrades (safe defaults preserve legacy behavior)
     fpu_reduction: Optional[float] = None
     surface_only_remove: bool = False
     bidirectional_p1: bool = False
@@ -55,6 +55,8 @@ class MCTSConfig(NamedTuple):
     root_only_policy_target: bool = False
     allow_stop_action: bool = False
     macro_num_candidates: int = 16
+    remove_min_vol_frac: float = 0.0
+    remove_floor_vol_frac: float = 0.0
 
 
 # Legacy v3.3 / Stage 5 configurations (preserved for exact regression & ablation)
@@ -123,6 +125,16 @@ PHASE2_V41_CONFIG = MCTSConfig(
     factored_policy=True,
     root_only_policy_target=True,
     allow_stop_action=True,
+    macro_num_candidates=16,
+)
+
+# Upgraded Stage 6 v4.2 configurations (volume-aware expansion + anti-throttle guard)
+PHASE1_V42_CONFIG = PHASE1_V41_CONFIG
+PHASE2_V42_CONFIG = PHASE2_V41_CONFIG._replace(
+    action_batch_size=48,
+    remove_prior_floor=0.25,
+    remove_min_vol_frac=0.080,
+    remove_floor_vol_frac=0.105,
     macro_num_candidates=16,
 )
 
@@ -352,6 +364,51 @@ def select_pv_sequences(
     return [act for branch in branches for act, _, _ in branch]
 
 
+def select_non_cycling_root_action(
+    root: Optional[MCTSNode],
+    density: np.ndarray,
+    seen_hashes: Set[str],
+    allow_stop: bool = False,
+    max_actions: Optional[int] = None,
+) -> Tuple[Optional[TreeAction], List[Action], Optional[List[Tuple[Action, int, float]]], bool, bool]:
+    """
+    Select highest-visit non-STOP root edge whose post-action state has not already been visited.
+    Returns `(chosen_tree_action, executed_actions, executed_action_stats, stopped_by_mcts, avoided_cycle)`.
+    """
+    if root is None or not getattr(root, "children", None):
+        return None, [], None, False, False
+
+    sorted_children = sorted(
+        root.children.items(),
+        key=lambda item: (item[1].visit_count, item[1].mean_value),
+        reverse=True,
+    )
+
+    top_tree_act, _ = sorted_children[0]
+    if is_stop_action(top_tree_act) and allow_stop:
+        return STOP_ACTION, [], None, True, False
+
+    non_stop_rank = 0
+    for tree_act, child in sorted_children:
+        if is_stop_action(tree_act):
+            continue
+        flat = flatten_tree_action(tree_act)
+        if max_actions is not None:
+            flat = flat[: max(1, int(max_actions))]
+        if not flat:
+            continue
+        cand = apply_actions(density, flat)
+        h = hashlib.md5((cand > 0.5).astype(np.uint8).tobytes()).hexdigest()
+        if h not in seen_hashes:
+            stats = [(a, int(child.visit_count), float(child.mean_value)) for a in flat]
+            return tree_act, flat, stats, False, (non_stop_rank > 0)
+        non_stop_rank += 1
+
+    if allow_stop and STOP_ACTION in root.children:
+        return STOP_ACTION, [], None, True, True
+    return None, [], None, False, True
+
+
 def expand_node(
     node: MCTSNode,
     policy_add: np.ndarray,
@@ -360,9 +417,15 @@ def expand_node(
     valid_remove: np.ndarray,
     config: MCTSConfig,
     op_probs: Optional[Tuple[float, float, float]] = None,
+    current_vol_frac: Optional[float] = None,
 ) -> None:
-    """Expand a leaf node using either composite macro-actions (v4.1) or unitary voxel edges."""
+    """Expand a leaf node using either composite macro-actions (v4.1/v4.2) or unitary voxel edges."""
     if config.macro_action_mode:
+        eff_rem_floor = (
+            config.remove_prior_floor
+            if (config.remove_min_vol_frac > 0.0 or config.remove_floor_vol_frac > 0.0)
+            else max(0.20, config.remove_prior_floor)
+        )
         node.expand_macro(
             policy_add=policy_add,
             policy_remove=policy_remove,
@@ -371,10 +434,13 @@ def expand_node(
             action_batch_size=config.action_batch_size,
             phase=config.phase,
             temperature=config.policy_temperature,
-            remove_prior_floor=max(0.20, config.remove_prior_floor),
+            remove_prior_floor=eff_rem_floor,
             op_probs=op_probs,
             allow_stop=bool(config.allow_stop_action and config.phase != "GROWTH"),
             max_candidates=config.macro_num_candidates,
+            current_vol_frac=current_vol_frac,
+            remove_min_vol_frac=config.remove_min_vol_frac,
+            remove_floor_vol_frac=config.remove_floor_vol_frac,
         )
         return
 
@@ -449,18 +515,37 @@ def run_mcts_search(
         )
 
     root_hash = compute_state_hash(root_density, phase=config.phase, context_key=context_key)
+    root_vol_frac = float(np.mean(root_density > config.density_threshold))
     if root_node is not None:
         root = root_node
         if not root.is_expanded:
             value, p_add, p_remove = _eval_single(root_density)
             valid_add, valid_remove = _legal(root_density)
-            expand_node(root, p_add, p_remove, valid_add, valid_remove, config, op_probs=root_op_probs)
+            expand_node(
+                root,
+                p_add,
+                p_remove,
+                valid_add,
+                valid_remove,
+                config,
+                op_probs=root_op_probs,
+                current_vol_frac=root_vol_frac,
+            )
             root.update(value)
     else:
         root_value, policy_add, policy_remove = _eval_single(root_density)
         valid_add, valid_remove = _legal(root_density)
         root = MCTSNode(prior=1.0)
-        expand_node(root, policy_add, policy_remove, valid_add, valid_remove, config, op_probs=root_op_probs)
+        expand_node(
+            root,
+            policy_add,
+            policy_remove,
+            valid_add,
+            valid_remove,
+            config,
+            op_probs=root_op_probs,
+            current_vol_frac=root_vol_frac,
+        )
         root.update(root_value)
 
     if config.use_transposition_dag and dag_nodes is not None:
@@ -580,7 +665,15 @@ def run_mcts_search(
                     value, p_add, p_remove = eval_cache[state_hash]
                     if not leaf.is_expanded:
                         valid_add, valid_remove = _legal(leaf_density)
-                        expand_node(leaf, p_add, p_remove, valid_add, valid_remove, config)
+                        expand_node(
+                            leaf,
+                            p_add,
+                            p_remove,
+                            valid_add,
+                            valid_remove,
+                            config,
+                            current_vol_frac=float(np.mean(leaf_density > config.density_threshold)),
+                        )
                     ready_to_backup.append((path, value))
                 else:
                     leaf_state = build_state_tensor(leaf_density, bc_masks, forces)
@@ -604,7 +697,15 @@ def run_mcts_search(
                     eval_cache[sha] = (val, p_a, p_r)
                     if not leaf.is_expanded:
                         valid_add, valid_remove = _legal(leaf_density)
-                        expand_node(leaf, p_a, p_r, valid_add, valid_remove, config)
+                        expand_node(
+                            leaf,
+                            p_a,
+                            p_r,
+                            valid_add,
+                            valid_remove,
+                            config,
+                            current_vol_frac=float(np.mean(leaf_density > config.density_threshold)),
+                        )
                     ready_to_backup.append((path, val))
 
             for path, value in ready_to_backup:
@@ -653,7 +754,15 @@ def run_mcts_search(
                 else:
                     value, policy_add, policy_remove = _eval_single(leaf_density)
                     valid_add, valid_remove = _legal(leaf_density)
-                    expand_node(leaf, policy_add, policy_remove, valid_add, valid_remove, config)
+                    expand_node(
+                        leaf,
+                        policy_add,
+                        policy_remove,
+                        valid_add,
+                        valid_remove,
+                        config,
+                        current_vol_frac=float(np.mean(leaf_density > config.density_threshold)),
+                    )
 
             backup(path, value)
 

@@ -361,11 +361,15 @@ class MCTSNode:
         allow_stop: bool = False,
         max_candidates: int = 16,
         seed: Optional[int] = None,
+        current_vol_frac: Optional[float] = None,
+        remove_min_vol_frac: float = 0.0,
+        remove_floor_vol_frac: float = 0.0,
     ) -> None:
         """
         Expand node with composite macro-actions of size `<= action_batch_size`:
         - Phase 1 (GROWTH): top-K ADD, upper/lower-flange ADD, and exploratory Gumbel ADD
-        - Phase 2 (REFINEMENT): pure ADD, pure REMOVE, mass-conserving SWAP (REMOVE+ADD), and STOP
+        - Phase 2 (REFINEMENT): pure ADD, volume-aware pure REMOVE, mass-conserving or
+          net-positive SWAP (REMOVE+ADD), and STOP
         """
         if self.is_expanded:
             return
@@ -396,6 +400,26 @@ class MCTSNode:
 
         add_pool, add_p = _top_pool(add_coords, prob_add, 0, cap=max(96, K * 6))
         rem_pool, rem_p = _top_pool(rem_coords, prob_rem, 1, cap=max(96, K * 6))
+
+        is_v42_vol = phase != "GROWTH" and current_vol_frac is not None and remove_min_vol_frac > 0.0
+        if is_v42_vol:
+            cur_v = float(current_vol_frac)
+            allow_pure_rem = bool(cur_v >= remove_min_vol_frac) or (not add_pool)
+            low_vol_expand_mode = bool(cur_v < remove_min_vol_frac and add_pool)
+            if low_vol_expand_mode:
+                eff_rem_floor = 0.0
+            elif remove_floor_vol_frac > remove_min_vol_frac:
+                ramp = min(
+                    1.0,
+                    max(0.0, (cur_v - remove_min_vol_frac) / (remove_floor_vol_frac - remove_min_vol_frac)),
+                )
+                eff_rem_floor = float(remove_prior_floor) * ramp
+            else:
+                eff_rem_floor = float(remove_prior_floor)
+        else:
+            allow_pure_rem = True
+            low_vol_expand_mode = False
+            eff_rem_floor = float(remove_prior_floor)
 
         macro_entries: List[Tuple[str, Tuple[Action, ...], float]] = []
         seen_keys: Set[TreeAction] = set()
@@ -441,19 +465,22 @@ class MCTSNode:
 
         # 2. Pure REMOVE and SWAP macro candidates in Phase 2 (REFINEMENT)
         if phase != "GROWTH" and rem_pool:
-            kr = min(K, len(rem_pool))
-            idx_rtop = np.arange(kr)
-            _add_macro("REM", [rem_pool[i] for i in idx_rtop], _score_logmean(rem_p, idx_rtop) + 0.25)
-
             log_r = np.log(np.clip(rem_p, 1e-8, 1.0))
-            for _ in range(3):
-                gumbel = -np.log(-np.log(np.clip(rng.random(len(rem_pool)), 1e-6, 1.0 - 1e-6)))
-                idx_rg = np.argsort(log_r + 0.85 * gumbel)[::-1][:kr]
-                _add_macro("REM", [rem_pool[int(i)] for i in idx_rg], _score_logmean(rem_p, idx_rg))
+            if allow_pure_rem:
+                kr = min(K, len(rem_pool))
+                idx_rtop = np.arange(kr)
+                _add_macro("REM", [rem_pool[i] for i in idx_rtop], _score_logmean(rem_p, idx_rtop) + 0.25)
 
-            # 3. Mass-conserving SWAP edges: move low-value/low-SED core mass out to stiff flanges
+                n_g_rem = 2 if remove_min_vol_frac > 0.0 else 3
+                for _ in range(n_g_rem):
+                    gumbel = -np.log(-np.log(np.clip(rng.random(len(rem_pool)), 1e-6, 1.0 - 1e-6)))
+                    idx_rg = np.argsort(log_r + 0.85 * gumbel)[::-1][:kr]
+                    _add_macro("REM", [rem_pool[int(i)] for i in idx_rg], _score_logmean(rem_p, idx_rg))
+
+            # 3. Mass-conserving SWAP (or net-positive GROW_SWAP below min vol):
+            # move low-value/low-SED core mass out to stiff flanges
             if add_pool:
-                kr_s = min(max(1, K // 2), len(rem_pool))
+                kr_s = min(max(1, K // 4), len(rem_pool)) if low_vol_expand_mode else min(max(1, K // 2), len(rem_pool))
                 ka_s = min(max(1, K - kr_s), len(add_pool))
                 swap_acts = [rem_pool[i] for i in range(kr_s)] + [add_pool[i] for i in range(ka_s)]
                 swap_sc = 0.5 * (_score_logmean(rem_p, np.arange(kr_s)) + _score_logmean(add_p, np.arange(ka_s))) + 0.20
@@ -470,7 +497,8 @@ class MCTSNode:
                 swap_flange_sc = 0.5 * (_score_logmean(rem_p, idx_rr) + _score_logmean(add_p, idx_ra)) + 0.15
                 _add_macro("SWAP", swap_flange, swap_flange_sc)
 
-                for _ in range(2):
+                n_g_swap = 1 if low_vol_expand_mode else 2
+                for _ in range(n_g_swap):
                     g_r = -np.log(-np.log(np.clip(rng.random(len(rem_pool)), 1e-6, 1.0 - 1e-6)))
                     g_a = -np.log(-np.log(np.clip(rng.random(len(add_pool)), 1e-6, 1.0 - 1e-6)))
                     ir = np.argsort(log_r + 0.8 * g_r)[::-1][:kr_s]
@@ -484,19 +512,28 @@ class MCTSNode:
         # Compute factored weights across active macro categories
         if phase == "GROWTH":
             type_budget = {"ADD": 1.0}
+        elif low_vol_expand_mode and add_pool:
+            type_budget = {"ADD": 0.78, "SWAP": 0.22} if rem_pool else {"ADD": 1.0}
         else:
             p_a_op = float(op_probs[0]) if op_probs is not None else 0.5
             p_r_op = float(op_probs[1]) if op_probs is not None else 0.5
-            if rem_pool and add_pool:
+            if rem_pool and add_pool and allow_pure_rem:
                 tot_ar = max(1e-6, p_a_op + p_r_op)
-                w_a = max(0.20, p_a_op / tot_ar)
-                w_r = max(float(remove_prior_floor), p_r_op / tot_ar)
-                w_sw = max(0.25, math.sqrt(w_a * w_r))
+                if remove_min_vol_frac > 0.0:
+                    w_a = max(0.25, p_a_op / tot_ar)
+                    w_r = max(eff_rem_floor, p_r_op / tot_ar)
+                    w_sw = max(0.25, math.sqrt(max(1e-4, w_a * max(w_r, 0.10))))
+                else:
+                    w_a = max(0.20, p_a_op / tot_ar)
+                    w_r = max(eff_rem_floor, p_r_op / tot_ar)
+                    w_sw = max(0.25, math.sqrt(w_a * w_r))
                 type_budget = {"ADD": w_a, "REM": w_r, "SWAP": w_sw}
-            elif rem_pool:
+            elif rem_pool and allow_pure_rem:
                 type_budget = {"REM": 1.0}
+            elif add_pool:
+                type_budget = {"ADD": 1.0, "SWAP": 0.22} if rem_pool else {"ADD": 1.0}
             else:
-                type_budget = {"ADD": 1.0}
+                type_budget = {"REM": 1.0}
 
         # Softmax within each category, then weight by category budget
         by_type: Dict[str, List[Tuple[Tuple[Action, ...], float]]] = {}

@@ -68,6 +68,7 @@ def _run_worker_shard(args: argparse.Namespace) -> None:
             record_displacement_map=False,
             record_sed_map=True,
             use_v41_mcts=not args.legacy_mcts,
+            use_v42_mcts=bool(args.v42_mcts and not args.legacy_mcts),
             use_best_of_episode_targets=not args.legacy_mcts,
             tier_weights=tier_weights,  # type: ignore[arg-type]
             seed=args.seed * 1000 + i,
@@ -82,7 +83,8 @@ def _run_worker_shard(args: argparse.Namespace) -> None:
             f"V={st['final_volume']*100:.2f}% C={st['final_compliance']} "
             f"Score={st['final_score']:+.3f} Best={st.get('best_score', st['final_score']):+.3f} "
             f"REM={st['p2_rem_actions']} reuse={st.get('tree_reuse_hits', 0)} dag={st.get('dag_transpositions', 0)} "
-            f"probes={st['probes_adopted']}/{st['probes_run']} ({st['elapsed_sec']:.1f}s)",
+            f"probes={st['probes_adopted']}/{st['probes_run']} rej={st.get('trust_rejects', 0)} cyc={st.get('cycle_avoided', 0)} "
+            f"({st['elapsed_sec']:.1f}s)",
             flush=True,
         )
         gc.collect()
@@ -101,6 +103,8 @@ def _summarize_generation_stats(stats_list: List[Dict[str, Any]]) -> Dict[str, A
     rems = 0
     p_run = 0
     p_adopt = 0
+    rej_tot = 0
+    cyc_tot = 0
     elapseds: List[float] = []
     for s in stats_list:
         by_tier.setdefault(int(s["tier"]), []).append(bool(s["reached_phase2"] and s["connected_final"]))
@@ -112,6 +116,8 @@ def _summarize_generation_stats(stats_list: List[Dict[str, Any]]) -> Dict[str, A
         rems += int(s.get("p2_rem_actions", 0))
         p_run += int(s.get("probes_run", 0))
         p_adopt += int(s.get("probes_adopted", 0))
+        rej_tot += int(s.get("trust_rejects", 0))
+        cyc_tot += int(s.get("cycle_avoided", 0))
         elapseds.append(float(s.get("elapsed_sec", 0.0)))
 
     tier_rates = {str(t): float(np.mean(vals)) for t, vals in sorted(by_tier.items())}
@@ -128,6 +134,8 @@ def _summarize_generation_stats(stats_list: List[Dict[str, Any]]) -> Dict[str, A
         "p2_rem_fraction": float(rems / tot_actions),
         "probes_run": p_run,
         "probes_adopted": p_adopt,
+        "total_trust_rejects": rej_tot,
+        "total_cycle_avoided": cyc_tot,
         "mean_best_score": float(np.mean([s.get("best_score", s["final_score"]) for s in stats_list])),
         "stop_fraction": float(np.mean([1.0 if s.get("end_reason") == "MCTS_STOP" else 0.0 for s in stats_list])),
         "mean_tree_reuse_hits": float(np.mean([s.get("tree_reuse_hits", 0) for s in stats_list])),
@@ -202,6 +210,7 @@ def main() -> None:
     parser.add_argument("--eval-extended", action="store_true", default=True)
     parser.add_argument("--eval-ood", action="store_true", default=True)
     parser.add_argument("--legacy-mcts", action="store_true", default=False, help="Disable v4.1 MCTS-DAG/macro/lifecycle upgrades")
+    parser.add_argument("--v42-mcts", action="store_true", default=False, help="Enable Stage 6 v4.2 volume-aware expansion + trust-region upgrades")
     parser.add_argument("--lambda-op", type=float, default=0.20)
     parser.add_argument("--max-wall-hours", type=float, default=10.5)
     parser.add_argument("--seed", type=int, default=42)
@@ -310,6 +319,8 @@ def main() -> None:
             ]
             if args.legacy_mcts:
                 cmd.append("--legacy-mcts")
+            elif args.v42_mcts:
+                cmd.append("--v42-mcts")
             procs.append(subprocess.Popen(cmd, env=env))
 
         for p in procs:
@@ -384,7 +395,7 @@ def main() -> None:
             "--fem-backend", args.fem_backend,
         ]
         if not args.legacy_mcts:
-            can_cmd.append("--v41-mcts")
+            can_cmd.append("--v42-mcts" if args.v42_mcts else "--v41-mcts")
         subprocess.run(can_cmd, check=True)
         can_summary = _summarize_eval_payload(json.loads(eval_can_json.read_text(encoding="utf-8")))
 
@@ -408,7 +419,7 @@ def main() -> None:
                 "--fem-backend", args.fem_backend,
             ]
             if not args.legacy_mcts:
-                ext_cmd.append("--v41-mcts")
+                ext_cmd.append("--v42-mcts" if args.v42_mcts else "--v41-mcts")
             subprocess.run(ext_cmd, check=True)
             ext_summary = _summarize_eval_payload(json.loads(eval_ext_json.read_text(encoding="utf-8")))
 
@@ -432,7 +443,7 @@ def main() -> None:
                 "--fem-backend", args.fem_backend,
             ]
             if not args.legacy_mcts:
-                ood_cmd.append("--v41-mcts")
+                ood_cmd.append("--v42-mcts" if args.v42_mcts else "--v41-mcts")
             subprocess.run(ood_cmd, check=True)
             ood_summary = _summarize_eval_payload(json.loads(eval_ood_json.read_text(encoding="utf-8")))
 
